@@ -14,6 +14,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { resolveStateDir, resolveStatePaths } from './lib/state.mjs';
 import { decideBindFallback, formatProjectUrl } from './lib/bind.mjs';
+import { LOGO } from './lib/ui.mjs';
 
 // The port the front door actually bound (set at boot). config.port is what we
 // ASK for; after a fallback they differ, and every URL the daemon renders must
@@ -1006,6 +1007,34 @@ function sendJson(res, status, obj) {
   res.end(JSON.stringify(obj));
 }
 
+// Small JSON bodies for control POSTs. Resolves null (never rejects) on bad
+// JSON, oversize, or a broken stream, so callers can treat all three as one
+// "no usable body" case.
+function readJsonBody(req, limit = 4096) {
+  return new Promise((resolve) => {
+    let buf = '';
+    req.on('data', (c) => {
+      buf += c;
+      if (buf.length > limit) {
+        resolve(null);
+        try {
+          req.destroy();
+        } catch {
+          /* ignore */
+        }
+      }
+    });
+    req.on('end', () => {
+      try {
+        resolve(JSON.parse(buf));
+      } catch {
+        resolve(null);
+      }
+    });
+    req.on('error', () => resolve(null));
+  });
+}
+
 // Decide whether a cold-hit request should get the HTML status page (a human in
 // a browser navigating) or a plain 503 (curl / XHR / webhook that wants data).
 // A real navigation sets Sec-Fetch-Mode: navigate; failing that, the request is
@@ -1301,6 +1330,49 @@ async function handleControl(req, res, url) {
     }
   }
 
+  // Rename a project: the dashboard's inline editor POSTs { to }. The daemon
+  // rewrites the registry file itself because that file is the single source
+  // of truth — a rename that only touched in-memory state would be undone by
+  // the next reload, and a later rescan preserves the new name through the
+  // ordinary host-merge path.
+  if (method === 'POST' && pathname.startsWith('/__lazydev/rename/')) {
+    const from = decodeURIComponent(pathname.slice('/__lazydev/rename/'.length));
+    const body = await readJsonBody(req);
+    const to = body && typeof body.to === 'string' ? body.to.trim() : '';
+    const project = projectByHost(from);
+    if (!project) return sendJson(res, 404, { ok: false, reason: 'unknown host' });
+    // Same shape sanitizeHost produces: a DNS label, lowercase.
+    if (!/^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$/.test(to)) {
+      return sendJson(res, 400, { ok: false, reason: 'lowercase letters, digits, and hyphens only' });
+    }
+    if (to === 'lazydev') return sendJson(res, 400, { ok: false, reason: '"lazydev" is the dashboard' });
+    if (to === from) return sendJson(res, 200, { ok: true, host: to });
+    if (projectByHost(to)) return sendJson(res, 409, { ok: false, reason: `"${to}" is taken` });
+    // The runtime record is keyed by host, so an owned running server is
+    // stopped and the next hit on the new URL is an ordinary cold start.
+    // stop() no-ops (with reason) for external/stopped — exactly right here.
+    stop(from, 'rename');
+    let reg;
+    try {
+      reg = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'));
+    } catch (err) {
+      return sendJson(res, 500, { ok: false, reason: 'could not read the registry' });
+    }
+    const entry = Array.isArray(reg.projects) ? reg.projects.find((p) => p.host === from) : null;
+    if (!entry) return sendJson(res, 500, { ok: false, reason: 'host missing from the registry file' });
+    entry.host = to;
+    try {
+      fs.writeFileSync(CONFIG_PATH, JSON.stringify(reg, null, 2) + '\n');
+    } catch (err) {
+      return sendJson(res, 500, { ok: false, reason: 'could not write the registry' });
+    }
+    runtime.delete(from);
+    lastAccess.delete(from);
+    loadConfig('control:rename');
+    log(`rename: ${from} -> ${to}`);
+    return sendJson(res, 200, { ok: true, host: to });
+  }
+
   // GET requests to /__lazydev/* that aren't matched, or anything else.
   return sendHtml(res, 404, 'lazydev — not found', `<h1>lazydev</h1><p class="muted">No such control endpoint: <code>${esc(method)} ${esc(pathname)}</code></p>${dashboardHomeLink()}`);
 }
@@ -1309,22 +1381,40 @@ function dashboardHomeLink() {
   return `<p><a href="${esc(frontUrl('lazydev'))}/">&larr; lazydev dashboard</a></p>`;
 }
 
+// Badge classes live in dashboardHtml's <style>; the poll script rebuilds the
+// same markup client-side, so label/class logic changed here must change there.
 function stateBadge(state, owned) {
-  if (state === 'running') {
-    return owned
-      ? '<span style="background:#16a34a;color:#fff;padding:2px 8px;border-radius:999px;font-size:12px">running</span>'
-      : '<span style="background:#0891b2;color:#fff;padding:2px 8px;border-radius:999px;font-size:12px">running (external)</span>';
+  const known = ['running', 'starting', 'installing', 'conflict'];
+  const k = state === 'running' && !owned ? 'external' : known.includes(state) ? state : 'stopped';
+  const label = k === 'external' ? 'running (external)' : k === 'stopped' ? 'sleeping' : k;
+  return `<span class="badge b-${k}">${label}</span>`;
+}
+
+// Framework marks: colored chips with the glyph inlined as SVG, because the
+// dashboard is a single self-contained response — no assets, no CDN; the
+// "nothing leaves this machine" rule covers the UI too. Letter chips where a
+// faithful brand path isn't worth the bytes; the text label next to the chip
+// carries the name either way.
+function frameworkIcon(fw) {
+  const chip = (bg, inner) =>
+    `<svg class="fwicon" viewBox="0 0 20 20" width="16" height="16" aria-hidden="true"><rect width="20" height="20" rx="5" fill="${bg}"/>${inner}</svg>`;
+  const letter = (bg, text, fg = '#fff') => {
+    const size = text.length > 1 ? 9 : 11;
+    return chip(bg, `<text x="10" y="${(10 + size * 0.36).toFixed(1)}" text-anchor="middle" font-family="ui-monospace,Menlo,monospace" font-weight="700" font-size="${size}" fill="${fg}">${esc(text)}</text>`);
+  };
+  switch (fw) {
+    case 'next': return letter('#000', 'N');
+    case 'vite': return chip('#646cff', '<path d="M11.5 3 5.5 11h4l-1 6 6-8h-4z" fill="#fff"/>');
+    case 'cra': return chip('#23272f', '<g fill="none" stroke="#61dafb"><ellipse cx="10" cy="10" rx="7" ry="2.8"/><ellipse cx="10" cy="10" rx="7" ry="2.8" transform="rotate(60 10 10)"/><ellipse cx="10" cy="10" rx="7" ry="2.8" transform="rotate(120 10 10)"/></g><circle cx="10" cy="10" r="1.4" fill="#61dafb"/>');
+    case 'astro': return letter('#7c3aed', 'A');
+    case 'remix': return letter('#3992ff', 'R');
+    case 'sveltekit': return letter('#ff3e00', 'S');
+    case 'rails': return letter('#cc0000', 'R');
+    case 'django': return letter('#092e20', 'dj', '#44b78b');
+    case 'node': return chip('#5fa04e', '<path d="M10 4l5.2 3v6L10 16l-5.2-3V7z" fill="none" stroke="#fff" stroke-width="1.4"/>');
+    case 'static': return chip('#64748b', '<g stroke="#fff" stroke-width="1.4" stroke-linecap="round"><path d="M6 7h8M6 10h8M6 13h5"/></g>');
+    default: return letter('#64748b', String(fw || '?').slice(0, 1).toUpperCase());
   }
-  if (state === 'starting') {
-    return '<span style="background:#d97706;color:#fff;padding:2px 8px;border-radius:999px;font-size:12px">starting</span>';
-  }
-  if (state === 'installing') {
-    return '<span style="background:#7c3aed;color:#fff;padding:2px 8px;border-radius:999px;font-size:12px">installing</span>';
-  }
-  if (state === 'conflict') {
-    return '<span style="background:#dc2626;color:#fff;padding:2px 8px;border-radius:999px;font-size:12px">conflict</span>';
-  }
-  return '<span style="background:#64748b;color:#fff;padding:2px 8px;border-radius:999px;font-size:12px">sleeping</span>';
 }
 
 function fmtIdle(ms) {
@@ -1340,57 +1430,183 @@ function fmtIdle(ms) {
 function dashboardHtml() {
   // The dashboard is served same-origin, so injecting the control token into its
   // inline script is safe: the browser's same-origin policy stops other sites
-  // reading this HTML. The Sleep button's fetch sends it back as a header, which
-  // authorizes the stop POST. JSON.stringify quotes/escapes it for JS string use.
+  // reading this HTML. The switches and the rename editor send it back as a
+  // header, which authorizes their POSTs. JSON.stringify escapes it for JS use.
   const token = ensureControlToken();
   const rows = config.projects
     .map((p) => {
       const ls = liveState(p.host, p);
-      const enabledNote = ls.enabled ? '' : ' <span class="muted">(disabled)</span>';
-      const sleepBtn = ls.owned && ls.state !== 'stopped'
-        ? `<button onclick="sleepHost('${esc(p.host)}')">Sleep</button>`
-        : `<button disabled>Sleep</button>`;
+      const on = ls.state === 'running' || ls.state === 'starting' || ls.state === 'installing';
+      // The switch is inert where flipping it couldn't work: a disabled project
+      // (enable it in the registry), a port conflict, and an external server
+      // lazydev didn't start and therefore can't stop.
+      const locked = !ls.enabled || ls.state === 'conflict' || (ls.state === 'running' && !ls.owned);
+      const lockReason = !ls.enabled ? 'disabled in the registry'
+        : ls.state === 'conflict' ? 'resolve the port conflict first'
+        : ls.state === 'running' && !ls.owned ? 'started outside lazydev' : '';
       // On conflict, hovering the state cell explains which foreign cwd holds it.
       const stateTitle = ls.state === 'conflict' && ls.conflictDir
         ? ` title="port held by ${esc(ls.conflictDir)}"`
         : '';
-      return `<tr>
-        <td><a href="${esc(frontUrl(p.host))}/">${esc(frontUrl(p.host))}</a>${enabledNote}</td>
-        <td>${esc(ls.framework)}</td>
-        <td${stateTitle}>${stateBadge(ls.state, ls.owned)}</td>
-        <td>${ls.state === 'running' ? fmtIdle(ls.idleForMs) : '—'}</td>
-        <td>${ls.connCount}</td>
-        <td>${sleepBtn}</td>
+      return `<tr data-host="${esc(p.host)}">
+        <td class="c-proj"><a href="${esc(frontUrl(p.host))}/">${esc(frontUrl(p.host))}</a>${ls.enabled ? '' : ' <span class="muted">(disabled)</span>'} <button class="edit" title="rename" aria-label="rename ${esc(p.host)}" onclick="editHost(this)">&#9998;</button></td>
+        <td class="c-fw">${frameworkIcon(ls.framework)} ${esc(ls.framework)}</td>
+        <td class="c-state"${stateTitle}>${stateBadge(ls.state, ls.owned)}</td>
+        <td class="c-idle">${ls.state === 'running' ? fmtIdle(ls.idleForMs) : '—'}</td>
+        <td class="c-conn">${ls.connCount}</td>
+        <td><label class="switch"${lockReason ? ` title="${lockReason}"` : ''}><input type="checkbox" role="switch" aria-label="run ${esc(p.host)}"${on ? ' checked' : ''}${locked ? ' disabled' : ''} onchange="toggleHost(this)"><span class="track"></span></label></td>
       </tr>`;
     })
     .join('');
 
-  return `<h1>lazydev</h1>
-  <p class="muted">On-demand local dev proxy · uptime ${fmtIdle(Date.now() - STARTED_AT)} · idle sleep after ${Math.round(config.idleTimeoutMs / 60000)}m</p>
+  return `<pre class="logo" role="img" aria-label="lazydev">${esc(LOGO.join('\n'))}</pre>
+  <p class="muted">On-demand local dev proxy · uptime <span id="uptime">${fmtIdle(Date.now() - STARTED_AT)}</span> · idle sleep after ${Math.round(config.idleTimeoutMs / 60000)}m</p>
   <style>
+    .logo { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px;
+            line-height: 1.25; color: #0891b2; background: none; padding: 0;
+            margin: 0 0 0.35rem; overflow-x: auto; }
     table { border-collapse: collapse; width: 100%; margin-top: 1rem; }
     th, td { text-align: left; padding: 0.5rem 0.7rem; border-bottom: 1px solid #8884; }
     th { font-size: 12px; text-transform: uppercase; letter-spacing: .04em; opacity: .6; }
-    button { font: inherit; padding: 3px 12px; border-radius: 6px; border: 1px solid #8886;
-             background: transparent; cursor: pointer; }
-    button:disabled { opacity: .4; cursor: default; }
-    button:not(:disabled):hover { background: #8882; }
+    .badge { color: #fff; padding: 2px 8px; border-radius: 999px; font-size: 12px; white-space: nowrap; }
+    .b-running { background: #16a34a; } .b-external { background: #0891b2; }
+    .b-starting { background: #d97706; } .b-installing { background: #7c3aed; }
+    .b-conflict { background: #dc2626; } .b-stopped { background: #64748b; }
+    .c-fw { white-space: nowrap; }
+    .fwicon { vertical-align: -3px; margin-right: 2px; }
+    .switch { position: relative; display: inline-block; width: 40px; height: 22px; vertical-align: middle; }
+    .switch input { position: absolute; inset: 0; width: 100%; height: 100%; margin: 0; opacity: 0; cursor: pointer; }
+    .switch .track { position: absolute; inset: 0; border-radius: 999px; background: #8885;
+                     transition: background .15s; pointer-events: none; }
+    .switch .track::after { content: ''; position: absolute; top: 2px; left: 2px; width: 18px; height: 18px;
+                            border-radius: 50%; background: #fff; box-shadow: 0 1px 2px #0003;
+                            transition: transform .15s; }
+    .switch input:checked + .track { background: #16a34a; }
+    .switch input:checked + .track::after { transform: translateX(18px); }
+    .switch input:disabled { cursor: default; }
+    .switch input:disabled + .track { opacity: .35; }
+    .switch input:focus-visible + .track { outline: 2px solid #2563eb; outline-offset: 2px; }
+    @media (prefers-reduced-motion: reduce) { .switch .track, .switch .track::after { transition: none; } }
+    .edit { border: none; background: none; cursor: pointer; opacity: 0; font: inherit; padding: 0 4px; color: inherit; }
+    tr:hover .edit, .edit:focus-visible { opacity: .55; }
+    .edit:hover { opacity: 1; }
+    .rename { font: inherit; width: 12ch; padding: 1px 6px; border: 1px solid #8886;
+              border-radius: 6px; background: transparent; color: inherit; }
+    .rename.bad { border-color: #dc2626; outline: none; }
   </style>
   <table>
     <thead><tr><th>Project</th><th>Framework</th><th>State</th><th>Idle</th><th>Conn</th><th></th></tr></thead>
     <tbody>${rows || '<tr><td colspan="6" class="muted">No projects registered.</td></tr>'}</tbody>
   </table>
   <script>
-    async function sleepHost(h) {
-      try {
-        await fetch('/__lazydev/stop/' + encodeURIComponent(h), {
-          method: 'POST',
-          headers: { 'X-Lazydev-Token': ${JSON.stringify(token)} },
-        });
-      } catch (e) {}
-      location.reload();
+    const TOKEN = ${JSON.stringify(token)};
+    const ON_STATES = ['running', 'starting', 'installing'];
+    // host -> { on, at }: what the user just asked for, so the poll doesn't
+    // snap the switch back before the daemon's state catches up.
+    const pending = new Map();
+
+    // Mirrors the server's stateBadge — change both together.
+    function badgeHtml(state, owned) {
+      const known = ['running', 'starting', 'installing', 'conflict'];
+      const k = state === 'running' && !owned ? 'external' : known.includes(state) ? state : 'stopped';
+      const label = k === 'external' ? 'running (external)' : k === 'stopped' ? 'sleeping' : k;
+      return '<span class="badge b-' + k + '">' + label + '</span>';
     }
-    setTimeout(() => location.reload(), 5000);
+
+    function fmtIdle(ms) {
+      if (ms == null) return '—';
+      const s = Math.floor(ms / 1000);
+      if (s < 60) return s + 's';
+      const m = Math.floor(s / 60);
+      if (m < 60) return m + 'm';
+      const h = Math.floor(m / 60);
+      return h + 'h ' + (m % 60) + 'm';
+    }
+
+    function toggleHost(input) {
+      const row = input.closest('tr');
+      const host = row.dataset.host;
+      const on = input.checked;
+      pending.set(host, { on, at: Date.now() });
+      // The switch itself already flipped (native checkbox); reflect it in the
+      // badge immediately and let the poll settle the truth.
+      row.querySelector('.c-state').innerHTML = badgeHtml(on ? 'starting' : 'stopped', true);
+      fetch('/__lazydev/' + (on ? 'up/' : 'stop/') + encodeURIComponent(host), {
+        method: 'POST',
+        headers: { 'X-Lazydev-Token': TOKEN },
+      }).catch(() => {});
+    }
+
+    function editHost(btn) {
+      const td = btn.closest('td');
+      const host = btn.closest('tr').dataset.host;
+      if (td.querySelector('.rename')) return;
+      const saved = td.innerHTML;
+      td.innerHTML = '';
+      const input = document.createElement('input');
+      input.className = 'rename';
+      input.value = host;
+      input.setAttribute('aria-label', 'new name');
+      const suffix = document.createElement('span');
+      suffix.className = 'muted';
+      suffix.textContent = '.localhost';
+      td.append(input, suffix);
+      input.focus();
+      input.select();
+      const bail = () => { td.innerHTML = saved; };
+      input.onblur = () => setTimeout(() => { if (td.querySelector('.rename') === input) bail(); }, 150);
+      input.onkeydown = async (e) => {
+        if (e.key === 'Escape') return bail();
+        if (e.key !== 'Enter') { input.classList.remove('bad'); return; }
+        const to = input.value.trim();
+        if (to === host) return bail();
+        if (!/^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$/.test(to) || to === 'lazydev') {
+          input.classList.add('bad');
+          input.title = 'lowercase letters, digits, and hyphens';
+          return;
+        }
+        try {
+          const res = await fetch('/__lazydev/rename/' + encodeURIComponent(host), {
+            method: 'POST',
+            headers: { 'X-Lazydev-Token': TOKEN, 'content-type': 'application/json' },
+            body: JSON.stringify({ to }),
+          });
+          const j = await res.json();
+          if (j.ok) { location.reload(); return; }
+          input.classList.add('bad');
+          input.title = j.reason || 'rename failed';
+        } catch (err) {
+          input.classList.add('bad');
+          input.title = 'daemon unreachable';
+        }
+      };
+    }
+
+    async function poll() {
+      try {
+        const res = await fetch('/__lazydev/status', { cache: 'no-store' });
+        if (!res.ok) return;
+        const data = await res.json();
+        document.getElementById('uptime').textContent = fmtIdle(data.uptimeMs);
+        for (const p of data.projects) {
+          const row = document.querySelector('tr[data-host="' + CSS.escape(p.host) + '"]');
+          if (!row || row.querySelector('.rename')) continue;
+          const on = ON_STATES.includes(p.state);
+          const pend = pending.get(p.host);
+          if (pend && Date.now() - pend.at < 10000 && on !== pend.on) continue;
+          pending.delete(p.host);
+          row.querySelector('.c-state').innerHTML = badgeHtml(p.state, p.owned);
+          row.querySelector('.c-idle').textContent = p.state === 'running' ? fmtIdle(p.idleForMs) : '—';
+          row.querySelector('.c-conn').textContent = p.connCount;
+          const sw = row.querySelector('.switch input');
+          if (sw && document.activeElement !== sw) {
+            sw.checked = on;
+            sw.disabled = !p.enabled || p.state === 'conflict' || (p.state === 'running' && !p.owned);
+          }
+        }
+      } catch (err) { /* daemon momentarily unreachable; keep polling */ }
+    }
+    setInterval(poll, 2000);
   </script>`;
 }
 
