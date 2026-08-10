@@ -110,6 +110,24 @@ function ensureDir(dir) {
   }
 }
 
+// Make sure logs/ exists — but never RESURRECT a state dir that has been
+// deleted out from under us. `lazydev uninstall` removes the whole state dir;
+// a daemon still winding down used to rebuild it on its very next line (one
+// ENOENT config-watch message was enough), so an uninstall that had just said
+// "every trace removed" left a logs/daemon.log behind. A missing logs/ inside
+// a state dir that still EXISTS is healed as before, which is the first-boot
+// case. Returns whether the dir is there to write into.
+function ensureLogsDir() {
+  try {
+    if (fs.existsSync(LOGS_DIR)) return true;
+    if (!fs.existsSync(path.dirname(LOGS_DIR))) return false;
+    ensureDir(LOGS_DIR);
+    return fs.existsSync(LOGS_DIR);
+  } catch {
+    return false;
+  }
+}
+
 function ts() {
   return new Date().toISOString();
 }
@@ -174,7 +192,7 @@ function log(...parts) {
   // bare `import` of this module writes nothing; mkdirSync recursive is
   // idempotent+cheap, so the running daemon's cost/behavior is unchanged.
   try {
-    ensureDir(LOGS_DIR);
+    if (!ensureLogsDir()) return; // uninstalled underneath us — write nothing
     rotateIfNeeded(DAEMON_LOG);
     fs.appendFileSync(DAEMON_LOG, line + '\n');
   } catch {

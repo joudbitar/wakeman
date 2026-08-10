@@ -3,7 +3,7 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { LAUNCHD_LABEL, assembleLaunchdPath, renderPlist, stripCaddyBlock, extractWorkingDirectory, toolsToVerify } from '../lib/install.mjs';
+import { LAUNCHD_LABEL, assembleLaunchdPath, renderPlist, stripCaddyBlock, extractWorkingDirectory, toolsToVerify, parseLaunchdPid, waitForExit } from '../lib/install.mjs';
 
 test('assembleLaunchdPath preserves the user shell PATH order verbatim', () => {
   // The bug this guards against: the machine has a broken pnpm in
@@ -183,4 +183,70 @@ test('toolsToVerify is calm about junk input', () => {
   assert.deepEqual(toolsToVerify(undefined), []);
   assert.deepEqual(toolsToVerify([]), []);
   assert.deepEqual(toolsToVerify([null, { startCmd: '   ' }]), []);
+});
+
+test('parseLaunchdPid finds the running job pid in launchctl print output', () => {
+  // Shape of the real thing, trimmed: uninstall needs the pid so it can watch
+  // the daemon actually exit before it deletes the state dir.
+  const out = [
+    'com.lazydev.proxy = {',
+    '\tactive count = 1',
+    '\tpath = /Users/x/Library/LaunchAgents/com.lazydev.proxy.plist',
+    '\tstate = running',
+    '',
+    '\tprogram = /opt/node/bin/node',
+    '\tpid = 54321',
+    '\truntime = 921',
+    '}',
+  ].join('\n');
+  assert.equal(parseLaunchdPid(out), 54321);
+});
+
+test('parseLaunchdPid returns null when no job is running', () => {
+  // A loaded-but-idle job prints no pid line, and an unknown label prints
+  // nothing at all. Both mean "nothing to wait for".
+  assert.equal(parseLaunchdPid('com.lazydev.proxy = {\n\tstate = not running\n}'), null);
+  assert.equal(parseLaunchdPid(''), null);
+  assert.equal(parseLaunchdPid(undefined), null);
+  // A pid mentioned inside another key is not the job's pid.
+  assert.equal(parseLaunchdPid('\tspawn stats = last exit pid = 42'), null);
+});
+
+test('waitForExit returns once the process is gone, without burning the timeout', async () => {
+  // The uninstall case: bootout returned, the daemon takes a few polls to die.
+  let alive = 3;
+  const slept = [];
+  const ok = await waitForExit({
+    isAlive: () => alive-- > 0,
+    timeoutMs: 5000,
+    intervalMs: 100,
+    sleep: async (ms) => slept.push(ms),
+  });
+  assert.equal(ok, true, 'saw the exit');
+  assert.equal(slept.length, 3, 'polled until gone, then stopped');
+});
+
+test('waitForExit gives up at the deadline instead of hanging', async () => {
+  // The wedged-daemon case: uninstall must still finish. A fake clock keeps
+  // this test instant and deterministic.
+  let clock = 0;
+  const ok = await waitForExit({
+    isAlive: () => true,
+    timeoutMs: 5000,
+    intervalMs: 100,
+    now: () => clock,
+    sleep: async (ms) => {
+      clock += ms;
+    },
+  });
+  assert.equal(ok, false, 'timed out rather than waiting forever');
+  assert.ok(clock >= 5000 && clock < 5200, `stopped near the deadline (was ${clock}ms)`);
+});
+
+test('waitForExit checks before it sleeps at all', async () => {
+  // Nothing to wait for (launchd had no pid) must cost zero time.
+  let slept = 0;
+  const ok = await waitForExit({ isAlive: () => false, sleep: async () => { slept++; } });
+  assert.equal(ok, true);
+  assert.equal(slept, 0);
 });
