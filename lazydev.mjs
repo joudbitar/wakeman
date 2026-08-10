@@ -349,6 +349,34 @@ function startConfigWatch() {
   }
 }
 
+// Dev-mode source watch, for installs that run a git checkout directly: the
+// plist sets LAZYDEV_WATCH_SOURCE=1 and launchd's KeepAlive restarts whatever
+// exits, so "reload on change" is just "exit on change". Owned dev servers
+// live in their own process groups and the adopt path picks them back up on
+// the next request, so a daemon restart does not cost the running servers.
+function startSourceWatch() {
+  if (process.env.LAZYDEV_WATCH_SOURCE !== '1') return;
+  const here = path.dirname(fileURLToPath(import.meta.url));
+  let t = null;
+  const kick = (file) => {
+    if (t) clearTimeout(t);
+    // Debounced past the editor's write burst; ThrottleInterval in the plist
+    // keeps a pathological loop from thrashing launchd.
+    t = setTimeout(() => {
+      log(`source: ${file || 'a file'} changed; exiting so launchd restarts with the new code`);
+      process.exit(0);
+    }, 300);
+  };
+  for (const target of [path.join(here, 'lazydev.mjs'), path.join(here, 'lib')]) {
+    try {
+      const w = fs.watch(target, (ev, file) => kick(file || path.basename(target)));
+      w.on('error', () => { /* watch died; the next install re-arms it */ });
+    } catch {
+      /* missing target — nothing to watch */
+    }
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Host -> project key resolution (SPEC rule)
 // ---------------------------------------------------------------------------
@@ -2157,6 +2185,7 @@ if (RUN_AS_MAIN) {
   // exists for the CLI to read and the dashboard HTML can embed it.
   ensureControlToken();
   startConfigWatch();
+  startSourceWatch();
   // Reaper cadence is 30s in production. LAZYDEV_REAP_INTERVAL_MS exists solely so
   // the bundled self-test can exercise the idle reaper quickly (same spirit as the
   // LAZYDEV_CONFIG override). Production never sets it.

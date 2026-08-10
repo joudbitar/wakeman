@@ -146,7 +146,7 @@ async function decideServePort() {
 // The environment a child (scan or daemon) inherits: pin the SAME state dir so
 // scan writes the registry where the daemon reads it, and force the port the
 // daemon serves on.
-function childEnvFor(servePort) {
+function childEnvFor(servePort, { scanAll = false } = {}) {
   return {
     ...process.env,
     LAZYDEV_STATE_DIR: stateDir,
@@ -156,6 +156,9 @@ function childEnvFor(servePort) {
     // daemon logs to daemon.log only. The banner is the whole startup output.
     LAZYDEV_SCAN_QUIET: '1',
     LAZYDEV_QUIET: '1',
+    // `--yes` promised no prompts: the scan registers everything it finds
+    // instead of raising the project picker.
+    ...(scanAll ? { LAZYDEV_SCAN_ALL: '1' } : {}),
   };
 }
 
@@ -183,7 +186,27 @@ function readProjects() {
   }
 }
 
-async function scanWithStatus(env) {
+// Interactive runs hand the terminal to the scan child: it may raise the
+// project picker, and a parent spinner redrawing over the child's raw-mode
+// input would garble both. Returns 'cancelled' when the user Ctrl-C'd out of
+// the picker (the scan exits 130 with nothing written) — the caller stops
+// there instead of installing over an abort.
+async function scanWithStatus(env, interactive) {
+  if (interactive) {
+    try {
+      await runScan(env);
+    } catch (err) {
+      if (/exited 130/.test(String(err.message))) {
+        process.stdout.write(ui.dim('  cancelled; nothing was changed.\n'));
+        return 'cancelled';
+      }
+      process.stderr.write(`lazydev: scan failed (${err.message}); continuing with whatever registry exists.\n`);
+      return;
+    }
+    const n = readProjects().length;
+    process.stdout.write(`  ${ui.green('✓')} ${ui.dim(`found ${n} project${n === 1 ? '' : 's'}`)}\n`);
+    return;
+  }
   const spin = makeSpinner({ isTTY: process.stdout.isTTY, styler: ui });
   spin.start(`scanning ${tilde(os.homedir())} for projects`);
   try {
@@ -214,7 +237,7 @@ async function askConsent({ willInstall, willInstallSkill }) {
   out();
   out(`  this will:`);
   out(`  scan your home folder for dev projects ${dim('· reads config files, writes nothing')}`);
-  out(`  give each one a URL: ${bold('http://<name>.localhost')} ${dim('· works only on this machine')}`);
+  out(`  let you pick which get a URL: ${bold('http://<name>.localhost')} ${dim('· works only on this machine')}`);
   if (willInstall) {
     out(`  install a background service ${dim('· no sudo, keeps the URLs working after reboot')}`);
     if (willInstallSkill) {
@@ -294,6 +317,22 @@ function launchctlAsync(args) {
   });
 }
 
+// A git checkout is a dev install: the LaunchAgent runs the checkout directly
+// (no app copy — the repo is not a cache that vanishes) and the daemon watches
+// its own source, so an edit here is live at lazydev.localhost a moment later.
+const IS_CHECKOUT = fs.existsSync(path.join(ROOT, '.git'));
+
+// A checkout install is "current" when the deployed plist already runs THIS
+// checkout — the version comparison below is meaningless when the code
+// live-reloads out from under it.
+function plistRunsCheckout() {
+  try {
+    return fs.readFileSync(PLIST_PATH, 'utf8').includes(`<string>${path.join(ROOT, 'lazydev.mjs')}</string>`);
+  } catch {
+    return false;
+  }
+}
+
 // Copy the running package into the state dir. npx runs from a cache that can
 // be pruned at any time, so the LaunchAgent must point at a copy we own. The
 // list comes from package.json "files" — exactly what the published package
@@ -330,14 +369,16 @@ async function installPersistent({ onStep = () => {} } = {}) {
 
   // Stop any existing agent first (this label covers the old checkout install
   // too, so an npx install cleanly supersedes it), then refresh the app copy.
+  // A checkout runs in place instead: no copy, and the daemon live-reloads.
   await launchctlAsync(['bootout', `${domain}/${LAUNCHD_LABEL}`]);
-  await copyApp();
+  const appDir = IS_CHECKOUT ? ROOT : APP_DIR;
+  if (!IS_CHECKOUT) await copyApp();
 
   const nodeBin = process.execPath;
   const plist = renderPlist({
     nodeBin,
-    daemonPath: path.join(APP_DIR, 'lazydev.mjs'),
-    workDir: APP_DIR,
+    daemonPath: path.join(appDir, 'lazydev.mjs'),
+    workDir: appDir,
     stateDir,
     logsDir,
     home: os.homedir(),
@@ -350,6 +391,7 @@ async function installPersistent({ onStep = () => {} } = {}) {
     }),
     frontPort: FRONT_PORT,
     fallbackPort: FALLBACK_PORT,
+    devWatch: IS_CHECKOUT,
   });
   fs.mkdirSync(path.dirname(PLIST_PATH), { recursive: true });
   fs.writeFileSync(PLIST_PATH, plist);
@@ -364,10 +406,11 @@ async function installPersistent({ onStep = () => {} } = {}) {
   await launchctlAsync(['enable', `${domain}/${LAUNCHD_LABEL}`]);
   await launchctlAsync(['kickstart', '-k', `${domain}/${LAUNCHD_LABEL}`]);
 
-  // Put `lazydev` on PATH: a symlink to this same entrypoint in the app copy.
+  // Put `lazydev` on PATH: a symlink to this same entrypoint in the app copy
+  // (or the checkout, on a dev install).
   fs.mkdirSync(path.dirname(CLI_LINK), { recursive: true });
   try { fs.rmSync(CLI_LINK, { force: true }); } catch { /* fine */ }
-  fs.symlinkSync(path.join(APP_DIR, 'bin', 'lazydev.mjs'), CLI_LINK);
+  fs.symlinkSync(path.join(appDir, 'bin', 'lazydev.mjs'), CLI_LINK);
 
   // The add-project skill, for machines that run Claude Code (~/.claude
   // exists). Replaced wholesale on every install so it tracks the daemon.
@@ -813,7 +856,8 @@ async function main() {
   }
 
   if (willInstall) {
-    await scanWithStatus(childEnvFor(FRONT_PORT));
+    const outcome = await scanWithStatus(childEnvFor(FRONT_PORT, { scanAll: assumeYes }), interactive);
+    if (outcome === 'cancelled') return 130;
     const projects = readProjects();
 
     // A re-run with a healthy daemon of this same version IS the rescan: the
@@ -823,7 +867,7 @@ async function main() {
     // a newer release supersedes the installed copy), or the user typed
     // `lazydev install` — the explicit form is the sanctioned way to force a
     // plist rewrite, e.g. after the preflight flags a stale service PATH.
-    if (cmd !== 'install' && installedVersion() === VERSION) {
+    if (cmd !== 'install' && (IS_CHECKOUT ? plistRunsCheckout() : installedVersion() === VERSION)) {
       for (const port of [FRONT_PORT, FALLBACK_PORT]) {
         if (await probeListen(port)) {
           printInstalledBanner({ projects, port, startedAt, skillInstalled: false, verb: 'rescanned' });
@@ -857,6 +901,9 @@ async function main() {
     }
     await spin.done(`${ui.green('✓')} ${ui.dim('service running')}`);
     printInstalledBanner({ projects, port: result.port, startedAt, skillInstalled: result.skillInstalled });
+    if (IS_CHECKOUT) {
+      process.stdout.write(ui.dim('  dev install: the service runs this checkout and restarts itself when the source changes.\n'));
+    }
     // The plist was just written, so deployedPathEnv() reads the fresh PATH:
     // this proves what the daemon will resolve, on the install that baked it.
     printToolWarnings(await preflightTools(toolsToVerify(projects), deployedPathEnv()));
@@ -867,8 +914,8 @@ async function main() {
   // daemon, and the printed URLs all agree.
   const before = new Set(readProjects().map((p) => p.host));
   const servePort = await decideServePort();
-  const env = childEnvFor(servePort);
-  await scanWithStatus(env);
+  const env = childEnvFor(servePort, { scanAll: assumeYes });
+  if ((await scanWithStatus(env, interactive)) === 'cancelled') return 130;
   const projects = readProjects();
   const after = new Set(projects.map((p) => p.host));
   const diff = firstRun
