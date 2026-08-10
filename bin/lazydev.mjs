@@ -30,7 +30,7 @@ import { fileURLToPath } from 'node:url';
 import { resolveStateDir, resolveStatePaths } from '../lib/state.mjs';
 import { decideBindFallback, formatProjectUrl } from '../lib/bind.mjs';
 import { makeStyler, makeSpinner, LOGO } from '../lib/ui.mjs';
-import { LAUNCHD_LABEL, assembleLaunchdPath, renderPlist, stripCaddyBlock, extractWorkingDirectory, toolsToVerify } from '../lib/install.mjs';
+import { LAUNCHD_LABEL, assembleLaunchdPath, renderPlist, stripCaddyBlock, extractWorkingDirectory, toolsToVerify, parseLaunchdPid, waitForExit } from '../lib/install.mjs';
 
 const ui = makeStyler({ isTTY: process.stdout.isTTY, env: process.env });
 
@@ -210,21 +210,22 @@ async function askConsent({ willInstall, willInstallSkill }) {
   out();
   for (const line of LOGO) out(`  ${cyan(line)}`);
   out();
-  out(`  ${dim(`v${VERSION} · dev servers on demand behind permanent URLs`)}`);
+  out(`  ${dim(`v${VERSION} · starts dev servers when you open their URL, stops them when idle`)}`);
   out();
-  out(`  scan ~ for projects it can prove how to run ${dim('· reads marker files, writes nothing')}`);
-  out(`  serve each at ${bold('http://<name>.localhost')} ${dim('· this machine only, nothing leaves it')}`);
+  out(`  this will:`);
+  out(`  scan your home folder for dev projects ${dim('· reads config files, writes nothing')}`);
+  out(`  give each one a URL: ${bold('http://<name>.localhost')} ${dim('· works only on this machine')}`);
   if (willInstall) {
-    out(`  install a user LaunchAgent ${dim('· no sudo, the URLs survive reboots')}`);
+    out(`  install a background service ${dim('· no sudo, keeps the URLs working after reboot')}`);
     if (willInstallSkill) {
-      out(`  add the add-project skill to ~/.claude/skills ${dim("· for what the scan can't prove")}`);
+      out(`  add the add-project skill to ~/.claude/skills ${dim('· for projects the scan misses')}`);
     }
     out();
-    out(dim(`  everything lands in ${tilde(stateDir)} · \`lazydev uninstall\` removes every trace`));
+    out(dim(`  everything is stored in ${tilde(stateDir)} · \`lazydev uninstall\` deletes all of it`));
   } else {
-    out(`  serve them in the foreground ${dim('· Ctrl-C stops it; a systemd port is the PR I\'d merge first')}`);
+    out(`  run them in the foreground ${dim('· Ctrl-C stops everything; the background service is macOS-only for now')}`);
     out();
-    out(dim(`  everything lands in ${tilde(stateDir)} · deleting it removes every trace`));
+    out(dim(`  everything is stored in ${tilde(stateDir)} · deleting that folder removes all of it`));
   }
   out();
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
@@ -255,6 +256,30 @@ function which(cmd) {
 
 function launchctl(args) {
   return spawnSync('launchctl', args, { stdio: 'ignore' }).status === 0;
+}
+
+// launchctl's stdout, for the one place we need to READ it rather than just
+// check its exit status: the daemon's pid, before uninstall boots it out.
+function launchctlOut(args) {
+  const r = spawnSync('launchctl', args, { encoding: 'utf8' });
+  return r.status === 0 ? (r.stdout || '') : '';
+}
+
+// Is the launchd daemon still running? A pid captured before the bootout is
+// the direct answer — signal 0 asks the kernel whether it exists without
+// touching it. EPERM means it exists and merely isn't ours to signal, which is
+// still alive. With no pid (launchd had none to give) fall back to asking
+// whether the job is in the domain at all.
+function daemonAlive(pid, domain) {
+  if (pid) {
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch (err) {
+      return !!err && err.code === 'EPERM';
+    }
+  }
+  return launchctl(['print', `${domain}/${LAUNCHD_LABEL}`]);
 }
 
 // Async twin for the install path. The spinner redraws on an event-loop timer,
@@ -422,10 +447,27 @@ async function uninstall({ assumeYes }) {
     }
   }
 
+  // True unless the daemon outlived the wait below; only then does the closing
+  // "state removed" need a caveat.
+  let daemonExited = true;
+
   if (process.platform === 'darwin') {
     const domain = `gui/${process.getuid()}`;
+    // Ask launchd who the daemon IS before booting it out: once the label
+    // leaves the domain, nothing is left to name the process still winding
+    // down.
+    const pid = parseLaunchdPid(launchctlOut(['print', `${domain}/${LAUNCHD_LABEL}`]));
     launchctl(['bootout', `${domain}/${LAUNCHD_LABEL}`]) || launchctl(['unload', PLIST_PATH]);
     fs.rmSync(PLIST_PATH, { force: true });
+    // bootout returns once launchd has ACCEPTED the request, not once the
+    // process is gone — and a daemon in that window still writes. Deleting the
+    // state dir underneath it is how "removes every trace" left one: the
+    // config watch fired on the vanishing projects.json, logged one ENOENT
+    // line, and rebuilt logs/ a second after uninstall said the machine was
+    // clean. So wait for the process to actually exit before anything below
+    // deletes its state. A daemon that outlives the wait still gets its state
+    // dir removed — the ordering is what we can fix, not a wedged process.
+    daemonExited = await waitForExit({ isAlive: () => daemonAlive(pid, domain), timeoutMs: 5_000 });
   }
 
   // The PATH symlink, but only if it is ours: a symlink whose target mentions
@@ -464,6 +506,9 @@ async function uninstall({ assumeYes }) {
 
   out();
   out('  lazydev is gone: service stopped, state removed. thanks for trying it.');
+  if (!daemonExited) {
+    out(dim(`  the daemon was still running 5s after being stopped; if ${tilde(stateDir)} comes back, remove it once it has exited.`));
+  }
   out();
   return 0;
 }
