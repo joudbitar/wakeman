@@ -426,6 +426,13 @@ async function uninstall({ assumeYes }) {
     const domain = `gui/${process.getuid()}`;
     launchctl(['bootout', `${domain}/${LAUNCHD_LABEL}`]) || launchctl(['unload', PLIST_PATH]);
     fs.rmSync(PLIST_PATH, { force: true });
+    // bootout returns before the daemon has fully exited, and a dying daemon
+    // can flush a last log line AFTER the state dir is deleted, resurrecting
+    // it. Wait for the label to leave launchd before touching the filesystem.
+    const gone = Date.now() + 5000;
+    while (launchctl(['print', `${domain}/${LAUNCHD_LABEL}`]) && Date.now() < gone) {
+      await new Promise((r) => setTimeout(r, 200));
+    }
   }
 
   // The PATH symlink, but only if it is ours: a symlink whose target mentions
