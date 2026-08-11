@@ -1,8 +1,11 @@
 name: publish
 
-# Publishes to npm with provenance when a GitHub release is published.
-# Needs an npm granular access token (publish-only, this package only)
-# stored as the NPM_TOKEN repository secret.
+# Publishes to npm when a GitHub release is published, via trusted publishing:
+# the npm package is configured (npmjs.com -> package -> Settings -> Trusted
+# Publisher) to trust this repo's publish.yml, and npm authenticates the run
+# with an OIDC token from GitHub. No npm token, no secret, and provenance is
+# attested from the same identity. Token-based CI publishing dies with EOTP
+# under npm's post-2025 hardening, which is how this workflow got here.
 
 on:
   release:
@@ -10,7 +13,7 @@ on:
 
 permissions:
   contents: read
-  id-token: write # npm provenance attestation
+  id-token: write # OIDC for npm trusted publishing + provenance attestation
 
 jobs:
   publish:
@@ -21,15 +24,11 @@ jobs:
         with:
           node-version: 22
           registry-url: https://registry.npmjs.org
+      # Trusted publishing needs npm >= 11.5.1; Node 22 bundles npm 10.
+      - run: npm install -g npm@latest
       - run: npm test
-      - name: publish (skips without NPM_TOKEN or if version already on npm)
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+      - name: publish (skips if version already on npm)
         run: |
-          if [ -z "$NODE_AUTH_TOKEN" ]; then
-            echo "NPM_TOKEN secret not set; skipping publish."
-            exit 0
-          fi
           pkg="$(node -p 'require("./package.json").name')"
           ver="$(node -p 'require("./package.json").version')"
           if npm view "$pkg@$ver" version >/dev/null 2>&1; then
