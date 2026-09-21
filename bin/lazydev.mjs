@@ -4,14 +4,20 @@
 //   npx @jbitar/lazydev        first run: ask consent, scan ~, install the
 //                              background service, print the URLs, exit
 //   lazydev                    (the installed command) rescan + refresh
-//   lazydev logs <host>        tail a project's dev-server log
-//   lazydev uninstall          stop the service and remove every trace
+//   lazydev --help             the whole command table
 //
-// Interactive runs on macOS install a user LaunchAgent (no sudo) so the URLs
-// survive reboots; the daemon serves :80 itself with a per-connection loopback
-// guard (ADR 0002), so there is no Caddy and no shell installer. Non-
-// interactive runs (CI, pipes) and Linux serve in the FOREGROUND instead —
-// same scan, same state dir, Ctrl-C stops it. See docs/adr/0003-one-way-in.md.
+// Every run installs a user LaunchAgent (no sudo) so the URLs survive reboots;
+// the daemon serves :80 itself with a per-connection loopback guard (ADR 0002),
+// so there is no Caddy and no shell installer. macOS only: the install IS a
+// LaunchAgent, and half a Linux story is worse than none.
+// See docs/adr/0003-one-way-in.md.
+//
+// The subcommands split in two. Registry edits (add, remove, enable, disable,
+// port, rename) write projects.json through lib/registry-cli.mjs and stop
+// there: the daemon watches the file, so the write is the deployment. Runtime
+// actions (status, stop, restart, wake, attach, logs -f) go over the control
+// API with the token from <state>/control-token, because only the live daemon
+// knows what is running.
 //
 // Nothing is ever written into a project directory. Everything lands in the
 // state dir (registry, logs, control token, the installed app copy) plus, when
@@ -22,21 +28,27 @@
 
 import os from 'node:os';
 import net from 'node:net';
+import http from 'node:http';
 import path from 'node:path';
 import fs from 'node:fs';
 import readline from 'node:readline/promises';
 import { spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { resolveStateDir, resolveStatePaths } from '../lib/state.mjs';
-import { decideBindFallback, formatProjectUrl } from '../lib/bind.mjs';
+import { formatProjectUrl } from '../lib/bind.mjs';
 import { makeStyler, makeSpinner, LOGO } from '../lib/ui.mjs';
+import { CANCEL_EXIT } from '../lib/picker.mjs';
+import {
+  RegistryError, readRegistry, writeRegistry, addEntry, removeEntry, setEnabled,
+  setPort, renameEntry, pickPort, sanitizeHost, expandTilde, detectOne, startCmdFor,
+  DETECTOR_EVIDENCE,
+} from '../lib/registry-cli.mjs';
 import { LAUNCHD_LABEL, assembleLaunchdPath, renderPlist, stripCaddyBlock, extractWorkingDirectory, toolsToVerify, parseLaunchdPid, waitForExit } from '../lib/install.mjs';
 
 const ui = makeStyler({ isTTY: process.stdout.isTTY, env: process.env });
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(HERE, '..'); // package root — where lazydev.mjs / scan.mjs live
-const DAEMON = path.join(ROOT, 'lazydev.mjs');
 const SCANNER = path.join(ROOT, 'scan.mjs');
 
 const VERSION = (() => {
@@ -61,7 +73,7 @@ const stateDir = resolveStateDir({
   scriptDir: ROOT, // only used if preferXdg were false; here XDG default wins
   preferXdg: true,
 });
-const { configPath, logsDir } = resolveStatePaths({ env: process.env, stateDir });
+const { configPath, logsDir, tokenPath } = resolveStatePaths({ env: process.env, stateDir });
 
 // Where the installed app copy lives: inside the state dir, so "everything
 // lazydev creates" stays one directory (plus the plist and the PATH symlink,
@@ -109,16 +121,6 @@ function migrateLegacyRegistry() {
 // port probes
 // ---------------------------------------------------------------------------
 
-// Can WE bind this port right now? Used by the foreground path to decide the
-// port before the daemon does the real bind (ADR 0002's one rule).
-function probeBind(port) {
-  return new Promise((resolve) => {
-    const probe = net.createServer();
-    probe.once('error', (err) => resolve({ ok: false, code: err && err.code }));
-    probe.listen(port, () => probe.close(() => resolve({ ok: true })));
-  });
-}
-
 // Is SOMETHING listening on this port? Used after the install to report the
 // URLs that actually work (the daemon on :80, or on the fallback behind a
 // legacy Caddy that still owns :80).
@@ -130,13 +132,6 @@ function probeListen(port) {
     s.once('timeout', () => { s.destroy(); resolve(false); });
     s.once('error', () => resolve(false));
   });
-}
-
-async function decideServePort() {
-  const r = await probeBind(FRONT_PORT);
-  if (r.ok) return FRONT_PORT;
-  const d = decideBindFallback({ attemptedPort: FRONT_PORT, errorCode: r.code, fallbackPort: FALLBACK_PORT });
-  return d.fallback ? d.port : FRONT_PORT; // nothing bindable — let the daemon surface the real error
 }
 
 // ---------------------------------------------------------------------------
@@ -188,14 +183,18 @@ function readProjects() {
 
 // Interactive runs hand the terminal to the scan child: it may raise the
 // project picker, and a parent spinner redrawing over the child's raw-mode
-// input would garble both. Returns 'cancelled' when the user Ctrl-C'd out of
-// the picker (the scan exits 130 with nothing written) — the caller stops
-// there instead of installing over an abort.
+// input would garble both. Two ways out of that picker come back as exit
+// codes: 130 (Ctrl-C, an abort) and CANCEL_EXIT (q/Esc, "not now"). Either
+// way nothing was written, so the caller stops instead of installing over it;
+// the difference is only what the user sees and what the shell gets.
 async function scanWithStatus(env, interactive) {
   if (interactive) {
     try {
       await runScan(env);
     } catch (err) {
+      // The picker already printed its one line; saying it twice would read
+      // like two different things happened.
+      if (new RegExp(`exited ${CANCEL_EXIT}`).test(String(err.message))) return 'declined';
       if (/exited 130/.test(String(err.message))) {
         process.stdout.write(ui.dim('  cancelled; nothing was changed.\n'));
         return 'cancelled';
@@ -227,7 +226,7 @@ async function scanWithStatus(env, interactive) {
 // The first-run prompt: exactly what will happen, in checkable terms, before a
 // single directory is read. Declining exits with nothing scanned and nothing
 // installed. Re-runs (a registry already exists) skip it — consent was given.
-async function askConsent({ willInstall, willInstallSkill }) {
+async function askConsent({ willInstallSkill }) {
   const { bold, dim, cyan } = ui;
   const out = (s = '') => process.stdout.write(s + '\n');
   out();
@@ -238,18 +237,12 @@ async function askConsent({ willInstall, willInstallSkill }) {
   out(`  this will:`);
   out(`  scan your home folder for dev projects ${dim('· reads config files, writes nothing')}`);
   out(`  let you pick which get a URL: ${bold('http://<name>.localhost')} ${dim('· works only on this machine')}`);
-  if (willInstall) {
-    out(`  install a background service ${dim('· no sudo, keeps the URLs working after reboot')}`);
-    if (willInstallSkill) {
-      out(`  add the add-project skill to ~/.claude/skills ${dim('· for projects the scan misses')}`);
-    }
-    out();
-    out(dim(`  everything is stored in ${tilde(stateDir)} · \`lazydev uninstall\` deletes all of it`));
-  } else {
-    out(`  run them in the foreground ${dim('· Ctrl-C stops everything; the background service is macOS-only for now')}`);
-    out();
-    out(dim(`  everything is stored in ${tilde(stateDir)} · deleting that folder removes all of it`));
+  out(`  install a background service ${dim('· no sudo, keeps the URLs working after reboot')}`);
+  if (willInstallSkill) {
+    out(`  add the add-project skill to ~/.claude/skills ${dim('· for projects the scan misses')}`);
   }
+  out();
+  out(dim(`  everything is stored in ${tilde(stateDir)} · \`lazydev uninstall\` deletes all of it`));
   out();
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
   let answer;
@@ -557,70 +550,6 @@ async function uninstall({ assumeYes }) {
 }
 
 // ---------------------------------------------------------------------------
-// foreground run (non-interactive contexts and Linux)
-// ---------------------------------------------------------------------------
-
-function printForegroundBanner({ projects, servePort, diff, firstRun, startedAt }) {
-  const { bold, dim, cyan } = ui;
-  const out = (s = '') => process.stdout.write(s + '\n');
-  const readyMs = Date.now() - startedAt;
-  out();
-  out(`  ${cyan(bold('lazydev'))} ${dim(`v${VERSION}`)}  ${dim(`ready in ${readyMs} ms`)}`);
-  out();
-  if (!projects.length) {
-    out(`  no projects found under ${tilde(os.homedir())}.`);
-    out(dim(`  a project is anything the scan can prove how to run: package.json with a "dev" script, rails, django with a venv, a static folder; add one and re-run.`));
-  } else {
-    const names = projects.map((p) => p.host);
-    const example = names[0];
-    out(`  ${dim('dashboard')}  ${bold(formatProjectUrl('lazydev', servePort))}`);
-    out(`  ${dim('projects')}   ${bold(formatProjectUrl('<name>', servePort))} ${dim(`for each of ${names.length} projects, e.g. ${formatProjectUrl(example, servePort)}`)}`);
-    if (diff && (diff.added.length || diff.removed.length)) {
-      const part = [];
-      if (diff.added.length) part.push(`+${diff.added.length} new: ${diff.added.slice(0, 3).join(', ')}${diff.added.length > 3 ? ', ...' : ''}`);
-      if (diff.removed.length) part.push(`${diff.removed.length} gone: ${diff.removed.slice(0, 3).join(', ')}${diff.removed.length > 3 ? ', ...' : ''}`);
-      out(`  ${dim('scan')}       ${part.join(dim(' · '))}`);
-    }
-  }
-  if (servePort !== FRONT_PORT) {
-    out();
-    out(dim(`  :${FRONT_PORT} is busy, so URLs carry :${servePort} for this run.`));
-  }
-  if (firstRun) {
-    out();
-    out(dim(`  first run: the registry lives at ${tilde(configPath)}; edit it to rename, re-port, or exclude projects.`));
-  }
-  out();
-  out(dim(`  Ctrl-C stops this foreground run · logs: ${tilde(logsDir)}`));
-  out();
-}
-
-// Spawn the daemon in the foreground, stdio inherited. It stays attached to this
-// process group, so Ctrl-C (SIGINT) reaches it and its own SIGINT/SIGTERM
-// handler shuts the children down cleanly. Resolves with the exit code.
-function runDaemon(env) {
-  return new Promise((resolve) => {
-    const child = spawn(process.execPath, [DAEMON], {
-      cwd: ROOT,
-      env,
-      stdio: 'inherit',
-    });
-    // Forward the signals a user or supervisor might send, so the daemon child
-    // gets them even if this launcher is the one signalled directly.
-    const forward = (sig) => {
-      try { child.kill(sig); } catch { /* already gone */ }
-    };
-    process.on('SIGINT', () => forward('SIGINT'));
-    process.on('SIGTERM', () => forward('SIGTERM'));
-    child.on('error', (err) => {
-      process.stderr.write(`lazydev: could not start the daemon: ${err.message}\n`);
-      resolve(1);
-    });
-    child.on('exit', (code, signal) => resolve(signal ? 0 : code || 0));
-  });
-}
-
-// ---------------------------------------------------------------------------
 // Tool preflight. The daemon resolves start commands under the plist PATH,
 // not the user's shell PATH. Those must agree BINARY BY BINARY, not just
 // name by name: the tradepulse incident was two pnpms on one machine —
@@ -809,29 +738,746 @@ function cmdLogs(args) {
 }
 
 // ---------------------------------------------------------------------------
+// control API: the runtime half of the CLI.
+//
+// `status`, `stop`, `restart`, `wake`, `attach` and `logs -f` ask the LIVE
+// daemon, because only it knows what is running, on which pid, and how long it
+// has been idle. The capability token in <state>/control-token is the
+// authorization (the daemon also wants same-origin, which a request carrying
+// no Origin header satisfies); a CLI on this machine can read that file
+// precisely because it is the user's own shell.
+// ---------------------------------------------------------------------------
+
+const NOT_RUNNING = 'lazydev is not running; run `lazydev` to start it';
+
+function controlToken() {
+  try {
+    return fs.readFileSync(tokenPath, 'utf8').trim();
+  } catch {
+    return ''; // no daemon has ever minted one, so the request 403s and we say so
+  }
+}
+
+// timeoutMs is the CLI's own backstop, not the daemon's: a bring-up POST
+// (`up`, `restart`) answers only once the start has settled, and the daemon
+// caps that itself with startTimeoutMs, so those callers pass a longer one
+// than the read paths need.
+function controlRequest(port, method, pathname, body, { timeoutMs = 5000 } = {}) {
+  return new Promise((resolve, reject) => {
+    const payload = body === undefined ? null : Buffer.from(JSON.stringify(body));
+    const req = http.request(
+      {
+        host: '127.0.0.1',
+        port,
+        method,
+        path: pathname,
+        headers: {
+          // The daemon routes by Host; the control plane lives on its own host.
+          host: 'lazydev.localhost',
+          'x-lazydev-token': controlToken(),
+          ...(payload ? { 'content-type': 'application/json', 'content-length': payload.length } : {}),
+        },
+      },
+      (res) => {
+        let b = '';
+        res.setEncoding('utf8');
+        res.on('data', (c) => (b += c));
+        res.on('end', () => {
+          let json = null;
+          try { json = JSON.parse(b); } catch { /* an HTML error page, not JSON */ }
+          resolve({ status: res.statusCode, body: b, json });
+        });
+      }
+    );
+    req.on('error', reject);
+    req.setTimeout(timeoutMs, () => req.destroy(new Error('control request timed out')));
+    if (payload) req.write(payload);
+    req.end();
+  });
+}
+
+// Which port is the daemon actually on: the front door, or the numbered
+// fallback it took when :80 was spoken for? GET /__lazydev/status is the probe
+// rather than a bare TCP connect, because "something is listening" is not
+// "lazydev is listening". Returns { port, status } or null.
+async function findDaemon() {
+  for (const port of new Set([FRONT_PORT, FALLBACK_PORT])) {
+    try {
+      const r = await controlRequest(port, 'GET', '/__lazydev/status');
+      if (r.status === 200 && r.json && Array.isArray(r.json.projects)) return { port, status: r.json };
+    } catch { /* nothing of ours there */ }
+  }
+  return null;
+}
+
+function notRunning() {
+  process.stderr.write(`lazydev: ${NOT_RUNNING}\n`);
+  return 3;
+}
+
+function needHost(cmd, usage) {
+  process.stderr.write(`lazydev: ${cmd} needs a project name. usage: ${usage}\n`);
+  return 1;
+}
+
+// ---------------------------------------------------------------------------
+// the command table, printed by -h/--help/help and again under any unknown
+// command, because the fix for a typo is the list of what exists.
+// ---------------------------------------------------------------------------
+
+function helpText() {
+  const { bold, dim } = ui;
+  return [
+    '',
+    `  ${bold('lazydev')} ${dim(`v${VERSION}`)}  ${dim('every project gets a URL that starts its dev server on request')}`,
+    '',
+    `  lazydev                     ${dim('first run: consent, scan, install. later: rescan')}`,
+    `  lazydev status              ${dim('every project, state, port, idle, one line each')}`,
+    `  lazydev add [dir] [--cmd "..."] [--port N] [--name host] [--parked]`,
+    `  lazydev remove <host>`,
+    `  lazydev enable <host> | disable <host>`,
+    `  lazydev port <host> <N>`,
+    `  lazydev rename <host> <new>`,
+    `  lazydev stop <host> | restart <host> | wake <host>`,
+    `  lazydev open <host>         ${dim('open http://<host>.localhost in the default browser')}`,
+    `  lazydev logs <host> [-n N] [-f]`,
+    `  lazydev attach <host>       ${dim("your terminal becomes the dev server's terminal")}`,
+    `  lazydev install             ${dim('force a reinstall (rebake the service PATH)')}`,
+    `  lazydev uninstall`,
+    '',
+    `  ${dim('-h, --help     this table')}`,
+    `  ${dim('-v, --version  print the version')}`,
+    '',
+    '',
+  ].join('\n');
+}
+
+// argv into flags and positionals. A flag with no value (--parked, -f, -y) is
+// a boolean; anything else takes the next argument, so `--cmd "npm run dev"`
+// keeps its quoted value and `--port=3010` works too.
+const BOOLEAN_FLAGS = new Set(['--parked', '--yes', '-y', '-f', '--follow', '-h', '--help', '-v', '--version', '--all']);
+
+function parseArgv(argv) {
+  const flags = new Map();
+  const rest = [];
+  for (let i = 0; i < argv.length; i += 1) {
+    const a = argv[i];
+    if (a.length > 1 && a.startsWith('-')) {
+      const eq = a.indexOf('=');
+      if (eq !== -1) {
+        flags.set(a.slice(0, eq), a.slice(eq + 1));
+      } else if (BOOLEAN_FLAGS.has(a)) {
+        flags.set(a, true);
+      } else {
+        flags.set(a, argv[++i]);
+      }
+      continue;
+    }
+    rest.push(a);
+  }
+  return { flags, rest };
+}
+
+// ---------------------------------------------------------------------------
+// registry subcommands. Every one writes projects.json through
+// lib/registry-cli.mjs and stops. The daemon watches that file, so there is no
+// second step; where a change would strand a running server (a removed
+// project, a renamed host, a disabled one) the server is stopped first over
+// the control API.
+// ---------------------------------------------------------------------------
+
+function loadRegistry() {
+  if (!fs.existsSync(configPath)) {
+    throw new RegistryError(`no registry yet at ${tilde(configPath)}; run \`lazydev\` once first.`);
+  }
+  return readRegistry(configPath);
+}
+
+// Best-effort stop: used before an edit that would otherwise leave a dev
+// server running under a name the registry no longer has. A dead daemon means
+// nothing is running, which is the same outcome.
+async function stopIfRunning(host) {
+  const live = await findDaemon();
+  if (!live) return;
+  try {
+    await controlRequest(live.port, 'POST', `/__lazydev/stop/${encodeURIComponent(host)}`);
+  } catch { /* it was not running */ }
+}
+
+async function cmdAdd({ flags, rest }) {
+  const { bold, dim } = ui;
+  const out = (s = '') => process.stdout.write(s + '\n');
+
+  const dir = path.resolve(expandTilde(rest[0] || process.cwd()));
+  if (!fs.existsSync(dir)) {
+    process.stderr.write(`lazydev: no such directory: ${dir}\n`);
+    return 1;
+  }
+  const nameFlag = flags.get('--name');
+  const host = sanitizeHost(typeof nameFlag === 'string' && nameFlag ? nameFlag : path.basename(dir));
+  const cmdFlag = flags.get('--cmd');
+  const portFlag = flags.get('--port');
+  const parked = flags.get('--parked') === true;
+
+  // The detectors only run when the user did not say how to start the project.
+  // A wrong startCmd executes arbitrary code on every visit to the URL, so the
+  // bar here is the same proof scan.mjs demands, and an unprovable folder
+  // gets the evidence list, not a guess.
+  let det = null;
+  if (typeof cmdFlag !== 'string' || !cmdFlag.trim()) {
+    det = detectOne(dir);
+    if (!det) {
+      out();
+      out(`  nothing provable in ${bold(tilde(dir))}. the detectors looked for:`);
+      for (const [name, evidence] of DETECTOR_EVIDENCE) out(`    ${name.padEnd(7)} ${dim(evidence)}`);
+      out();
+      out(`  say how it starts and it is registered either way:`);
+      out(`    ${bold(`lazydev add ${tilde(dir)} --cmd "npm run dev"`)}`);
+      out(dim('    the command runs with cwd set to that folder and PORT in the environment.'));
+      out();
+      return 1;
+    }
+  }
+
+  ensureStateDir();
+  const reg = fs.existsSync(configPath) ? readRegistry(configPath) : { projects: [] };
+  const known = reg.projects.find((p) => p.dir === dir) || null;
+
+  // The port has to be settled BEFORE the start command: rails and django
+  // ignore the injected PORT, so their command carries the number.
+  let port;
+  if (portFlag !== undefined && portFlag !== true) port = Number(portFlag);
+  else if (det && det.fixedPort) port = det.fixedPort;
+  else if (known) port = known.port;
+  else port = await pickPort(reg);
+
+  // Re-adding a folder updates its entry in place, so this is also a port
+  // change and a rename. Remember what it was: a running server under the old
+  // host or on the old port has to be stopped, or the daemon proxies to a port
+  // nothing answers on, and a record keyed by a host the registry no longer has
+  // can never be stopped or reaped again.
+  const wasHost = known ? known.host : null;
+  const wasPort = known ? known.port : null;
+
+  const startCmd = det ? startCmdFor(det, port) : String(cmdFlag).trim();
+  const { entry, updated } = await addEntry(reg, {
+    host,
+    dir,
+    startCmd,
+    port,
+    framework: det ? det.framework : 'node',
+    parked,
+    fixedPort: det && det.fixedPort,
+  });
+  if (wasHost !== null && (wasHost !== entry.host || wasPort !== entry.port)) {
+    await stopIfRunning(wasHost);
+  }
+  writeRegistry(configPath, reg);
+
+  const live = await findDaemon();
+  out();
+  out(`  ${updated ? 'updated' : 'registered'} ${bold(entry.host)} ${dim(`:${entry.port}`)}`);
+  out(`    ${dim('dir')}    ${tilde(entry.dir)}`);
+  out(`    ${dim('start')}  ${entry.startCmd}`);
+  if (entry.enabled === false) {
+    out(`    ${dim(`parked · \`lazydev enable ${entry.host}\` turns it on`)}`);
+  } else if (live) {
+    out(`    ${dim('url')}    ${bold(formatProjectUrl(entry.host, live.port))}`);
+  } else {
+    out(`    ${dim(NOT_RUNNING)}`);
+  }
+  out();
+  return 0;
+}
+
+async function cmdRemove(host) {
+  if (!host) return needHost('remove', 'lazydev remove <host>');
+  const reg = loadRegistry();
+  const entry = removeEntry(reg, host); // throws before anything is stopped
+  await stopIfRunning(host);
+  writeRegistry(configPath, reg);
+  process.stdout.write(`  removed ${ui.bold(host)}. ${ui.dim(`${tilde(entry.dir)} was not touched.`)}\n`);
+  return 0;
+}
+
+async function cmdEnable(host, enabled) {
+  const verb = enabled ? 'enable' : 'disable';
+  if (!host) return needHost(verb, `lazydev ${verb} <host>`);
+  const reg = loadRegistry();
+  setEnabled(reg, host, enabled);
+  if (!enabled) await stopIfRunning(host);
+  writeRegistry(configPath, reg);
+  process.stdout.write(`  ${host} is ${enabled ? 'enabled' : 'disabled'}.\n`);
+  return 0;
+}
+
+async function cmdPort(host, value) {
+  if (!host || value === undefined) {
+    process.stderr.write('lazydev: usage: lazydev port <host> <N>\n');
+    return 1;
+  }
+  // A running server is bound to the old port; changing the registry under it
+  // would leave the daemon proxying to a port nothing answers on.
+  const live = await findDaemon();
+  const row = live ? live.status.projects.find((p) => p.host === host) : null;
+  if (row && row.state === 'running') {
+    process.stderr.write(`lazydev: ${host} is running on :${row.port}. stop it first: lazydev stop ${host}\n`);
+    return 1;
+  }
+  const reg = loadRegistry();
+  const entry = setPort(reg, host, value);
+  writeRegistry(configPath, reg);
+  process.stdout.write(`  ${host} now starts on :${entry.port}.\n`);
+  return 0;
+}
+
+async function cmdRename(from, to) {
+  if (!from || !to) {
+    process.stderr.write('lazydev: usage: lazydev rename <host> <new>\n');
+    return 1;
+  }
+  const reg = loadRegistry();
+  renameEntry(reg, from, to); // validates before anything is stopped
+  // The runtime record is keyed by host, so an owned server under the old name
+  // is stopped; the next hit on the new URL is an ordinary cold start.
+  await stopIfRunning(from);
+  writeRegistry(configPath, reg);
+  const live = await findDaemon();
+  process.stdout.write(`  ${from} is now ${ui.bold(to)}${live ? ` ${ui.dim(formatProjectUrl(to, live.port))}` : ''}\n`);
+  return 0;
+}
+
+// ---------------------------------------------------------------------------
+// runtime subcommands
+// ---------------------------------------------------------------------------
+
+function fmtIdle(ms) {
+  if (ms == null) return '';
+  const s = Math.floor(ms / 1000);
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}m`;
+  const h = Math.floor(m / 60);
+  return `${h}h ${m % 60}m`;
+}
+
+async function cmdStatus() {
+  const { bold, dim, green, red } = ui;
+  const out = (s = '') => process.stdout.write(s + '\n');
+  const live = await findDaemon();
+  if (!live) return notRunning();
+  const rows = live.status.projects;
+  out();
+  // Spec section 6: with no python3 the dev servers run on plain pipes, the
+  // terminal panel is read-only, and this is the one line that says so. The
+  // daemon works it out (it is the process that looks for the interpreter) and
+  // ships it in the status payload; printing it once, above the rows, is the
+  // whole of the CLI's half.
+  if (live.status.pty && live.status.pty.note) {
+    out(dim(`  ${live.status.pty.note}`));
+    out();
+  }
+  if (!rows.length) {
+    out(`  no projects registered. ${dim('`lazydev add [dir]` registers one, `lazydev` rescans.')}`);
+    out();
+    return 0;
+  }
+  const w = Math.max(...rows.map((r) => r.host.length));
+  for (const r of rows) {
+    const state = !r.enabled ? 'disabled' : r.conflict ? 'conflict' : r.state;
+    const mark = state === 'running' ? green('*') : state === 'conflict' ? red('!') : dim('.');
+    const notes = [];
+    if (state === 'running' && !r.owned) notes.push('external');
+    if (state === 'running' && r.idleForMs != null) notes.push(`idle ${fmtIdle(r.idleForMs)}`);
+    if (state === 'conflict' && r.conflictDir) notes.push(`port held by ${tilde(r.conflictDir)}`);
+    out(`  ${mark} ${r.host.padEnd(w)}  ${state.padEnd(8)} ${dim(`:${r.port}`)}${notes.length ? dim(`  ${notes.join(' · ')}`) : ''}`);
+  }
+  out();
+  out(dim(`  dashboard ${formatProjectUrl('lazydev', live.port)} · sleeps after ${fmtIdle(live.status.idleTimeoutMs)} idle · \`lazydev logs <host>\``));
+  out();
+  return 0;
+}
+
+// stop / wake / restart. restart is ONE daemon call, not stop-then-wake: stop()
+// returns as soon as the SIGTERM is sent, and a dev server that holds its port
+// for even a moment after that (Next, Vite, Rails all do) is still listening
+// when the wake probes it, so the wake finds a listener in the project's own
+// folder and adopts the process we just killed. /__lazydev/restart waits for
+// the port to go quiet in between, and writes one log separator for the start
+// that follows.
+async function cmdRuntime(action, host) {
+  if (!host) return needHost(action, `lazydev ${action} <host>`);
+  const live = await findDaemon();
+  if (!live) return notRunning();
+  const row = live.status.projects.find((p) => p.host === host);
+  if (!row) {
+    process.stderr.write(`lazydev: no project named "${host}". \`lazydev status\` lists them.\n`);
+    return 1;
+  }
+  const post = (p, opts) => controlRequest(live.port, 'POST', p, undefined, opts);
+  // A wake or a restart holds the connection open for the whole bring-up
+  // (install included), so the CLI waits out anything the daemon is willing
+  // to wait out rather than reporting a timeout the daemon never hit.
+  const bringUp = { timeoutMs: 15 * 60_000 };
+
+  if (action === 'stop') {
+    const r = await post(`/__lazydev/stop/${encodeURIComponent(host)}`);
+    if (r.status === 403) {
+      process.stderr.write('lazydev: the daemon refused the control token; run `lazydev` to reinstall it.\n');
+      return 1;
+    }
+    const ok = r.json && r.json.ok;
+    process.stdout.write(ok ? `  stopped ${host}.\n` : `  ${host} was not running (${(r.json && r.json.reason) || 'stopped'}).\n`);
+    return 0;
+  }
+
+  const r = await post(
+    action === 'restart'
+      ? `/__lazydev/restart/${encodeURIComponent(host)}`
+      : `/__lazydev/up/${encodeURIComponent(host)}`,
+    bringUp
+  );
+  if (r.status === 403) {
+    process.stderr.write('lazydev: the daemon refused the control token; run `lazydev` to reinstall it.\n');
+    return 1;
+  }
+  if (r.status === 200) {
+    process.stdout.write(`  ${action === 'restart' ? 'restarted' : 'woke'} ${host} ${ui.dim(formatProjectUrl(host, live.port))}\n`);
+    return 0;
+  }
+  if (r.status === 409) {
+    process.stderr.write(`lazydev: ${host} is disabled. \`lazydev enable ${host}\` first.\n`);
+    return 1;
+  }
+  process.stderr.write(`lazydev: ${host} did not come up (${(r.json && r.json.reason) || r.status}). \`lazydev logs ${host}\` has its output.\n`);
+  return 1;
+}
+
+// `open` uses macOS's own `open`, so the URL lands in whatever the user set as
+// their default browser. The port is the one the daemon actually answers on.
+async function cmdOpen(host) {
+  if (!host) return needHost('open', 'lazydev open <host>');
+  const live = await findDaemon();
+  if (!live) return notRunning();
+  if (!live.status.projects.some((p) => p.host === host) && host !== 'lazydev') {
+    process.stderr.write(`lazydev: no project named "${host}". \`lazydev status\` lists them.\n`);
+    return 1;
+  }
+  const url = formatProjectUrl(host, live.port);
+  const r = spawnSync('open', [url], { stdio: 'ignore' });
+  if (r.status !== 0) {
+    process.stderr.write(`lazydev: could not open ${url}\n`);
+    return 1;
+  }
+  process.stdout.write(`  ${url}\n`);
+  return 0;
+}
+
+// ---------------------------------------------------------------------------
+// attach / logs -f: the two CLI clients of the per-project terminal socket.
+//
+// Both open GET /__lazydev/term/<host>, a WebSocket upgrade the daemon serves
+// on its control plane (spec 0.3.0 section 6). The daemon's first frame is the
+// scrollback, then live pty bytes; the client speaks `i:<bytes>` for input and
+// `r:<rows>,<cols>` for a resize.
+//
+// attach puts the local tty in raw mode and relays both ways, so Ctrl-C, a
+// Vite keystroke and a `(y/n)` prompt all reach the dev server. `logs -f` is
+// the same socket with the escapes stripped and no raw mode, so it reads like
+// the log file it is following.
+//
+// Neither one owns the dev server: it is lazydev's child, started before this
+// shell and outliving it. Detaching stops nothing.
+// ---------------------------------------------------------------------------
+
+const TERM_PATH = '/__lazydev/term/';
+const DETACH_BYTE = 0x1d; // Ctrl-]
+// Signals worth cleaning up for. Ctrl-C is NOT one of them while attached: raw
+// mode turns it into a 0x03 byte for the dev server, which is the point.
+const LEAVE_SIGNALS = ['SIGINT', 'SIGTERM', 'SIGHUP'];
+
+// Complete escape sequences, the same four patterns the daemon runs before it
+// writes <host>.log, so a `logs -f` and a `lazydev logs` of one run read alike.
+// ESC [ and ESC ] stay out of ESC2_RE so a CSI or OSC split across two frames
+// is carried rather than eaten one character at a time.
+const OSC_RE = /\u001b\][^\u0007\u001b]*(?:\u0007|\u001b\\)/g;
+const CSI_RE = /\u001b\[[0-9;:?<>=!]*[ -\/]*[@-~]/g;
+const ESC2_RE = /\u001b[()#][0-9A-Za-z]|\u001b[@A-Z\\^_=><]/g;
+const CTRL_RE = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g;
+
+// Frames in, plain text out. Stateful: whatever might still be the start of a
+// sequence is held back until the next frame completes it.
+function makeStripper() {
+  let carry = '';
+  return (buf) => {
+    let text = carry + buf.toString('utf8');
+    carry = '';
+    text = text.replace(OSC_RE, '').replace(CSI_RE, '').replace(ESC2_RE, '');
+    // A leftover ESC is an incomplete sequence. Capped, so one stray ESC byte
+    // cannot stall the stream forever.
+    const esc = text.lastIndexOf('\u001b');
+    if (esc >= 0 && text.length - esc <= 64) {
+      carry = text.slice(esc);
+      text = text.slice(0, esc);
+    }
+    if (text.endsWith('\r')) {
+      carry = '\r' + carry;
+      text = text.slice(0, -1);
+    }
+    // A pty ends lines with CRLF and redraws a progress line with a bare CR.
+    // Both become newlines, which is what makes the output greppable.
+    return text.replace(/\r\n/g, '\n').replace(/\r/g, '\n').replace(CTRL_RE, '');
+  };
+}
+
+// Every frame the daemon sends is terminal bytes: binary for pty output, text
+// for the lines the daemon writes itself (the start separator, the read-only
+// note).
+function frameBytes(data) {
+  return typeof data === 'string' ? Buffer.from(data, 'utf8') : Buffer.from(data);
+}
+
+// Open the terminal socket, resolved once the handshake is up.
+//
+// 127.0.0.1 and not lazydev.localhost: the daemon routes on the Host header,
+// an IP literal names no project (which IS the control plane the terminal
+// socket demands), and it skips a DNS lookup that answers ::1 on a machine
+// whose daemon is bound to 127.0.0.1.
+//
+// The token rides in Sec-WebSocket-Protocol rather than a header because the
+// dashboard's panel cannot set headers on a WebSocket, and one auth path for
+// both clients is one path to keep right.
+function openTermSocket(port, host) {
+  const token = controlToken();
+  if (!token) throw new Error('no control token in the state dir; run `lazydev` to mint one');
+  const ws = new WebSocket(`ws://127.0.0.1:${port}${TERM_PATH}${encodeURIComponent(host)}`, [token]);
+  ws.binaryType = 'arraybuffer'; // raw pty bytes, not a Blob to await
+  return new Promise((resolve, reject) => {
+    ws.addEventListener('open', () => resolve(ws), { once: true });
+    // A refused handshake reaches the client as a bare Event with no status on
+    // it, so the message says what the caller can act on instead of guessing.
+    ws.addEventListener('error', () => reject(new Error('the daemon refused the terminal socket')), { once: true });
+  });
+}
+
+// `lazydev attach <host>`: this terminal becomes the dev server's terminal.
+function attachTerm(ws, host) {
+  const { bold, dim } = ui;
+  const stdin = process.stdin;
+  let rawOn = false;
+
+  // One restore, idempotent, reachable from every way out: Ctrl-], the socket
+  // closing, a signal, and process exit itself. A tty left in raw mode is a
+  // shell that stopped echoing, which is the worst thing this could leave
+  // behind, so the 'exit' hook stays registered even after a clean detach.
+  const restore = () => {
+    if (!rawOn) return;
+    rawOn = false;
+    try {
+      stdin.setRawMode(false);
+    } catch {
+      /* the tty went away before we did */
+    }
+  };
+  process.on('exit', restore);
+
+  return new Promise((resolve) => {
+    let done = false;
+
+    const sendSize = () => {
+      const { rows, columns } = process.stdout;
+      if (!rows || !columns) return; // not a tty: the daemon's startup size stands
+      try {
+        ws.send(`r:${rows},${columns}`);
+      } catch {
+        /* the socket is on its way out */
+      }
+    };
+
+    const onInput = (chunk) => {
+      const at = chunk.indexOf(DETACH_BYTE);
+      const upto = at === -1 ? chunk : chunk.subarray(0, at);
+      // utf8 on purpose: the daemon writes the frame's text straight into the
+      // pty, and the dashboard panel sends strings too, so both clients decode
+      // the same way.
+      if (upto.length) {
+        try {
+          ws.send('i:' + upto.toString('utf8'));
+        } catch {
+          /* the socket is on its way out */
+        }
+      }
+      if (at !== -1) leave(0, `\r\n  detached. ${host} keeps running; \`lazydev stop ${host}\` stops it.\n`);
+    };
+
+    const onWinch = () => sendSize();
+    const onSignal = () => leave(130, `\r\n  detached. ${host} keeps running.\n`);
+
+    function leave(code, note) {
+      if (done) return;
+      done = true;
+      restore();
+      process.removeListener('SIGWINCH', onWinch);
+      for (const sig of LEAVE_SIGNALS) process.removeListener(sig, onSignal);
+      stdin.removeListener('data', onInput);
+      // pause() stops the reading; unref() is what lets the process actually
+      // exit. A resumed stdin pipe stays refed on its own, so without this the
+      // shell hangs on a detach that has already printed its goodbye.
+      stdin.pause();
+      if (stdin.unref) stdin.unref();
+      try {
+        ws.close();
+      } catch {
+        /* already gone */
+      }
+      if (note) process.stdout.write(note);
+      resolve(code);
+    }
+
+    ws.addEventListener('message', (ev) => process.stdout.write(frameBytes(ev.data)));
+    ws.addEventListener('close', () => leave(0, `\r\n  ${host}: the terminal socket closed.\n`));
+    ws.addEventListener('error', () => leave(1, `\r\n  ${host}: the terminal socket dropped.\n`));
+
+    if (stdin.isTTY && stdin.setRawMode) {
+      stdin.setRawMode(true);
+      rawOn = true;
+    }
+    stdin.on('data', onInput);
+    stdin.resume();
+    process.on('SIGWINCH', onWinch);
+    for (const sig of LEAVE_SIGNALS) process.on(sig, onSignal);
+
+    // Tell the pty how big this window is before anything draws into it.
+    sendSize();
+    process.stdout.write(
+      `  attached to ${bold(host)}. ${dim("ctrl-] detaches. the dev server is lazydev's, not this shell's, so it keeps running.")}\n`
+    );
+  });
+}
+
+// `lazydev logs -f <host>`: the same socket, one direction, escapes stripped.
+// Ctrl-C is the way out and reports 130, like every other follow.
+function followTerm(ws, host) {
+  const strip = makeStripper();
+  return new Promise((resolve) => {
+    let done = false;
+    const onSignal = () => leave(130);
+    function leave(code) {
+      if (done) return;
+      done = true;
+      for (const sig of LEAVE_SIGNALS) process.removeListener(sig, onSignal);
+      try {
+        ws.close();
+      } catch {
+        /* already gone */
+      }
+      resolve(code);
+    }
+    ws.addEventListener('message', (ev) => {
+      const text = strip(frameBytes(ev.data));
+      if (text) process.stdout.write(text);
+    });
+    ws.addEventListener('close', () => leave(0));
+    ws.addEventListener('error', () => {
+      process.stderr.write(`lazydev: ${host}: the terminal socket dropped.\n`);
+      leave(1);
+    });
+    for (const sig of LEAVE_SIGNALS) process.on(sig, onSignal);
+  });
+}
+
+async function cmdTerminal(host, { follow = false } = {}) {
+  const what = follow ? 'logs -f' : 'attach';
+  if (!host) return needHost(what, follow ? 'lazydev logs <host> -f' : 'lazydev attach <host>');
+  const live = await findDaemon();
+  if (!live) return notRunning();
+  if (!live.status.projects.some((p) => p.host === host)) {
+    process.stderr.write(`lazydev: no project named "${host}". \`lazydev status\` lists them.\n`);
+    return 1;
+  }
+  let ws;
+  try {
+    ws = await openTermSocket(live.port, host);
+  } catch (err) {
+    process.stderr.write(`lazydev: ${what} could not open ${host}'s terminal: ${err.message}\n`);
+    return 1;
+  }
+  return follow ? await followTerm(ws, host) : await attachTerm(ws, host);
+}
+
+// ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
 
 async function main() {
-  const args = process.argv.slice(2);
-  const assumeYes = args.includes('--yes') || args.includes('-y');
-  const cmd = args.find((a) => !a.startsWith('-')) || '';
+  const argv = process.argv.slice(2);
+  const { flags, rest } = parseArgv(argv);
+  const cmd = rest[0] || '';
 
-  if (cmd === 'uninstall') return uninstall({ assumeYes });
-  if (cmd === 'logs') return cmdLogs(args.slice(args.indexOf('logs') + 1));
-  if (cmd && cmd !== 'install') {
-    process.stderr.write(`lazydev: unknown command "${cmd}". run with no arguments to install/rescan, \`lazydev logs <host>\`, or \`lazydev uninstall\`.\n`);
-    return 1;
+  // First, and before the state dir exists: these two answer questions ABOUT
+  // lazydev rather than doing anything with it, so `npx @jbitar/lazydev --help`
+  // on a fresh machine leaves that machine exactly as it was.
+  if (cmd === 'help' || flags.has('-h') || flags.has('--help')) {
+    process.stdout.write(helpText());
+    return 0;
+  }
+  if (flags.has('-v') || flags.has('--version')) {
+    process.stdout.write(`${VERSION}\n`);
+    return 0;
   }
 
+  // macOS only. The install IS a user LaunchAgent and the front door is :80
+  // with a per-connection loopback guard; there is no half of that worth
+  // shipping elsewhere, and a foreground fallback taught people a lazydev that
+  // stops when the terminal closes.
+  if (process.platform !== 'darwin') {
+    process.stderr.write('lazydev runs on macOS. Linux support is not planned.\n');
+    return 2;
+  }
+
+  const assumeYes = flags.has('--yes') || flags.has('-y');
+  const host = rest[1] || '';
+
+  try {
+    switch (cmd) {
+      case '':
+      case 'install':
+        break; // the install / rescan path below
+      case 'uninstall': return await uninstall({ assumeYes });
+      case 'status': return await cmdStatus();
+      case 'add': return await cmdAdd({ flags, rest: rest.slice(1) });
+      case 'remove': return await cmdRemove(host);
+      case 'enable': return await cmdEnable(host, true);
+      case 'disable': return await cmdEnable(host, false);
+      case 'port': return await cmdPort(host, rest[2]);
+      case 'rename': return await cmdRename(host, rest[2]);
+      case 'stop':
+      case 'restart':
+      case 'wake': return await cmdRuntime(cmd, host);
+      case 'open': return await cmdOpen(host);
+      case 'attach': return await cmdTerminal(host);
+      case 'logs':
+        // Plain `logs` reads the file off disk and never asks the daemon, so a
+        // wedged daemon is exactly when it still works. `-f` is the live
+        // stream, which only the daemon has.
+        return flags.has('-f') || flags.has('--follow')
+          ? await cmdTerminal(host, { follow: true })
+          : cmdLogs(argv.slice(argv.indexOf('logs') + 1));
+      default:
+        process.stderr.write(`lazydev: unknown command ${cmd}\n`);
+        process.stderr.write(helpText());
+        return 1;
+    }
+  } catch (err) {
+    if (err instanceof RegistryError) {
+      process.stderr.write(`lazydev: ${err.message}\n`);
+      return 1;
+    }
+    throw err;
+  }
+
+  // ---- the bare run: consent, scan, install (or rescan) --------------------
   const interactive = process.stdin.isTTY && process.stdout.isTTY;
-  // The install needs launchd, so it is macOS + a human at the terminal (or an
-  // explicit --yes / `install`). Everything else — CI, pipes, Linux — serves in
-  // the foreground with the same scan and the same state dir.
-  const willInstall =
-    process.platform === 'darwin' &&
-    (interactive || assumeYes || cmd === 'install') &&
-    process.env.LAZYDEV_NO_INSTALL !== '1';
 
   ensureStateDir();
   const startedAt = Date.now();
@@ -843,11 +1489,19 @@ async function main() {
   }
   const firstRun = !fs.existsSync(configPath);
 
-  const willInstallSkill =
-    willInstall && fs.existsSync(SKILL_SRC) && fs.existsSync(path.join(os.homedir(), '.claude'));
+  // A first run asks before it installs a LaunchAgent, and a pipe has nobody
+  // to ask. `--yes` is that answer given up front, which is how a script
+  // installs. With a registry already there, consent is on record and a
+  // non-interactive run just rescans, as it always did.
+  if (firstRun && !interactive && !assumeYes) {
+    process.stderr.write('lazydev: first run needs a terminal (it asks before installing)\n');
+    return 1;
+  }
+
+  const willInstallSkill = fs.existsSync(SKILL_SRC) && fs.existsSync(path.join(os.homedir(), '.claude'));
 
   if (firstRun && interactive && !assumeYes) {
-    const ok = await askConsent({ willInstall, willInstallSkill });
+    const ok = await askConsent({ willInstallSkill });
     if (!ok) {
       process.stdout.write('  ok. nothing was scanned, nothing was installed.\n\n');
       return 0;
@@ -855,75 +1509,59 @@ async function main() {
     process.stdout.write('\n');
   }
 
-  if (willInstall) {
-    const outcome = await scanWithStatus(childEnvFor(FRONT_PORT, { scanAll: assumeYes }), interactive);
-    if (outcome === 'cancelled') return 130;
-    const projects = readProjects();
+  const outcome = await scanWithStatus(childEnvFor(FRONT_PORT, { scanAll: assumeYes }), interactive);
+  if (outcome === 'declined') return 0; // picker q/Esc, which printed its own line
+  if (outcome === 'cancelled') return 130;
+  const projects = readProjects();
 
-    // A re-run with a healthy daemon of this same version IS the rescan: the
-    // daemon watches projects.json and reloads on its own, so replacing the
-    // LaunchAgent here would only kill the dev servers it is holding. The
-    // full install runs when nothing answers, the version changed (an npx of
-    // a newer release supersedes the installed copy), or the user typed
-    // `lazydev install` — the explicit form is the sanctioned way to force a
-    // plist rewrite, e.g. after the preflight flags a stale service PATH.
-    if (cmd !== 'install' && (IS_CHECKOUT ? plistRunsCheckout() : installedVersion() === VERSION)) {
-      for (const port of [FRONT_PORT, FALLBACK_PORT]) {
-        if (await probeListen(port)) {
-          printInstalledBanner({ projects, port, startedAt, skillInstalled: false, verb: 'rescanned' });
-          // Preflight against the DEPLOYED plist PATH — what the daemon is
-          // actually resolving with right now. A tool that broke or diverged
-          // since install surfaces here, on the next casual `lazydev`, not at
-          // 3am via a start timeout.
-          printToolWarnings(await preflightTools(toolsToVerify(projects), deployedPathEnv()));
-          return 0;
-        }
+  // A re-run with a healthy daemon of this same version IS the rescan: the
+  // daemon watches projects.json and reloads on its own, so replacing the
+  // LaunchAgent here would only kill the dev servers it is holding. The
+  // full install runs when nothing answers, the version changed (an npx of
+  // a newer release supersedes the installed copy), or the user typed
+  // `lazydev install` — the explicit form is the sanctioned way to force a
+  // plist rewrite, e.g. after the preflight flags a stale service PATH.
+  if (cmd !== 'install' && (IS_CHECKOUT ? plistRunsCheckout() : installedVersion() === VERSION)) {
+    for (const port of [FRONT_PORT, FALLBACK_PORT]) {
+      if (await probeListen(port)) {
+        printInstalledBanner({ projects, port, startedAt, skillInstalled: false, verb: 'rescanned' });
+        // Preflight against the DEPLOYED plist PATH — what the daemon is
+        // actually resolving with right now. A tool that broke or diverged
+        // since install surfaces here, on the next casual `lazydev`, not at
+        // 3am via a start timeout.
+        printToolWarnings(await preflightTools(toolsToVerify(projects), deployedPathEnv()));
+        return 0;
       }
     }
-
-    let result;
-    const spin = makeSpinner({ isTTY: process.stdout.isTTY, styler: ui });
-    spin.start('installing the LaunchAgent');
-    try {
-      result = await installPersistent({ onStep: (t) => spin.update(t) });
-    } catch (err) {
-      spin.fail();
-      process.stderr.write(`lazydev: install failed: ${err.message}\n`);
-      return 1;
-    }
-    if (!result.up) {
-      spin.fail();
-      process.stderr.write(
-        `lazydev: the service was installed but the daemon did not answer within 10s.\n` +
-        `check ${tilde(logsDir)}/daemon.err and daemon.log, then run \`lazydev\` again.\n`
-      );
-      return 1;
-    }
-    await spin.done(`${ui.green('✓')} ${ui.dim('service running')}`);
-    printInstalledBanner({ projects, port: result.port, startedAt, skillInstalled: result.skillInstalled });
-    if (IS_CHECKOUT) {
-      process.stdout.write(ui.dim('  dev install: the service runs this checkout and restarts itself when the source changes.\n'));
-    }
-    // The plist was just written, so deployedPathEnv() reads the fresh PATH:
-    // this proves what the daemon will resolve, on the install that baked it.
-    printToolWarnings(await preflightTools(toolsToVerify(projects), deployedPathEnv()));
-    return 0;
   }
 
-  // Foreground path. Decide the real serving port up front so scan, the
-  // daemon, and the printed URLs all agree.
-  const before = new Set(readProjects().map((p) => p.host));
-  const servePort = await decideServePort();
-  const env = childEnvFor(servePort, { scanAll: assumeYes });
-  if ((await scanWithStatus(env, interactive)) === 'cancelled') return 130;
-  const projects = readProjects();
-  const after = new Set(projects.map((p) => p.host));
-  const diff = firstRun
-    ? { added: [], removed: [] }
-    : { added: [...after].filter((h) => !before.has(h)), removed: [...before].filter((h) => !after.has(h)) };
-  printForegroundBanner({ projects, servePort, diff, firstRun, startedAt });
-
-  return runDaemon(env);
+  let result;
+  const spin = makeSpinner({ isTTY: process.stdout.isTTY, styler: ui });
+  spin.start('installing the LaunchAgent');
+  try {
+    result = await installPersistent({ onStep: (t) => spin.update(t) });
+  } catch (err) {
+    spin.fail();
+    process.stderr.write(`lazydev: install failed: ${err.message}\n`);
+    return 1;
+  }
+  if (!result.up) {
+    spin.fail();
+    process.stderr.write(
+      `lazydev: the service was installed but the daemon did not answer within 10s.\n` +
+      `check ${tilde(logsDir)}/daemon.err and daemon.log, then run \`lazydev\` again.\n`
+    );
+    return 1;
+  }
+  await spin.done(`${ui.green('✓')} ${ui.dim('service running')}`);
+  printInstalledBanner({ projects, port: result.port, startedAt, skillInstalled: result.skillInstalled });
+  if (IS_CHECKOUT) {
+    process.stdout.write(ui.dim('  dev install: the service runs this checkout and restarts itself when the source changes.\n'));
+  }
+  // The plist was just written, so deployedPathEnv() reads the fresh PATH:
+  // this proves what the daemon will resolve, on the install that baked it.
+  printToolWarnings(await preflightTools(toolsToVerify(projects), deployedPathEnv()));
+  return 0;
 }
 
 main().then((code) => {

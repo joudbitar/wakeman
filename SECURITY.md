@@ -12,7 +12,7 @@ Nothing off your machine can reach lazydev or anything behind it.
 
 ## Supply chain
 
-The published package has zero npm dependencies: 16 files, all from this repository (`npm pack --dry-run` lists them). Releases are published from GitHub Actions with npm provenance, so the npm page links every version to the public commit it was built from. CI runs the test suite on every push, on macOS and Linux.
+The published package has zero npm dependencies: 16 files, all from this repository (`npm pack --dry-run` lists them). Releases are published from GitHub Actions with npm provenance, so the npm page links every version to the public commit it was built from. CI runs the test suite on every push, on macOS.
 
 ## What it does not defend against
 

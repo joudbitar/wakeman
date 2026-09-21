@@ -1,8 +1,8 @@
 # Contributing
 
-The daemon is one Node file with zero npm dependencies, and it stays that way; a PR that adds a dependency will be asked to lose it. `npm test` runs the whole suite with `node --test`, no setup. CI runs it on macOS and Linux, Node 20 and 22.
+The daemon is one Node file with zero npm dependencies, and it stays that way; a PR that adds a dependency will be asked to lose it. `npm test` runs the whole suite with `node --test`, no setup. CI runs it on macOS, Node 22 and 24.
 
-The PR I'd merge first is the Linux installer: a systemd user unit with `CAP_NET_BIND_SERVICE` so Linux gets the background service and the portless URLs too. The daemon already passes its tests on Linux; only the launchd install in `bin/lazydev.mjs` is macOS.
+lazydev is macOS only and staying that way: on anything else the entrypoint prints one line and exits 2. A Linux port is not a PR I'd merge, so don't spend a weekend on one.
 
 Ground rules:
 

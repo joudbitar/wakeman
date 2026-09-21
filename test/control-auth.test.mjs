@@ -2,8 +2,9 @@
 //
 // Proves that every mutating control POST is refused without the token or with a
 // foreign Origin, succeeds with the token on a clean origin, that GET /status
-// stays readable (so the CLI keeps working), that error pages redact log tails
-// for unauthorized callers, and that the token file is owner-only (0600).
+// stays readable (so the CLI keeps working), that error pages redact the raw
+// failure reason for unauthorized callers while the log tail is served by the
+// host-scoped GET /__lazydev/tail, and that the token file is owner-only (0600).
 //
 // ISOLATION: the env vars below MUST be set BEFORE lazydev.mjs is imported,
 // because the module evaluates CONTROL_TOKEN_PATH / CONFIG_PATH at import time.
@@ -201,7 +202,7 @@ test('GET /__lazydev/status stays readable without a token', async (t) => {
   assert.equal(typeof parsed.uptimeMs, 'number', 'status payload has uptimeMs');
 });
 
-test('start-error page redacts the log tail for unauthorized callers, shows it for authorized', async (t) => {
+test('start-error page redacts the failure reason for unauthorized callers, shows it for authorized', async (t) => {
   const server = createDaemonServer();
   t.after(() => server.close());
   const port = await listen(server);
@@ -230,11 +231,15 @@ test('start-error page redacts the log tail for unauthorized callers, shows it f
   }
   assert.equal(unauth.status, 200, `failed start renders the 200 status page (got ${unauth.status})`);
   assert.match(unauth.body, /failed to start/i, 'failure page reached (start timed out)');
-  assert.doesNotMatch(unauth.body, /Last lines of/, 'unauthorized page must not include the log-tail marker');
-  assert.match(unauth.body, /Log output is hidden/, 'unauthorized page shows the redaction notice');
+  // The raw failure reason (which can leak paths) stays behind the token; the
+  // log tail is no longer inlined for anyone — the page fetches it from the
+  // host-scoped GET /__lazydev/tail instead.
+  assert.match(unauth.body, /The dev server failed to start\./, 'unauthorized page shows the generic reason only');
+  assert.match(unauth.body, /__lazydev\/tail/, 'the page fetches the tail from the host-scoped endpoint');
 
-  // Authorized caller (valid token): same nav, but the tail is included. Poll the
-  // same way so we land on the failure page even if a fresh re-kick was in flight.
+  // Authorized caller (valid token): same nav, but the raw reason is included.
+  // Poll the same way so we land on the failure page even if a fresh re-kick
+  // was in flight.
   const token = ensureControlToken();
   let auth;
   for (let i = 0; i < 40; i++) {
@@ -243,8 +248,73 @@ test('start-error page redacts the log tail for unauthorized callers, shows it f
     await new Promise((r) => setTimeout(r, 50));
   }
   assert.equal(auth.status, 200, `failed start renders the 200 status page (got ${auth.status})`);
-  assert.match(auth.body, /Last lines of <code>logs\//, 'authorized page includes the log-tail marker');
-  assert.doesNotMatch(auth.body, /Log output is hidden/, 'authorized page does not show the redaction notice');
+  assert.doesNotMatch(auth.body, /The dev server failed to start\./, 'authorized page shows the raw reason, not the generic one');
+});
+
+test('GET /__lazydev/tail is host-scoped and same-origin: project host ok, dashboard host 404, foreign origin 403', async (t) => {
+  const server = createDaemonServer();
+  t.after(() => server.close());
+  const port = await listen(server);
+
+  const onProj = await httpReq(port, { pathname: '/__lazydev/tail', headers: { host: 'fake.localhost' } });
+  assert.equal(onProj.status, 200, 'the project origin may read its own tail');
+  const j = JSON.parse(onProj.body);
+  assert.equal(j.ok, true);
+  assert.equal(typeof j.tail, 'string', 'tail is the log text');
+  assert.equal(typeof j.state, 'string', 'state rides along for the wake page poll');
+
+  const onDash = await httpReq(port, { pathname: '/__lazydev/tail', headers: { host: 'lazydev.localhost' } });
+  assert.equal(onDash.status, 404, 'the dashboard host names no project to tail');
+
+  const crossOrigin = await httpReq(port, {
+    pathname: '/__lazydev/tail',
+    headers: { host: 'fake.localhost', origin: 'http://evil.example' },
+  });
+  assert.equal(crossOrigin.status, 403, 'a foreign Origin is refused');
+});
+
+// /__lazydev/* is routed to the control plane whatever Host it arrives on, so a
+// page any registered dev server renders can fetch the status JSON same-origin.
+// What that page may read is therefore the same question the failure page
+// already answers: the start command, the raw failure message and a raw line of
+// another project's log stay behind the token.
+test('GET /__lazydev/status redacts start commands and failure detail for a tokenless caller', async (t) => {
+  const server = createDaemonServer();
+  t.after(() => server.close());
+  const port = await listen(server);
+
+  // Reach the failure, so there is a lastError with a message to leak.
+  for (let i = 0; i < 40; i++) {
+    const hit = await httpReq(port, {
+      pathname: '/',
+      headers: { host: 'fake.localhost', 'sec-fetch-mode': 'navigate', accept: 'text/html' },
+    });
+    if (/failed to start/i.test(hit.body)) break;
+    await new Promise((r) => setTimeout(r, 50));
+  }
+
+  // A page served by a dev server, reading the control plane on its own origin.
+  const open = await httpReq(port, {
+    pathname: '/__lazydev/status',
+    headers: { host: 'fake.localhost', origin: 'http://fake.localhost' },
+  });
+  assert.equal(open.status, 200, 'status stays readable, as the CLI needs');
+  const row = JSON.parse(open.body).projects.find((p) => p.host === 'fake');
+  assert.ok(row, 'the row is still there');
+  assert.equal(row.state, 'stopped', 'the state a row needs to paint itself is not a secret');
+  assert.equal(row.lastError.kind, 'timeout', 'nor is the failure kind');
+  assert.equal(row.startCmd, '', 'the start command is not served to a tokenless caller');
+  assert.equal(row.lastError.message, null, 'nor the raw failure message');
+  assert.equal(row.lastError.errorLine, null, 'nor a raw line of the log');
+
+  // The dashboard and the CLI hold the token, and they get all of it.
+  const authed = await httpReq(port, {
+    pathname: '/__lazydev/status',
+    headers: { host: 'lazydev.localhost', 'x-lazydev-token': ensureControlToken() },
+  });
+  const full = JSON.parse(authed.body).projects.find((p) => p.host === 'fake');
+  assert.equal(full.startCmd, 'sleep 5', 'the edit panel still prefills');
+  assert.equal(full.lastError.message, 'startTimeout', 'and the raw reason is there');
 });
 
 test('control-token file is created readable only by the owner (0600)', () => {

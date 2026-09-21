@@ -13,7 +13,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, rmSync, readdirSync } from 'node
 import { join } from 'node:path';
 import os from 'node:os';
 
-import { detectRails, detectDjango, detectStatic, normalizeScanRoots, hardcodedPort } from '../lib/detect.mjs';
+import { detectRails, detectDjango, detectStatic, detectNode, normalizeScanRoots, hardcodedPort } from '../lib/detect.mjs';
 
 const ROOT = mkdtempSync(join(os.tmpdir(), 'lazydev-detect-'));
 after(() => rmSync(ROOT, { recursive: true, force: true }));
@@ -119,6 +119,63 @@ test('index.html at the root of another ecosystem repo must NOT register', () =>
 test('index.html beside a package.json is the node path, not static', () => {
   const [dir, names] = fixture({ 'index.html': '', '.git': null, 'package.json': '{}' });
   assert.equal(detectStatic(dir, names), null);
+});
+
+// --- node -------------------------------------------------------------------
+// detectNode returning null must NOT end the walk (scan.mjs descends past it),
+// so the negatives here are about not registering, not about hiding subtrees.
+
+test('package.json with a next dev script registers', () => {
+  const [dir, names] = fixture({
+    'package.json': JSON.stringify({ scripts: { dev: 'next dev' }, dependencies: { next: '14.0.0' } }),
+  });
+  assert.deepEqual(detectNode(dir, names), { framework: 'next', pm: 'npm', dev: 'next dev' });
+});
+
+test('a dependency-only package.json must NOT register', () => {
+  // The blind spot that hid a whole home subtree: a stub package.json with
+  // one dependency and no scripts at the top of ~/life.
+  const [dir, names] = fixture({ 'package.json': JSON.stringify({ dependencies: { 'just-bash': '^3.1.0' } }) });
+  assert.equal(detectNode(dir, names), null);
+});
+
+test('a plain-node dev script that does not look like a server must NOT register', () => {
+  const [dir, names] = fixture({ 'package.json': JSON.stringify({ scripts: { dev: 'tsc --watch' } }) });
+  assert.equal(detectNode(dir, names), null);
+});
+
+test('a plain-node dev script with a server hint registers', () => {
+  const [dir, names] = fixture({ 'package.json': JSON.stringify({ scripts: { dev: 'nodemon server.js' } }) });
+  assert.deepEqual(detectNode(dir, names), { framework: 'node', pm: 'npm', dev: 'nodemon server.js' });
+});
+
+test('a pinned port in a PORT-env framework rides along as fixedPort', () => {
+  const [dir, names] = fixture({
+    'package.json': JSON.stringify({ scripts: { dev: 'next dev -p 3000' }, dependencies: { next: '14.0.0' } }),
+  });
+  assert.deepEqual(detectNode(dir, names), { framework: 'next', pm: 'npm', dev: 'next dev -p 3000', fixedPort: 3000 });
+});
+
+test('a pinned port in a vite dev script is NOT a fixedPort (scan appends --port, last flag wins)', () => {
+  const [dir, names] = fixture({
+    'package.json': JSON.stringify({ scripts: { dev: 'vite --port 5173' }, devDependencies: { vite: '5.0.0' } }),
+  });
+  assert.deepEqual(detectNode(dir, names), { framework: 'vite', pm: 'npm', dev: 'vite --port 5173' });
+});
+
+test('the lockfile picks the package manager', () => {
+  const [dir, names] = fixture({
+    'package.json': JSON.stringify({ scripts: { dev: 'next dev' }, dependencies: { next: '14.0.0' } }),
+    'pnpm-lock.yaml': '',
+  });
+  assert.equal(detectNode(dir, names).pm, 'pnpm');
+});
+
+test('malformed or absent package.json must NOT register', () => {
+  const [dir, names] = fixture({ 'package.json': '{not json' });
+  assert.equal(detectNode(dir, names), null);
+  const [dir2, names2] = fixture({ 'index.html': '' });
+  assert.equal(detectNode(dir2, names2), null);
 });
 
 // --- scanRoots ------------------------------------------------------------

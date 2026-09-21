@@ -16,11 +16,11 @@ All script paths below are relative to this skill directory.
 ## quick start
 
 ```bash
-# a static folder (serve_static.py ships with lazydev; on an installed
-# machine it lives at ~/.local/state/lazydev/app/serve_static.py, in a
-# checkout at the repo root — use the absolute path that exists)
+# a static folder: $LAZYDEV_STATIC is a placeholder the daemon expands to
+# its own serve_static.py at spawn time, so the entry keeps working wherever
+# lazydev itself lives
 node scripts/registry.mjs add --host myblog --dir /abs/path/to/blog \
-  --start-cmd "python3 ~/.local/state/lazydev/app/serve_static.py"
+  --start-cmd '$LAZYDEV_STATIC'
 
 # a Django app with a project venv
 node scripts/registry.mjs add --host crm --dir /abs/path/to/crm \

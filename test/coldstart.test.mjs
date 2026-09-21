@@ -289,15 +289,34 @@ test('failed start surfaces the reason + log tail in the status page', async (t)
   const failed = await waitFor('broke', (r) => r.state === 'stopped' && r.lastError, 3000);
   assert.ok(failed, 'background start reached stopped+lastError');
 
-  // A follow-up nav renders the failure page (from the pre-kick snapshot) with
-  // the reason + log tail. This hit ALSO re-kicks a fresh attempt in the
-  // background (retry-on-reload); we drain it in t.after so it can't leak.
-  const res = await httpReq('127.0.0.1', port, { host: 'broke.localhost', accept: 'text/html', 'sec-fetch-mode': 'navigate' });
-  assert.equal(res.status, 200, 'failure nav -> 200 status page');
-  assert.match(res.body, /failed|did not open/i, 'names the failure');
-  // This nav carries no capability token, so the log tail is redacted (issue-5):
-  // the page points at the CLI instead of leaking log paths/contents.
-  assert.match(res.body, /Log output is hidden/i, 'unauthorized failure page redacts the log tail');
+  // A reload without ?retry=1 lands on the terminal failure page (no re-kick).
+  const failure = await httpReq('127.0.0.1', port, { host: 'broke.localhost', accept: 'text/html', 'sec-fetch-mode': 'navigate' });
+  assert.equal(failure.status, 200, 'failure nav -> 200 status page');
+  assert.match(failure.body, /failed to start/i, 'names the failure');
+  assert.match(failure.body, /The dev server failed to start\./, 'unauthorized failure page keeps the generic reason');
+  // Section 4: the headline sentence is the one for THIS kind. `sleep 5` never
+  // binds, so this is the timeout kind, and the sentence must say so with the
+  // port and the timeout in it, not the one-size copy every kind used to get.
+  assert.equal(getRuntime('broke').lastError.kind, 'timeout', 'a start that never binds is the timeout kind');
+  assert.match(
+    failure.body,
+    /Nothing answered on port \d+ within \d+s\. The process is still being killed\./,
+    'timeout copy carries the port and the timeout'
+  );
+  assert.match(failure.body, /\?retry=1/, 'Retry link carries the explicit retry flag');
+
+  // /?retry=1 kicks a fresh attempt and shows the wake page instead of the
+  // stale failure snapshot. Drain the re-kick in t.after so it can't leak.
+  const res = await httpReq(
+    '127.0.0.1',
+    port,
+    { host: 'broke.localhost', accept: 'text/html', 'sec-fetch-mode': 'navigate' },
+    '/?retry=1'
+  );
+  assert.equal(res.status, 200, 'retry nav -> 200 status page');
+  assert.doesNotMatch(res.body, /failed to start/i, 'retry does not immediately re-show the failure page');
+  assert.match(res.body, /being turned on/i, 'retry shows the wake page while bring-up runs');
+  assert.match(res.body, /__lazydev\/tail/, 'wake page wires up the terminal panel');
 
   // Settle the re-kicked attempt now (config is still 300ms here) so it times
   // out fast and doesn't run under a later test's larger startTimeout.
@@ -488,6 +507,11 @@ test('child exiting before the port opens fails the start, even with a foreign l
   assert.equal(r.owned, false, 'no ownership claimed over a dead pid');
   assert.equal(r.pid, null, 'no stale pid retained');
   assert.equal(r.lastError && r.lastError.code, 'START_EXITED', 'lastError records the exit for the status page');
+  // Section 4: the numbers the failure copy quotes are captured at failure
+  // time, not re-derived when the page renders.
+  assert.equal(r.lastError.kind, 'exited', 'the kind the copy table switches on');
+  assert.equal(r.lastError.exitCode, 7, 'the code the page quotes');
+  assert.equal(typeof r.lastError.elapsedMs, 'number', 'how long the child lived, for "after 0.1s"');
 });
 
 // --- cleanup ----------------------------------------------------------------

@@ -7,6 +7,7 @@
 import { test, after } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
@@ -69,4 +70,35 @@ test('path traversal in the host is rejected as usage, exit 1', () => {
   const r = run(['../secrets']);
   assert.equal(r.code, 1);
   assert.match(r.stdout, /usage: lazydev logs <host>/);
+});
+
+// `-f` is a different command with the same name: it needs the live daemon,
+// where plain `logs` deliberately does not. The contrast is the whole reason
+// the file read stays daemon-free, so it is asserted in one place.
+test('-f needs the daemon and says so, while the file read still works', async () => {
+  fs.mkdirSync(LOGS, { recursive: true });
+  fs.writeFileSync(path.join(LOGS, 'proj.log'), 'line-1\nline-2\n');
+
+  // A port nothing answers on, so this cannot reach the developer's own
+  // lazydev on :80 and pass for the wrong reason.
+  const dead = await new Promise((resolve, reject) => {
+    const s = net.createServer();
+    s.once('error', reject);
+    s.listen(0, '127.0.0.1', () => {
+      const { port } = s.address();
+      s.close(() => resolve(String(port)));
+    });
+  });
+
+  const follow = spawnSync(process.execPath, [BIN, 'logs', 'proj', '-f'], {
+    env: { ...process.env, LAZYDEV_STATE_DIR: STATE, LAZYDEV_PORT: dead, LAZYDEV_FALLBACK_PORT: dead, NO_COLOR: '1' },
+    encoding: 'utf8',
+    timeout: 10000,
+  });
+  assert.equal(follow.status, 3);
+  assert.match(follow.stderr, /lazydev is not running; run `lazydev` to start it/);
+
+  const plain = run(['proj']);
+  assert.equal(plain.code, 0, 'the file read never asks the daemon');
+  assert.ok(plain.stdout.includes('line-2'));
 });

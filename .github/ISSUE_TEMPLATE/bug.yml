@@ -15,7 +15,7 @@ body:
       label: How are you running lazydev
       options:
         - npx @jbitar/lazydev / installed lazydev (background service)
-        - foreground run (CI, Linux, LAZYDEV_NO_INSTALL)
+        - a checkout run in place (the dev install)
         - other
     validations:
       required: true
@@ -23,7 +23,7 @@ body:
     id: os
     attributes:
       label: OS and version
-      placeholder: macOS 15.5 / Ubuntu 24.04
+      placeholder: macOS 15.5
     validations:
       required: true
   - type: input

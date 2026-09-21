@@ -14,7 +14,9 @@ permissions:
 
 jobs:
   publish:
-    runs-on: ubuntu-latest
+    # macos, not ubuntu: the test suite drives a macOS-only CLI, and the gate
+    # before a publish has to be the same suite CI runs.
+    runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4

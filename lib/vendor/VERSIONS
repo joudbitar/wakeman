@@ -1,0 +1,6 @@
+# Written by scripts/vendor.sh. Do not edit by hand.
+# Fetched 2026-09-13 02:03:51Z from https://registry.npmjs.org
+
+@xterm/xterm@5.5.0  lib/xterm.js  ->  lib/vendor/xterm.js  sha256:1f991ac3b4b283ebf96e60ae23a00a52765dd3a2e46fa6fdda9f1aab032f7495
+@xterm/xterm@5.5.0  css/xterm.css  ->  lib/vendor/xterm.css  sha256:ba8e6985669488981ccf40c0cefe3aba80722cb6c92de7ad628b0bd717faf2b6
+@xterm/addon-fit@0.10.0  lib/addon-fit.js  ->  lib/vendor/addon-fit.js  sha256:bdaefa370b1bfc42ee88d46fe6072400902a4d4b2d45cd93438dda9b23c97089

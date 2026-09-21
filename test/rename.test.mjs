@@ -52,7 +52,12 @@ function postJson(port, reqPath, { token, body } = {}) {
         let text = '';
         res.setEncoding('utf8');
         res.on('data', (c) => (text += c));
-        res.on('end', () => resolve({ status: res.statusCode, json: text ? JSON.parse(text) : null }));
+        // Not every answer is JSON: the crash path renders an HTML 500 page.
+        res.on('end', () => {
+          let json = null;
+          try { json = text ? JSON.parse(text) : null; } catch { /* HTML, not JSON */ }
+          resolve({ status: res.statusCode, json, body: text });
+        });
       }
     );
     req.on('error', reject);
@@ -127,4 +132,20 @@ test('renames in the registry file and the live config', async () => {
   const hosts = status.projects.map((p) => p.host);
   assert.ok(hosts.includes('renamed'));
   assert.equal(hosts.includes('proj'), false);
+});
+
+// A registry write that fails for a reason no RegistryError covers (a read-only
+// state dir, a full disk, a synced folder mid-sync) is a 500 by the handler's
+// own comment. It used to be nothing at all: handleRequest is async, so a throw
+// after its first await arrives as a rejection, and createDaemonServer's plain
+// try/catch could not see it — the client got no response and the socket stayed
+// open until the browser gave up.
+test('a control route that throws after an await answers 500 instead of hanging', async (t) => {
+  const mode = fs.statSync(CONFIG_PATH).mode & 0o777;
+  fs.chmodSync(CONFIG_PATH, 0o444);
+  t.after(() => fs.chmodSync(CONFIG_PATH, mode));
+
+  const res = await postJson(daemonPort, '/__lazydev/rename/other', { token, body: { to: 'newname' } });
+  assert.equal(res.status, 500, 'the request is answered, not abandoned');
+  assert.match(res.body, /Internal error/, 'and it says what happened');
 });

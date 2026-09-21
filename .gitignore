@@ -21,3 +21,6 @@ daemon.err
 # .claude/skills/ is shipped product, not scratch — it stays tracked.
 .claude/*
 !.claude/skills/
+
+# byproduct of running lib/pty.py
+__pycache__/

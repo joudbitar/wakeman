@@ -1,14 +1,19 @@
-// Boot smoke for the npx entrypoint (issue #9).
+// Boot smoke for the daemon (issue #9).
 //
-// Runs the REAL bin/lazydev.mjs the way `npx lazydev` would, but forced onto a
-// non-privileged port so CI (which cannot bind :80) works. It points the state
-// dir and HOME at temp trees, plants ONE discoverable project whose dev server
-// is a trivial node listener, and asserts:
-//   - the entrypoint scans, writes the registry INTO the state dir, and boots;
-//   - http://<host>.localhost:<port> proxies to the planted dev server;
+// Scans a throwaway $HOME with the real scan.mjs, then runs the real
+// lazydev.mjs on a random LAZYDEV_PORT, and asserts:
+//   - the scan writes the registry INTO the state dir and discovers the
+//     planted project;
+//   - http://<host>.localhost:<port> proxies to the dev server the daemon
+//     spawns from that entry;
 //   - nothing was written into the project directory or the checkout — every
 //     artifact (registry, logs, control token) landed in the state dir.
 // Then Ctrl-C (SIGINT) stops it cleanly. Zero deps: node:test + built-ins.
+//
+// It drives lazydev.mjs rather than bin/lazydev.mjs because the entrypoint's
+// one path is now a launchd install, and a GitHub runner has no GUI domain to
+// bootstrap into. The entrypoint's own surface (consent, scan, help, version,
+// the non-darwin exit, every subcommand) is test/cli.test.mjs.
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -16,11 +21,12 @@ import http from 'node:http';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const BIN = path.join(ROOT, 'bin', 'lazydev.mjs');
+const DAEMON = path.join(ROOT, 'lazydev.mjs');
+const SCANNER = path.join(ROOT, 'scan.mjs');
 
 // A free 127.0.0.1 port (opened then closed), for forcing a non-privileged
 // front door the daemon can actually bind under a test runner.
@@ -68,7 +74,7 @@ async function poll(fn, ms) {
   return null;
 }
 
-test('npx entrypoint scans, boots on a forced port, and proxies to a discovered project', async (t) => {
+test('scan discovers a project and the daemon proxies to it on a forced port', async (t) => {
   const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'lazydev-npx-state-'));
   const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'lazydev-npx-home-'));
 
@@ -107,17 +113,25 @@ test('npx entrypoint scans, boots on a forced port, and proxies to a discovered 
     JSON.stringify({ projects: [{ host: 'demoapp', dir: projDir, port: devPort }] })
   );
 
-  const child = spawn(process.execPath, [BIN], {
+  const childEnv = {
+    ...process.env,
+    HOME: homeDir, // scan walks HOME; keep it tiny and contained
+    LAZYDEV_STATE_DIR: stateDir,
+    LAZYDEV_PORT: String(frontPort), // force a bindable non-privileged front door
+    LAZYDEV_FALLBACK_PORT: String(frontPort),
+    LAZYDEV_SCAN_QUIET: '1',
+    // Fail a stuck start fast so the test can't hang on a bad spawn.
+    LAZYDEV_REAP_INTERVAL_MS: '60000',
+  };
+
+  // The scan runs first, exactly as the entrypoint runs it: a child of this
+  // process with the state dir pinned, no terminal, so no picker.
+  const scan = spawnSync(process.execPath, [SCANNER], { cwd: ROOT, env: childEnv, encoding: 'utf8', timeout: 60000 });
+  assert.equal(scan.status, 0, `scan exited 0\n${scan.stderr || ''}`);
+
+  const child = spawn(process.execPath, [DAEMON], {
     cwd: ROOT,
-    env: {
-      ...process.env,
-      HOME: homeDir, // scan walks HOME; keep it tiny and contained
-      LAZYDEV_STATE_DIR: stateDir,
-      LAZYDEV_PORT: String(frontPort), // force a bindable non-privileged front door
-      LAZYDEV_FALLBACK_PORT: String(frontPort),
-      // Fail a stuck start fast so the test can't hang on a bad spawn.
-      LAZYDEV_REAP_INTERVAL_MS: '60000',
-    },
+    env: childEnv,
     stdio: ['ignore', 'pipe', 'pipe'],
   });
 
@@ -125,7 +139,7 @@ test('npx entrypoint scans, boots on a forced port, and proxies to a discovered 
   child.stdout.on('data', (d) => (out += d));
   child.stderr.on('data', (d) => (out += d));
 
-  // Terminal signal for the polls below: once the entrypoint is gone there is
+  // Terminal signal for the polls below: once the daemon is gone there is
   // nothing left to wait for, however much deadline remains.
   let exited = false;
   child.once('exit', () => {
@@ -149,9 +163,9 @@ test('npx entrypoint scans, boots on a forced port, and proxies to a discovered 
   });
 
   // Wait for the daemon to answer on the front port (dashboard control plane).
-  // Generous cap: under a parallel `node --test` load the boot (spawn + scan +
-  // bind) stretches well past any "reasonable" figure while still being fine.
-  // A dead entrypoint ends the wait immediately instead of burning the cap.
+  // Generous cap: under a parallel `node --test` load the boot (spawn + bind)
+  // stretches well past any "reasonable" figure while still being fine. A dead
+  // daemon ends the wait immediately instead of burning the cap.
   const up = await poll(async () => {
     if (exited) return { exited: true };
     const r = await get('lazydev.localhost', frontPort);
@@ -182,7 +196,7 @@ test('npx entrypoint scans, boots on a forced port, and proxies to a discovered 
   // ensureUp waits exactly that long for the port — so poll up to that plus
   // headroom for the proxy hop. Real failures don't wait it out: the moment
   // the daemon records a terminal verdict in daemon.log (start-timeout /
-  // spawn-error) or the entrypoint dies, the poll ends and the assert shows
+  // spawn-error) or the daemon dies, the poll ends and the assert shows
   // the verdict. What the test proves is unchanged; only the deadline now
   // scales with the daemon's instead of guessing a wall-clock figure.
   const startTimeoutMs = Number.isFinite(reg.startTimeoutMs) ? reg.startTimeoutMs : 120000;
@@ -195,7 +209,7 @@ test('npx entrypoint scans, boots on a forced port, and proxies to a discovered 
     }
   };
   const outcome = await poll(async () => {
-    if (exited) return { fail: 'entrypoint exited before the proxy came up' };
+    if (exited) return { fail: 'daemon exited before the proxy came up' };
     const verdict = readDaemonLog().match(/(?:start-timeout|spawn-error): demoapp[^\n]*/);
     if (verdict) return { fail: `daemon gave up on the dev server: ${verdict[0]}` };
     const r = await get('demoapp.localhost', frontPort);
@@ -226,5 +240,5 @@ test('npx entrypoint scans, boots on a forced port, and proxies to a discovered 
     child.once('exit', () => resolve(true));
     setTimeout(() => resolve(exited), 10000).unref?.();
   });
-  assert.ok(sigintExited, 'entrypoint exits on SIGINT');
+  assert.ok(sigintExited, 'the daemon exits on SIGINT');
 });

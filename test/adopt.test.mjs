@@ -7,6 +7,13 @@
 // three paths end-to-end (real daemon, real proxied HTTP) plus the pure sameDir
 // helper. The PID->cwd resolver is swapped via __setResolvePidCwd so no real
 // lsof runs — deterministic in CI. No real projects, no fixed ports.
+//
+// Adoption is also re-checked, not just decided once (spec 0.3.0 section 5): the
+// pid that held the port at adoption is stored on the record and re-resolved
+// before proxying, at most once every ADOPT_VERIFY_TTL_MS. Tests F and G cover
+// the stranger-takes-the-port case and the cache that keeps it to one lsof every
+// two seconds. Both swap __setResolveListenerPid, which is also why every adopt
+// test below pins a pid: the adopt path resolves one now.
 
 import { test, before, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
@@ -42,8 +49,16 @@ process.env.LAZYDEV_CONFIG = CONFIG_PATH;
 // real repo's control-token (issue-5 gates mutating control POSTs on this token).
 process.env.LAZYDEV_CONTROL_TOKEN_PATH = path.join(TMP_ROOT, 'control-token');
 
-const { createDaemonServer, loadConfig, sameDir, __setResolvePidCwd, ensureControlToken, __setRuntimeForTest } =
-  await import('../lazydev.mjs');
+const {
+  createDaemonServer,
+  loadConfig,
+  sameDir,
+  __setResolvePidCwd,
+  __setResolveListenerPid,
+  ensureControlToken,
+  __setRuntimeForTest,
+  ADOPT_VERIFY_TTL_MS,
+} = await import('../lazydev.mjs');
 
 // Listen on an OS-assigned loopback port; resolve the actual port.
 function listen(server) {
@@ -127,6 +142,7 @@ before(() => {
 // next request would proxy instead of re-running the adopt-or-conflict decision.
 afterEach(() => {
   __setResolvePidCwd(null); // null -> restores defaultResolvePidCwd
+  __setResolveListenerPid(null); // same, for the adopt-time / re-verify pid lookup
   __setRuntimeForTest('proj', {
     state: 'stopped',
     owned: false,
@@ -136,6 +152,8 @@ afterEach(() => {
     upstreamHost: null,
     lastError: null,
     conflictDir: null,
+    adoptedPid: null,
+    verifiedAt: 0,
   });
 });
 
@@ -155,8 +173,10 @@ test('B: external listener with matching cwd is adopted and proxied', async (t) 
   writeRegistry(fakePort, PROJECT_DIR);
   loadConfig('test-B');
 
-  // Fake resolver: the listener's cwd equals project.dir -> match -> adopt.
+  // Fake resolvers: the listener's cwd equals project.dir -> match -> adopt.
+  // The pid is pinned too, because the adopt path records it for re-verification.
   __setResolvePidCwd(() => PROJECT_DIR);
+  __setResolveListenerPid(() => 1111);
 
   const daemon = createDaemonServer();
   const daemonPort = await listen(daemon);
@@ -182,8 +202,9 @@ test('C: external listener with mismatching cwd is a conflict, never proxied', a
   writeRegistry(fakePort, '/some/project/dir');
   loadConfig('test-C');
 
-  // Fake resolver: the listener's cwd differs from project.dir -> conflict.
+  // Fake resolvers: the listener's cwd differs from project.dir -> conflict.
   __setResolvePidCwd(() => '/totally/different/dir');
+  __setResolveListenerPid(() => 2222);
 
   const daemon = createDaemonServer();
   const daemonPort = await listen(daemon);
@@ -225,6 +246,7 @@ test('E: adopted upstream that dies is healed, and re-adopted when it returns', 
   writeRegistry(fakePort, PROJECT_DIR);
   loadConfig('test-E');
   __setResolvePidCwd(() => PROJECT_DIR);
+  __setResolveListenerPid(() => 1111); // same pid throughout: this is a restart, not a stranger
 
   const daemon = createDaemonServer();
   const daemonPort = await listen(daemon);
@@ -259,9 +281,16 @@ test('E: adopted upstream that dies is healed, and re-adopted when it returns', 
     fake2.srv.once('error', reject);
     fake2.srv.listen(fakePort, '127.0.0.1', resolve);
   });
+  // Poll with ?retry=1, which is what the wake page's Retry link sends. The
+  // heal's own bring-up probed the port in the gap before fake2 was listening,
+  // so it spawned this project's startCmd ('true') instead, which exits at once.
+  // Whether that respawn or the returned listener wins is a coin-flip, and a
+  // respawn that loses leaves a terminal failure the cold path deliberately does
+  // NOT re-kick on a plain reload (spec 4). An explicit retry re-arms it, and
+  // then the probe finds fake2 and re-adopts. This is what makes E stop flaking.
   let res3;
   for (let i = 0; i < 20; i++) {
-    res3 = await httpGet(daemonPort, 'proj.localhost', '/');
+    res3 = await httpGet(daemonPort, 'proj.localhost', '/?retry=1');
     if (res3.status === 200) break;
     await new Promise((r) => setTimeout(r, 100));
   }
@@ -276,14 +305,134 @@ test('E: adopted upstream that dies is healed, and re-adopted when it returns', 
   assert.equal(entry.state, 'running', 'healed record is running again');
 });
 
+test('F: a stranger that takes the port after adoption gets a conflict, not a proxy', async (t) => {
+  // The spec-5 hole, end to end. lazydev adopts a dev server you started by hand
+  // from the project folder. That server dies. Something else — a python
+  // one-liner in /tmp, a rebased container, anything — binds the same port.
+  // Pre-fix the record still said "running (external)" and the daemon happily
+  // piped your browser to the stranger, because the cwd check ran once, at
+  // adoption. Post-fix the adopted pid is re-resolved before the proxy, and a
+  // pid that changed drops the record into a normal bring-up, which does the cwd
+  // check again and lands here on a conflict.
+  const mine = fakeDevServer('hello-from-mine');
+  const port = await listen(mine.srv);
+  writeRegistry(port, PROJECT_DIR);
+  loadConfig('test-F');
+
+  // Adoption: cwd matches, and pid 1111 is the process we vetted.
+  __setResolvePidCwd(() => PROJECT_DIR);
+  __setResolveListenerPid(() => 1111);
+
+  const daemon = createDaemonServer();
+  const daemonPort = await listen(daemon);
+  let stranger;
+  t.after(async () => {
+    daemon.close();
+    try { mine.srv.close(); } catch { /* already closed mid-test */ }
+    if (stranger) await new Promise((r) => stranger.srv.close(r));
+  });
+
+  const res1 = await httpGet(daemonPort, 'proj.localhost', '/');
+  assert.equal(res1.status, 200, 'sanity: my own server is adopted and proxied');
+  assert.equal(res1.body, 'hello-from-mine');
+
+  // My server dies, keep-alive sockets and all.
+  await new Promise((resolve) => {
+    mine.srv.close(resolve);
+    mine.srv.closeAllConnections();
+  });
+
+  // A foreign process from a different cwd takes the port.
+  stranger = fakeDevServer('hello-from-stranger');
+  await new Promise((resolve, reject) => {
+    stranger.srv.once('error', reject);
+    stranger.srv.listen(port, '127.0.0.1', resolve);
+  });
+  __setResolvePidCwd(() => '/tmp/some-stranger');
+  __setResolveListenerPid(() => 9999);
+
+  // Age the verification stamp past the TTL instead of sleeping two seconds.
+  // This is exactly the state the record is in when the next navigation arrives
+  // more than ADOPT_VERIFY_TTL_MS after the last one, which is every real case.
+  __setRuntimeForTest('proj', { verifiedAt: Date.now() - ADOPT_VERIFY_TTL_MS - 1 });
+
+  const res2 = await httpGet(daemonPort, 'proj.localhost', '/');
+  assert.equal(res2.status, 502, `a stranger on the port is a conflict 502, got ${res2.status}`);
+  assert.ok(
+    !res2.body.includes('hello-from-stranger'),
+    'the stranger\'s body must never reach the client'
+  );
+  assert.equal(stranger.count, 0, 'the stranger must NEVER be proxied to');
+
+  const entry = await statusFor(daemonPort, 'proj');
+  assert.equal(entry.state, 'conflict', 'the record lands in conflict, not running');
+  assert.equal(entry.owned, false);
+  assert.equal(entry.conflictDir, '/tmp/some-stranger', 'conflictDir names the stranger\'s cwd');
+});
+
+test('G: the 2s cache holds — one pid lookup per window, not one per request', async (t) => {
+  // The whole feature is affordable only if the verification is cached: a busy
+  // project serves hundreds of requests in two seconds and must not pay an lsof
+  // for each. The counter below is the proof; the cache itself is the
+  // `Date.now() - r.verifiedAt < ADOPT_VERIFY_TTL_MS` early return in
+  // verifyAdoptedUpstream, which sits ahead of the resolver call.
+  const fake = fakeDevServer('hello-cached');
+  const port = await listen(fake.srv);
+  writeRegistry(port, PROJECT_DIR);
+  loadConfig('test-G');
+
+  let pidLookups = 0;
+  __setResolvePidCwd(() => PROJECT_DIR);
+  __setResolveListenerPid(() => {
+    pidLookups += 1;
+    return 1111;
+  });
+
+  const daemon = createDaemonServer();
+  const daemonPort = await listen(daemon);
+  t.after(() => {
+    daemon.close();
+    fake.srv.close();
+  });
+
+  const first = await httpGet(daemonPort, 'proj.localhost', '/');
+  assert.equal(first.status, 200, 'sanity: adopted and proxied');
+  // Adoption itself resolved the pid once; that is the baseline the re-checks
+  // compare against, and it stamps the verification clock.
+  assert.equal(pidLookups, 1, 'adoption resolves the pid exactly once');
+
+  pidLookups = 0;
+  for (let i = 0; i < 8; i++) {
+    const res = await httpGet(daemonPort, 'proj.localhost', '/');
+    assert.equal(res.status, 200);
+    assert.equal(res.body, 'hello-cached');
+  }
+  assert.equal(pidLookups, 0, 'eight requests inside the window cost zero lsof calls');
+
+  // Step over the TTL: the next request pays for one lookup, the ones behind it
+  // ride the refreshed stamp.
+  __setRuntimeForTest('proj', { verifiedAt: Date.now() - ADOPT_VERIFY_TTL_MS - 1 });
+  const after = await httpGet(daemonPort, 'proj.localhost', '/');
+  assert.equal(after.status, 200, 'same pid -> keep proxying');
+  assert.equal(after.body, 'hello-cached');
+  assert.equal(pidLookups, 1, 'an expired window costs exactly one lookup');
+
+  await httpGet(daemonPort, 'proj.localhost', '/');
+  await httpGet(daemonPort, 'proj.localhost', '/');
+  assert.equal(pidLookups, 1, 'the refreshed stamp opens a new window, it does not re-check');
+});
+
 test('D: unresolved cwd (lsof unavailable) degrades to legacy adopt', async (t) => {
   const fake = fakeDevServer('hello-from-fake');
   const fakePort = await listen(fake.srv);
   writeRegistry(fakePort, '/some/project/dir');
   loadConfig('test-D');
 
-  // Fake resolver returns null: cwd unknowable -> legacy adopt, still proxies.
+  // Fake resolvers return null: nothing is knowable about the listener -> legacy
+  // adopt, still proxies. With no pid there is nothing to re-verify against, so
+  // the record is trusted as-is rather than being dropped every two seconds.
   __setResolvePidCwd(() => null);
+  __setResolveListenerPid(() => null);
 
   const daemon = createDaemonServer();
   const daemonPort = await listen(daemon);

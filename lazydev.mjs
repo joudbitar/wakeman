@@ -14,7 +14,34 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { resolveStateDir, resolveStatePaths } from './lib/state.mjs';
 import { decideBindFallback, formatProjectUrl } from './lib/bind.mjs';
-import { LOGO } from './lib/ui.mjs';
+// The WebSocket server half, built-ins only (spec section 6). Aliased on import
+// because this file already has a handleUpgrade: that one is the HMR proxy for
+// project hosts, this one completes a handshake on the control plane.
+import { handleUpgrade as wsAccept, isWebSocketUpgrade } from './lib/ws.mjs';
+// Every registry WRITE in this file goes through these, because the dashboard
+// and the `lazydev add/remove/enable/disable/port/rename` subcommands must not
+// drift: one module owns what a valid entry is, and the daemon only decides
+// when to call it. (The terminal logo lives in lib/ui.mjs and stays there —
+// the dashboard draws its own word mark; see dashboardHtml.)
+import {
+  RegistryError,
+  addEntry,
+  removeEntry,
+  renameEntry,
+  setEnabled,
+  setPort,
+  setStartCmd,
+  readRegistry,
+  writeRegistry,
+  pickPort,
+  portListening,
+  sanitizeHost,
+  expandTilde,
+  detectOne,
+  startCmdFor,
+  DETECTOR_EVIDENCE,
+  STATIC_PLACEHOLDER,
+} from './lib/registry-cli.mjs';
 
 // The port the front door actually bound (set at boot). config.port is what we
 // ASK for; after a fallback they differ, and every URL the daemon renders must
@@ -232,10 +259,25 @@ function getRuntime(host) {
   let r = runtime.get(host);
   if (!r) {
     // lastError persists on the record after startPromise clears, so the cold
-    // status page can read WHY a background bring-up failed (see ensureUp). phase
-    // is derived from `state` by phaseLabel(); we keep a slot but state is truth.
+    // status page can read WHY a background bring-up failed (see ensureUp). Its
+    // `kind` is the closed set the failure copy switches on: 'exited',
+    // 'timeout', 'dir-missing', 'install-failed', 'conflict'. phase is derived
+    // from `state` by phaseLabel(); we keep a slot but state is truth.
     // conflictDir holds the foreign cwd when a port-conflict is detected on adopt.
-    r = { state: 'stopped', owned: false, child: null, pid: null, startPromise: null, upstreamHost: null, lastError: null, phase: null, conflictDir: null };
+    // installFailed remembers a dependency install that already failed on this
+    // record, so a reload does not pay installTimeoutMs again (see ensureUp).
+    // adoptedPid is the pid that held the port when we ADOPTED it (owned=false);
+    // verifiedAt is when we last confirmed that pid still holds it. Together they
+    // are the re-verification the adopt path used to lack — see
+    // verifyAdoptedUpstream(). Both stay null/0 for a server we spawned ourselves.
+    // pty holds the two writable ends of the terminal the dev server runs in
+    // ({ stdin, resize }, null when it runs on plain pipes). It lives on the
+    // record rather than inside a socket handler so a panel that stays open
+    // across a restart types into the NEW child (see attachTermSocket).
+    // stopSeq counts deliberate stops. ensureUp reads it before it spawns and
+    // again if the bring-up fails: a different value means WE killed the child,
+    // so the failure is the stop, not something to paint red (see ensureUp).
+    r = { state: 'stopped', owned: false, child: null, pid: null, startPromise: null, upstreamHost: null, lastError: null, phase: null, conflictDir: null, installFailed: null, adoptedPid: null, verifiedAt: 0, pty: null, stopSeq: 0 };
     runtime.set(host, r);
   }
   return r;
@@ -281,6 +323,53 @@ function activeConnCount(host, now) {
   return n;
 }
 
+// ---------------------------------------------------------------------------
+// Static sites: the registry holds a placeholder, not a path
+// ---------------------------------------------------------------------------
+
+// STATIC_PLACEHOLDER is what a static-folder project stores as its startCmd.
+// It is defined in lib/registry-cli.mjs, with the writers, and imported here
+// because this is the only module that resolves it: the old scanner wrote
+// `python3 "<abs path>/serve_static.py"`, and under npx that path lives in
+// ~/.npm/_npx/<hash>/, which npm prunes whenever it feels like it, and the
+// entry then dies with an ENOENT no one can read. The placeholder survives,
+// because it is resolved against the lazydev.mjs that is running right now.
+
+// Expand the placeholder to the command that actually runs. serve_static.py
+// ships next to this file, so CONFIG_DIR is the answer wherever the checkout
+// sits (npx cache, <state>/app, a clone). Quoted: the npx cache path can
+// contain spaces. Anything else is returned untouched.
+//
+// The match is the WHOLE command, not a substring: `$LAZYDEV_STATIC` inside a
+// longer command would also be expanded by `sh -c` (to the empty string, since
+// it is not in the environment), so a half-expansion would be a trap. One
+// project, one placeholder, one command.
+function expandStartCmd(startCmd) {
+  const cmd = String(startCmd || '').trim();
+  if (cmd !== STATIC_PLACEHOLDER) return startCmd;
+  return `python3 "${path.join(CONFIG_DIR, 'serve_static.py')}"`;
+}
+
+// True for the absolute-path form the old scanner wrote, with or without the
+// quotes it wrapped the path in.
+function isLegacyStaticCmd(startCmd) {
+  return /serve_static\.py"?\s*$/.test(String(startCmd || ''));
+}
+
+// Rewrite every legacy absolute-path static startCmd in a parsed registry to
+// the placeholder, in place. Returns the number of entries changed.
+function rewriteStaticStartCmds(parsed) {
+  if (!Array.isArray(parsed?.projects)) return 0;
+  let changed = 0;
+  for (const entry of parsed.projects) {
+    if (entry && isLegacyStaticCmd(entry.startCmd)) {
+      entry.startCmd = STATIC_PLACEHOLDER;
+      changed += 1;
+    }
+  }
+  return changed;
+}
+
 function loadConfig(reason) {
   let raw;
   try {
@@ -295,6 +384,22 @@ function loadConfig(reason) {
   } catch (err) {
     log(`config: invalid JSON in ${CONFIG_PATH} (${err.message}); keeping previous registry`);
     return false;
+  }
+  // Migrate the pruned-path static entries the old scanner wrote, and save the
+  // file back so the fix outlives this process. This runs on every load but
+  // writes at most once per stale registry: the rewrite is idempotent, so the
+  // fs.watch event our own write fires reloads, finds nothing left ending in
+  // serve_static.py, and stops there. A write we cannot do (read-only state
+  // dir) is logged and otherwise ignored: the in-memory registry is already
+  // correct, so the project still starts, it just gets migrated again next boot.
+  const rewritten = rewriteStaticStartCmds(parsed);
+  if (rewritten > 0) {
+    try {
+      fs.writeFileSync(CONFIG_PATH, `${JSON.stringify(parsed, null, 2)}\n`);
+      log(`config: rewrote ${rewritten} static startCmd(s) to ${STATIC_PLACEHOLDER} in ${CONFIG_PATH}`);
+    } catch (err) {
+      log(`config: could not save the ${STATIC_PLACEHOLDER} rewrite to ${CONFIG_PATH} (${err.code || err.message})`);
+    }
   }
   // LAZYDEV_PORT forces the listen port regardless of what the registry says.
   // The npx entrypoint sets it to 80 to serve the front door directly; applying
@@ -471,14 +576,10 @@ async function probePort(port, timeoutMs = 300) {
   }
 }
 
-// Resolve the working directory of the process LISTENing on `port`, via lsof
-// (macOS). Returns the cwd string, or null when it cannot be determined (lsof
-// missing/ENOENT, non-zero exit, timeout, or unparseable output). NEVER throws
-// — a null return means "unknown", and ensureUp degrades to the legacy adopt
-// instead of blocking. Two -F (field) queries: first the listening PID on the
-// port, then that PID's cwd file descriptor.
-function defaultResolvePidCwd(port) {
-  let pid;
+// Resolve the PID of the process LISTENing on `port`, via lsof (macOS).
+// Returns a positive number, or null when it cannot be determined (lsof
+// missing/ENOENT, non-zero exit, timeout, or unparseable output). NEVER throws.
+function defaultResolveListenerPid(port) {
   try {
     const out = execFileSync('lsof', ['-nP', '-iTCP:' + port, '-sTCP:LISTEN', '-Fpn'], {
       encoding: 'utf8',
@@ -489,16 +590,25 @@ function defaultResolvePidCwd(port) {
     // the first.
     for (const line of out.split('\n')) {
       if (line[0] === 'p') {
-        pid = line.slice(1).trim();
-        break;
+        const pid = Number(line.slice(1).trim());
+        return Number.isFinite(pid) && pid > 0 ? pid : null;
       }
     }
-    if (!pid) return null;
+    return null;
   } catch {
     return null;
   }
+}
+
+// Resolve the working directory of the process LISTENing on `port`. Returns
+// the cwd string, or null for "unknown" — ensureUp degrades to the legacy
+// adopt instead of blocking, and freePort refuses to kill. NEVER throws. Two
+// -F (field) queries: the listening PID first, then that PID's cwd descriptor.
+function defaultResolvePidCwd(port) {
+  const pid = defaultResolveListenerPid(port);
+  if (!pid) return null;
   try {
-    const out = execFileSync('lsof', ['-a', '-p', pid, '-d', 'cwd', '-Fn'], {
+    const out = execFileSync('lsof', ['-a', '-p', String(pid), '-d', 'cwd', '-Fn'], {
       encoding: 'utf8',
       timeout: 2000,
     });
@@ -521,6 +631,88 @@ function defaultResolvePidCwd(port) {
 let resolvePidCwd = defaultResolvePidCwd;
 function __setResolvePidCwd(fn) {
   resolvePidCwd = typeof fn === 'function' ? fn : defaultResolvePidCwd;
+}
+
+// Same swap points for freePort: the listener-pid lookup and the kill itself,
+// so a test can prove the guards without lsof and without signalling anything.
+let resolveListenerPid = defaultResolveListenerPid;
+function __setResolveListenerPid(fn) {
+  resolveListenerPid = typeof fn === 'function' ? fn : defaultResolveListenerPid;
+}
+// Bare pid, no process group: the foreigner's group is unknown and could
+// contain a shell or editor that must not be touched.
+function defaultKillForeign(pid, signal) {
+  try {
+    process.kill(pid, signal);
+  } catch {
+    /* already dead */
+  }
+}
+let killForeign = defaultKillForeign;
+function __setKillForeign(fn) {
+  killForeign = typeof fn === 'function' ? fn : defaultKillForeign;
+}
+
+// ---------------------------------------------------------------------------
+// Adoption re-verification
+// ---------------------------------------------------------------------------
+
+// How long an adoption stays trusted before the listening pid is resolved
+// again. The cwd check at adoption is a statement about one process; this is
+// how stale that statement is allowed to get. Two seconds is the spec's number:
+// long enough that a busy project pays one lsof every two seconds instead of
+// one per request, short enough that a stranger on the port is caught on the
+// next navigation rather than at the next daemon restart.
+const ADOPT_VERIFY_TTL_MS = 2000;
+
+// Forget an adoption. Called wherever a record stops representing an adopted
+// listener: it was replaced by a child we own, it became a conflict, it was
+// stopped, or its upstream went away.
+function clearAdoption(r) {
+  if (!r) return;
+  r.adoptedPid = null;
+  r.verifiedAt = 0;
+}
+
+// Gate in front of every proxy to an ADOPTED upstream (owned=false). Returns
+// true when the record may be used as-is, false when it was dropped and the
+// caller must fall through to the cold path, which re-runs ensureUp and lands
+// on adopt, spawn or conflict exactly as a first request would.
+//
+// The port answering is not proof the server we vetted is still behind it: it
+// dies, something from /tmp binds the same port, and pre-fix the daemon kept
+// proxying the stranger forever because the cwd check ran once, at adoption.
+//
+// Cost: `Date.now() - r.verifiedAt < ADOPT_VERIFY_TTL_MS` on the line below is
+// the only read of the timestamp, and it returns BEFORE resolveListenerPid is
+// reached — so a project serving a hundred requests a second still runs at most
+// one lsof per two seconds. test/adopt.test.mjs ('G: ... the 2s cache holds')
+// counts the resolver calls across a burst to keep that true.
+function verifyAdoptedUpstream(project, r) {
+  if (!r || r.state !== 'running' || r.owned) return true; // a child we spawned has an exit handler
+  if (!r.adoptedPid) return true; // adopted without a pid (no lsof): nothing to compare against
+  const now = Date.now();
+  if (now - (r.verifiedAt || 0) < ADOPT_VERIFY_TTL_MS) return true;
+
+  const pid = resolveListenerPid(project.port);
+  if (pid === r.adoptedPid) {
+    r.verifiedAt = now;
+    return true;
+  }
+  log(
+    `adopt-stale: ${project.host} port ${project.port} was pid ${r.adoptedPid}, now ${pid || 'nothing'} -> dropping the record`
+  );
+  // Drop it the same way the heal path does, then say so. No lastError: the
+  // fresh bring-up decides what this is (a re-adopt, a spawn, or a conflict)
+  // and records its own failure if it has one.
+  r.state = 'stopped';
+  r.owned = false;
+  r.child = null;
+  r.pid = null;
+  r.upstreamHost = null;
+  r.conflictDir = null;
+  clearAdoption(r);
+  return false;
 }
 
 // True if two directory paths refer to the same directory. Resolves both (so
@@ -564,17 +756,33 @@ function waitForPort(port, timeoutMs) {
   });
 }
 
+// The inverse of waitForPort: resolve true once NOTHING answers on the port.
+// A restart needs it — SIGTERM returns long before the child lets go of the
+// port, and a bring-up that races it would probe, find the dying server, match
+// its cwd, and "adopt" a process that is about to exit. Resolves false on
+// timeout; the caller carries on and lands on the ordinary conflict path.
+async function waitForPortFree(port, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  do {
+    if (!(await probePort(port, 200))) return true;
+    await new Promise((resolve) => setTimeout(resolve, 150));
+  } while (Date.now() < deadline);
+  return !(await probePort(port, 200));
+}
+
 // ---------------------------------------------------------------------------
 // Lifecycle: ensureUp / stop
 // ---------------------------------------------------------------------------
 
-// Open (append) the per-project log fd handed to the spawned child via stdio.
-// This is the SOLE opener of per-project logs — called once per install spawn
-// (runInstall) and once per start spawn (ensureUp). The daemon never appends to
-// this fd itself; the child owns it continuously. So fd-open time is the only
-// choke point the daemon controls: we rotate here, capping the log at each
-// spawn/install. Deliberate limitation: a single long-running dev server whose
-// log grows past 1 MB is only rotated on its NEXT spawn, not mid-run.
+// Open (append) the per-project log fd. This is the SOLE opener of per-project
+// logs — called once per install spawn (runInstall) and once per start spawn
+// (ensureUp). The install child still holds it as its own stdout/stderr; the
+// start path hands it to a terminal sink instead, because since section 6 the
+// dev server's stdout is a tty and the daemon writes the escape-stripped copy
+// itself (see makeTermSink). Either way fd-open time is the one choke point the
+// daemon controls: we rotate here, capping the log at each spawn/install.
+// Deliberate limitation: a single long-running dev server whose log grows past
+// 1 MB is only rotated on its NEXT spawn, not mid-run.
 function logFdFor(host) {
   const file = path.join(LOGS_DIR, `${host}.log`);
   try {
@@ -586,14 +794,450 @@ function logFdFor(host) {
   }
 }
 
-function tailLog(host, lines = 40) {
+// The one line the DAEMON writes into a per-project log. Everything else in the
+// file is the child's own stdout/stderr, so without this every attempt was
+// concatenated onto the last with nothing between them and two `compiling...`
+// runs read as one. Written before the fd is handed to the child, at both spawn
+// sites (install and start). Rendered exactly as the 0.3.0 spec words it:
+//   -- 2026-09-12 17:31:17 . start: npm run dev (PORT=3030) --
+// with box-drawing rules and a middle dot, the one place the ASCII-only rule
+// for terminal output does not apply (this is a file, read back through the
+// terminal panel and `lazydev logs`).
+const LOG_RULE = '──';
+const LOG_DOT = '·';
+const SEPARATOR_RE = new RegExp(`^${LOG_RULE} .* ${LOG_RULE}$`);
+
+function isSeparatorLine(line) {
+  return SEPARATOR_RE.test(line);
+}
+
+function logStamp(d = new Date()) {
+  const p = (n) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+}
+
+function separatorLine(label, cmd, port) {
+  return `${LOG_RULE} ${logStamp()} ${LOG_DOT} ${label}: ${cmd} (PORT=${port}) ${LOG_RULE}`;
+}
+
+// Write the separator into an open append fd. `label` is 'start' or 'install'.
+// A blank line goes in front whenever the file already has bytes, so a child
+// that ended mid-line cannot glue itself onto the rule.
+function writeLogSeparator(host, logFd, label, cmd, port) {
+  const line = separatorLine(label, cmd, port);
+  // The terminal gets the same rule the file gets, so a restart with a panel
+  // open draws a line between the run that stopped and the run that started
+  // instead of running the two together (the bug section 4 opens with). CRLF:
+  // this one is going to a terminal, where a bare LF only moves down a row.
+  termEcho(host, `\r\n${line}\r\n`);
+  if (typeof logFd !== 'number') return line;
+  const file = path.join(LOGS_DIR, `${host}.log`);
+  let lead = '';
+  try {
+    if (fs.statSync(file).size > 0) lead = '\n';
+  } catch {
+    /* first attempt: no file yet */
+  }
+  try {
+    fs.writeSync(logFd, `${lead}${line}\n`);
+  } catch (err) {
+    log(`log-separator: ${host}: ${err.message}`);
+  }
+  return line;
+}
+
+// Tail the per-project log. By default only THIS attempt: the lines after the
+// last separator, so the terminal panel shows the run that just failed instead
+// of the three before it. `all` returns the whole file, separators included,
+// which is what `?all=1` on the tail endpoint asks for.
+function tailLog(host, lines = 40, { all = false } = {}) {
   const file = path.join(LOGS_DIR, `${host}.log`);
   try {
     const data = fs.readFileSync(file, 'utf8');
-    const all = data.split('\n');
-    return all.slice(-lines).join('\n');
+    let out = data.split('\n');
+    if (!all) {
+      for (let i = out.length - 1; i >= 0; i--) {
+        if (isSeparatorLine(out[i])) {
+          out = out.slice(i + 1);
+          break;
+        }
+      }
+    }
+    return out.slice(-lines).join('\n');
   } catch {
     return '(no log output captured)';
+  }
+}
+
+// The one line the dashboard shows next to a failed badge. Prefer a line that
+// announces itself as an error; fall back to the last thing the process said,
+// because "Killed: 9" with no error keyword is still the answer.
+function firstErrorLine(tail) {
+  const lines = String(tail || '')
+    .split('\n')
+    .map((l) => l.replace(/\u001b\[[0-9;?]*[ -\/]*[@-~]/g, '').trim()) // children run with FORCE_COLOR=1
+    .filter((l) => l && !isSeparatorLine(l));
+  const hit = lines.find((l) => /\b(error|failed|fatal|cannot|unable|not found|refused|ENOENT|EADDRINUSE|EACCES)\b|ERR!/i.test(l));
+  return (hit || lines[lines.length - 1] || '').slice(0, 200);
+}
+
+// ---------------------------------------------------------------------------
+// A terminal per dev server (spec section 6)
+// ---------------------------------------------------------------------------
+
+// The reason to install lazydev instead of keeping a tab open is that the tab
+// is gone, so the tab has to come back on demand, and a log tail is not a tab.
+// Next asks "port in use, use 3001 instead? (y/n)", Vite has keyboard
+// shortcuts, Rails drops into byebug, and a stack trace without its colors is a
+// worse stack trace. All of that needs a real tty behind the dev server.
+//
+// macOS script(1) refuses a non-tty stdin, so the pty is lib/pty.py, run by the
+// python3 that ships with the Xcode command line tools. The daemon keeps
+// ordinary pipes on both ends of it:
+//
+//   stdout  raw terminal bytes -> the ring buffer, every open term socket, and
+//           an escape-stripped copy into <host>.log
+//   stdin   what someone types in a panel or in `lazydev attach`
+//   fd 3    one "<rows> <cols>\n" line per resize
+const PTY_SCRIPT = path.join(CONFIG_DIR, 'lib', 'pty.py');
+
+// The size the dev server sees until a client resizes it: what the dashboard
+// panel opens at, and what pty.py defaults to.
+const PTY_ROWS = 24;
+const PTY_COLS = 80;
+
+// Per project, the last 256 KB of raw output with the escapes intact: what a
+// freshly-opened panel replays. Keyed by host and not cleared on restart, so
+// the panel keeps the run that just died above the run that just started.
+const TERM_RING_BYTES = 256 * 1024;
+
+// The one line a read-only panel opens with, and the one `lazydev status`
+// prints when there is no python3. ASCII: it is drawn in a terminal.
+const NO_PTY_NOTE = 'no python3, so terminals are read-only: output shows, nothing you type reaches the dev server';
+
+// undefined = never looked, null = looked and there is none.
+let ptyPython;
+
+// The interpreter that runs lib/pty.py, or null for the pipe fallback. Resolved
+// once and remembered: this is a fact about the machine, and paying a fork per
+// wake to re-learn it would be silly. LAZYDEV_PYTHON overrides the search, and
+// an empty LAZYDEV_PYTHON is how a test asks for the fallback path on a machine
+// that does have python3.
+function ptyInterpreter() {
+  if (ptyPython !== undefined) return ptyPython;
+  const override = process.env.LAZYDEV_PYTHON;
+  if (typeof override === 'string') {
+    ptyPython = override.trim() || null;
+  } else if (!fs.existsSync(PTY_SCRIPT)) {
+    // A checkout without lib/pty.py (a partial package, an old <state>/app) is
+    // the same situation as a machine without python: pipes, read-only panel.
+    ptyPython = null;
+  } else {
+    ptyPython = null;
+    // PATH first, then the Xcode command line tools' copy, which is on any
+    // machine that has git.
+    for (const candidate of ['python3', '/usr/bin/python3']) {
+      try {
+        execFileSync(candidate, ['-c', ''], { stdio: 'ignore', timeout: 10_000 });
+        ptyPython = candidate;
+        break;
+      } catch {
+        /* next candidate */
+      }
+    }
+  }
+  log(ptyPython ? `pty: ${ptyPython} ${PTY_SCRIPT}` : `pty: ${NO_PTY_NOTE}`);
+  return ptyPython;
+}
+
+// What the status JSON carries, so `lazydev status` prints the read-only line
+// without going looking for python itself.
+function ptyStatus() {
+  const python = ptyInterpreter();
+  return { available: !!python, python, note: python ? null : NO_PTY_NOTE };
+}
+
+// host -> { chunks: Buffer[], size } of raw pty bytes.
+const termRings = new Map();
+// host -> Set of { conn, rec }: one entry per open terminal socket (a dashboard
+// panel, a `lazydev attach`), with the live-connection record it holds.
+const termSockets = new Map();
+// host -> { rows, cols } last asked for by a client. Remembered so the NEXT
+// child is born the size the panel already is: a resize only reaches a running
+// pty, and without this a restart would drop every panel back to 24x80.
+const termSizes = new Map();
+
+function appendTermRing(host, buf) {
+  let ring = termRings.get(host);
+  if (!ring) termRings.set(host, (ring = { chunks: [], size: 0 }));
+  ring.chunks.push(buf);
+  ring.size += buf.length;
+  // Drop whole chunks off the front, then slice the one straddling the cap. The
+  // slice can land mid-escape; a terminal emulator swallows one broken sequence
+  // at the top of a replay, and the alternative is parsing 256 KB on every read.
+  while (ring.size > TERM_RING_BYTES) {
+    const first = ring.chunks[0];
+    const over = ring.size - TERM_RING_BYTES;
+    if (first.length <= over) {
+      ring.chunks.shift();
+      ring.size -= first.length;
+    } else {
+      ring.chunks[0] = first.subarray(over);
+      ring.size -= over;
+    }
+  }
+}
+
+function termRingBytes(host) {
+  const ring = termRings.get(host);
+  if (!ring || !ring.size) return Buffer.alloc(0);
+  return Buffer.concat(ring.chunks, ring.size);
+}
+
+// Live bytes to every open panel for this host. Both clocks move, exactly as
+// they do for a proxied HMR socket: a byte crossing in either direction is the
+// project being used, and an open terminal defers the reaper until it goes
+// quiet for the hard cap.
+function broadcastTerm(host, buf) {
+  const socks = termSockets.get(host);
+  if (!socks || !socks.size) return;
+  const now = Date.now();
+  lastAccess.set(host, now);
+  for (const s of socks) {
+    s.rec.lastByteAt = now;
+    try {
+      s.conn.send(buf);
+    } catch {
+      /* a dying socket cleans itself up on 'close' */
+    }
+  }
+}
+
+// Say something to the terminal that the dev server did not say. Today that is
+// only the start/install separator. It joins the scrollback too, so a panel
+// opened later still sees it.
+function termEcho(host, text) {
+  const buf = Buffer.from(text, 'utf8');
+  appendTermRing(host, buf);
+  broadcastTerm(host, buf);
+}
+
+// Complete escape sequences, in the order they have to be recognised: OSC
+// (window titles, shell integration) ends at BEL or ST; CSI is what colors and
+// cursor moves are; the two- and three-character forms are charset selects and
+// friends. ESC [ and ESC ] are deliberately outside ESC2_RE so an OSC or CSI cut
+// in half by a chunk boundary is carried, not eaten one character at a time.
+const OSC_RE = /\u001b\][^\u0007\u001b]*(?:\u0007|\u001b\\)/g;
+const CSI_RE = /\u001b\[[0-9;:?<>=!]*[ -\/]*[@-~]/g;
+const ESC2_RE = /\u001b[()#][0-9A-Za-z]|\u001b[@A-Z\\^_=><]/g;
+// Everything else a terminal uses that a text file has no use for. CR is absent
+// on purpose: it is handled first, because it carries line structure.
+const CTRL_RE = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g;
+
+// One spawn's output sink. Raw bytes go to the scrollback and the panels; a
+// plain-text copy goes into <host>.log, which is what `lazydev logs` and grep
+// read. The daemon does that write itself now, because the child's own stdout
+// is the tty, not the file, and it writes SYNCHRONOUSLY so that a failure page
+// rendered the instant a child dies finds the last thing it said already there.
+function makeTermSink(host, logFd) {
+  // A sequence or a CR can straddle a chunk boundary. Whatever might still be
+  // the start of one is held back here until the next chunk completes it.
+  let carry = '';
+  const toLog = (text) => {
+    if (typeof logFd !== 'number' || !text) return;
+    try {
+      fs.writeSync(logFd, text);
+    } catch {
+      /* a log we cannot write is never a reason to lose the terminal */
+    }
+  };
+  const strip = (text) =>
+    // A pty ends lines with CRLF, and a progress line redraws itself with a
+    // bare CR. Both become newlines: one keeps the file free of ^M, the other
+    // turns a spinner into lines you can grep rather than one unreadable one.
+    text.replace(/\r\n/g, '\n').replace(/\r/g, '\n').replace(CTRL_RE, '');
+  return {
+    write(buf) {
+      appendTermRing(host, buf);
+      broadcastTerm(host, buf);
+      let text = carry + buf.toString('utf8');
+      carry = '';
+      text = text.replace(OSC_RE, '').replace(CSI_RE, '').replace(ESC2_RE, '');
+      // A leftover ESC is an incomplete sequence: hold it and what follows.
+      // Capped, so one stray ESC byte cannot stall the log forever.
+      const esc = text.lastIndexOf('\u001b');
+      if (esc >= 0 && text.length - esc <= 64) {
+        carry = text.slice(esc);
+        text = text.slice(0, esc);
+      }
+      if (text.endsWith('\r')) {
+        carry = '\r' + carry;
+        text = text.slice(0, -1);
+      }
+      toLog(strip(text));
+    },
+    end() {
+      const rest = carry;
+      carry = '';
+      toLog(strip(rest.replace(/\u001b/g, '')));
+      if (typeof logFd === 'number') {
+        try {
+          fs.closeSync(logFd);
+        } catch {
+          /* ignore */
+        }
+      }
+    },
+  };
+}
+
+// GET /__lazydev/term/<host>, a WebSocket upgrade on the dashboard's own host.
+const TERM_PATH = '/__lazydev/term/';
+
+// The terminal socket's handshake. Called from handleUpgrade before it hands
+// anything to the HMR proxy, because an http server gets exactly one 'upgrade'
+// listener and both paths live under it.
+function handleTermUpgrade(req, socket, head, url, key) {
+  const refuse = (code, why) => {
+    log(`term-refused: ${code} (${why})`);
+    try {
+      const text = code === 401 ? 'Unauthorized' : code === 404 ? 'Not Found' : 'Bad Request';
+      socket.write(`HTTP/1.1 ${code} ${text}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n`);
+      socket.destroy();
+    } catch {
+      /* ignore */
+    }
+  };
+  // The terminal lives on the control plane: the lazydev host, or a host naming
+  // no project (bare localhost, an IP literal), which is where the dashboard is
+  // also served. Anywhere else is a project host, and a page a dev server
+  // serves must not be able to ask for anybody's terminal, its own included.
+  if (key !== 'lazydev' && key !== null) return refuse(401, `term socket asked for on ${key}`);
+  if (!isWebSocketUpgrade(req)) return refuse(400, 'not a websocket upgrade');
+  if (!isSameOrigin(req)) return refuse(401, 'cross-origin');
+  // A browser cannot set headers on a WebSocket, so the control token rides in
+  // Sec-WebSocket-Protocol, which it can set. We echo back exactly the value we
+  // accepted and nothing else, because RFC 6455 wants one of the offered ones.
+  const offered = String(req.headers['sec-websocket-protocol'] || '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean);
+  const accepted = offered.find((p) => p === ensureControlToken());
+  if (!accepted) return refuse(401, 'missing or wrong token');
+  let host = url.pathname.slice(TERM_PATH.length);
+  try {
+    host = decodeURIComponent(host);
+  } catch {
+    /* keep the raw value; the lookup below fails it */
+  }
+  const project = projectByHost(host);
+  if (!project) return refuse(404, `unknown host ${host}`);
+  const conn = wsAccept(req, socket, head, { protocol: accepted });
+  if (conn) attachTermSocket(conn, project);
+}
+
+// One open terminal: replay, live bytes out, `i:`/`r:` frames in.
+function attachTermSocket(conn, project) {
+  const host = project.host;
+  // An open terminal is a live connection, so the reaper leaves the project
+  // alone while a panel watches it. The 2 h hard cap still retires an abandoned
+  // tab: a record with no byte in that long stops counting as active.
+  const rec = addConn(host);
+  const entry = { conn, rec };
+  let socks = termSockets.get(host);
+  if (!socks) termSockets.set(host, (socks = new Set()));
+  socks.add(entry);
+  const bump = () => {
+    const now = Date.now();
+    lastAccess.set(host, now);
+    rec.lastByteAt = now;
+  };
+  bump();
+  log(`term: ${host} attached (${socks.size} open)`);
+
+  // First frame is the scrollback, so a panel opens showing what already
+  // happened instead of an empty box. The read-only line goes in front of it
+  // when there is no pty to type into.
+  const opening = [];
+  if (!ptyInterpreter()) opening.push(Buffer.from(`\r\n[lazydev] ${NO_PTY_NOTE}\r\n\r\n`, 'utf8'));
+  const ring = termRingBytes(host);
+  if (ring.length) opening.push(ring);
+  conn.send(opening.length === 1 ? opening[0] : Buffer.concat(opening));
+
+  conn.on('message', (data) => {
+    bump();
+    handleTermFrame(host, typeof data === 'string' ? data : data.toString('utf8'));
+  });
+  // Listening at all keeps a protocol error from reaching the daemon as an
+  // unhandled 'error' (see lib/ws.mjs); 'close' does the cleanup either way.
+  conn.on('error', () => {});
+  conn.on('close', () => {
+    socks.delete(entry);
+    removeConn(host, rec);
+    log(`term: ${host} detached (${socks.size} open)`);
+  });
+
+  // Opening a terminal is a wake request, and deliberately not awaited: the
+  // case this whole section exists for is a dev server that will not finish
+  // starting until someone answers a question, and waiting for the bring-up
+  // would mean the panel could not show the question.
+  if (project.enabled !== false) {
+    ensureUp(project).catch(() => {
+      /* the failure is on the page and in the log; the socket stays open */
+    });
+  }
+}
+
+// How long after a spawn a resize needs re-sending (see handleTermFrame).
+const PTY_SIZE_SETTLE_MS = 300;
+
+// Push the size a host's clients last asked for down to its running pty.
+function writePtySize(host) {
+  const r = runtime.get(host);
+  const pty = r && r.pty;
+  const size = termSizes.get(host);
+  if (!size || !pty || !pty.resize || !pty.resize.writable) return;
+  try {
+    // pty.py ioctls the master; the kernel raises SIGWINCH on the child itself.
+    pty.resize.write(`${size.rows} ${size.cols}\n`);
+  } catch {
+    /* the child is on its way out */
+  }
+}
+
+// The client half of the protocol, in full: `i:<bytes>` is input, `r:<rows>,
+// <cols>` is a resize. Anything else is ignored rather than closed on, so a
+// later client that knows one more verb is not hung up on by an older daemon.
+function handleTermFrame(host, msg) {
+  const r = runtime.get(host);
+  const pty = r && r.pty;
+  if (msg.startsWith('i:')) {
+    // No pty (no python3, or the project is not running): read-only, and the
+    // panel already said so on its first frame.
+    if (!pty || !pty.stdin || !pty.stdin.writable) return;
+    try {
+      pty.stdin.write(msg.slice(2));
+    } catch {
+      /* the child is on its way out */
+    }
+    return;
+  }
+  if (msg.startsWith('r:')) {
+    const m = /^r:(\d+),(\d+)$/.exec(msg.trim());
+    if (!m) return;
+    // Clamped before it reaches an ioctl: these numbers come off a socket, and
+    // a terminal 0 rows tall is a dev server drawing into nothing.
+    const rows = Math.min(1000, Math.max(1, Number(m[1])));
+    const cols = Math.min(1000, Math.max(1, Number(m[2])));
+    termSizes.set(host, { rows, cols });
+    writePtySize(host);
+    // A resize that lands in the first moments of a spawn can be undone: the
+    // child pty.py forks stamps the startup size on the slave just before exec,
+    // and it can get there after our line does. Send it again past that window;
+    // re-applying a size a terminal already has costs one no-op ioctl.
+    if (pty && Date.now() - (pty.startedAt || 0) < PTY_SIZE_SETTLE_MS) {
+      setTimeout(() => writePtySize(host), PTY_SIZE_SETTLE_MS).unref?.();
+    }
   }
 }
 
@@ -619,13 +1263,18 @@ function inferInstallCmd(startCmd) {
 }
 
 // Run the install step for a project whose node_modules is missing. Streams to
-// logs/<host>.log, has its own timeout, and resolves true ONLY on exit code 0.
-// On non-zero/timeout it kills the install process and resolves false.
+// logs/<host>.log, has its own timeout, and resolves { ok: true } ONLY on exit
+// code 0. On non-zero/timeout it kills the install process and resolves
+// { ok: false, cmd, exitCode, timedOut }, because the failure page quotes the
+// command and the code and a bare boolean cannot carry either.
 function runInstall(project, r) {
   const host = project.host;
-  const installCmd = inferInstallCmd(project.startCmd);
+  // Expanded first, so the install command is inferred from the real first
+  // token (`python3` for a static site) rather than from the placeholder.
+  const installCmd = inferInstallCmd(expandStartCmd(project.startCmd));
   return new Promise((resolve) => {
     const logFd = logFdFor(host);
+    writeLogSeparator(host, logFd, 'install', installCmd, project.port);
     log(`install: ${host} -> sh -c '${installCmd}' (cwd=${project.dir})`);
     let child;
     try {
@@ -650,7 +1299,7 @@ function runInstall(project, r) {
         }
       }
       log(`install-spawn-error: ${host}: ${err.message}`);
-      return resolve(false);
+      return resolve({ ok: false, cmd: installCmd, exitCode: null, timedOut: false, message: err.message });
     }
 
     if (typeof logFd === 'number') {
@@ -676,16 +1325,16 @@ function runInstall(project, r) {
     const timer = setTimeout(() => {
       log(`install-timeout: ${host} exceeded ${config.installTimeoutMs}ms -> SIGKILL`);
       killGroup(r, 'SIGKILL');
-      finish(false);
+      finish({ ok: false, cmd: installCmd, exitCode: null, timedOut: true });
     }, config.installTimeoutMs);
 
     child.on('error', (err) => {
       log(`install-error: ${host}: ${err.message}`);
-      finish(false);
+      finish({ ok: false, cmd: installCmd, exitCode: null, timedOut: false, message: err.message });
     });
     child.on('exit', (code, signal) => {
       log(`install-exit: ${host} pid=${child.pid} code=${code} signal=${signal}`);
-      finish(code === 0);
+      finish(code === 0 ? { ok: true, cmd: installCmd } : { ok: false, cmd: installCmd, exitCode: code, signal, timedOut: false });
     });
   });
 }
@@ -716,6 +1365,13 @@ async function ensureUp(project) {
     // Fresh attempt — clear any failure recorded by a previous bring-up so the
     // status page doesn't show stale wording while this one is in flight.
     r.lastError = null;
+    // A stop that lands while this attempt is in flight is not a failure: the
+    // switch flipped off, `lazydev stop` ran, the project was renamed. Every
+    // failure path below checks this before recording anything, because a
+    // record left stopped-with-lastError shows a red `failed` badge AND stops
+    // the URL from waking the project (see handleRequest's kick gate).
+    const stopSeq = r.stopSeq || 0;
+    const stoppedByUs = () => (r.stopSeq || 0) !== stopSeq;
     // Probe the port (both loopback families). If something is already
     // listening, decide whether to adopt it (do NOT spawn) by verifying the
     // listener's working directory. All of this runs inside the mutex closure.
@@ -726,11 +1382,19 @@ async function ensureUp(project) {
         r.upstreamHost = openHost;
         r.state = 'running';
         r.conflictDir = null;
+        clearAdoption(r); // a child we own is tracked by its exit handler, not by pid polling
         return;
       }
       // External listener: verify ownership by cwd before adopting. A dev server
       // you started by hand FROM the project dir is yours (matching cwd); a
       // stray process squatting the port is not.
+      //
+      // Resolve the pid FIRST and keep it on the record: the cwd check below is
+      // a statement about THAT process, and it stops being true the moment that
+      // process dies and something else takes the port. verifyAdoptedUpstream()
+      // re-checks the pid before each proxy so the adoption cannot be inherited
+      // by a stranger. One extra lsof, at adoption only.
+      const listenerPid = resolveListenerPid(project.port); // null when lsof unavailable
       const cwd = resolvePidCwd(project.port); // null when lsof unavailable/unresolved
       if (cwd === null) {
         // Cannot determine cwd (lsof missing, etc.) -> degrade to the legacy
@@ -742,16 +1406,24 @@ async function ensureUp(project) {
         r.child = null;
         r.pid = null;
         r.conflictDir = null;
+        // No cwd means no lsof, which means no pid either: nothing to re-verify
+        // against, so leave adoptedPid null and let verifyAdoptedUpstream pass
+        // this record through (an unverified adopt cannot get more verified by
+        // asking the same broken tool again every two seconds).
+        r.adoptedPid = listenerPid;
+        r.verifiedAt = listenerPid ? Date.now() : 0;
         return;
       }
       if (sameDir(cwd, project.dir)) {
-        log(`adopt: ${host} external listener cwd matches ${project.dir} -> adopting`);
+        log(`adopt: ${host} external listener cwd matches ${project.dir} -> adopting (pid ${listenerPid || '?'})`);
         r.upstreamHost = openHost;
         r.state = 'running';
         r.owned = false;
         r.child = null;
         r.pid = null;
         r.conflictDir = null;
+        r.adoptedPid = listenerPid;
+        r.verifiedAt = listenerPid ? Date.now() : 0;
         return;
       }
       // Mismatch: someone else owns this port. Do NOT proxy — surface a visible
@@ -762,7 +1434,9 @@ async function ensureUp(project) {
       r.child = null;
       r.pid = null;
       r.upstreamHost = null;
+      clearAdoption(r);
       r.conflictDir = cwd; // remember foreign cwd for status/dashboard detail
+      r.lastError = { code: 'PORT_CONFLICT', kind: 'conflict', message: `port ${project.port} is held by a process in ${cwd}`, at: Date.now(), port: project.port, conflictDir: cwd };
       const e = new Error('portConflict');
       e.code = 'PORT_CONFLICT';
       e.host = host;
@@ -770,18 +1444,66 @@ async function ensureUp(project) {
       throw e; // rejects startPromise -> handleRequest/handleUpgrade/up never proxy
     }
 
-    // Need to spawn. Install (if needed) and start are ONE atomic operation, so
-    // a second concurrent request never launches a second install.
+    // Need to spawn. Before anything else: does the folder still exist? A moved
+    // or deleted project dir is a start that CANNOT work, and spawn() does not
+    // tell us so in time: posix_spawn's ENOENT for a missing cwd surfaces
+    // asynchronously on 'error' and (on this Node/macOS pair) never fires
+    // 'exit', so the exit race below never settles and the old code sat in
+    // 'starting' for the full startTimeoutMs. One statSync fails it in a
+    // millisecond, with copy that names the folder and the way back.
+    let dirExists = false;
+    try {
+      dirExists = fs.statSync(project.dir).isDirectory();
+    } catch {
+      dirExists = false;
+    }
+    if (!dirExists) {
+      log(`dir-missing: ${host} ${project.dir} is gone -> failed`);
+      r.state = 'stopped';
+      r.owned = false;
+      r.child = null;
+      r.pid = null;
+      const e = new Error(`project folder ${project.dir} does not exist`);
+      e.code = 'DIR_MISSING';
+      e.host = host;
+      r.lastError = { code: e.code, kind: 'dir-missing', message: e.message, at: Date.now(), dir: project.dir };
+      throw e;
+    }
+
+    // Install (if needed) and start are ONE atomic operation, so a second
+    // concurrent request never launches a second install.
     // First start with no deps installed -> install them before starting.
     // Only Node projects get an install step: "no node_modules" means nothing
     // in a project that has no package.json (a static folder, a Python
     // server), and forcing `npm install` there fails and blocks the start.
     const nodeModules = path.join(project.dir, 'node_modules');
     const packageJson = path.join(project.dir, 'package.json');
-    if (!fs.existsSync(nodeModules) && fs.existsSync(packageJson)) {
+    const haveModules = fs.existsSync(nodeModules);
+    // Deps arrived (the install worked, or the user ran it by hand): forget any
+    // remembered failure so a later one can install again.
+    if (haveModules) r.installFailed = null;
+    if (!haveModules && fs.existsSync(packageJson)) {
+      // An install that already failed on this record is not retried by a plain
+      // reload: node_modules is still missing, so the condition above is still
+      // true, and without this memo every refresh paid installTimeoutMs again
+      // (5 minutes, by default) to reach the same failure. Re-report the
+      // remembered failure instead, instantly. The failure page's Retry link
+      // clears the memo (see handleRequest), so a deliberate retry does install.
+      if (r.installFailed) {
+        log(`install-skipped: ${host} install already failed at ${new Date(r.installFailed.at).toISOString()} -> failing fast`);
+        r.state = 'stopped';
+        r.owned = false;
+        r.child = null;
+        r.pid = null;
+        const e = new Error(r.installFailed.message);
+        e.code = 'INSTALL_FAILED';
+        e.host = host;
+        r.lastError = { ...r.installFailed, at: Date.now() };
+        throw e;
+      }
       r.state = 'installing';
-      const ok = await runInstall(project, r);
-      if (!ok) {
+      const result = await runInstall(project, r);
+      if (!result.ok) {
         // Install failed/timed out — runInstall already killed it on timeout,
         // but a non-zero exit leaves the child reaped; make sure the group dies.
         killGroup(r, 'SIGKILL');
@@ -789,21 +1511,56 @@ async function ensureUp(project) {
         r.owned = false;
         r.child = null;
         r.pid = null;
-        const e = new Error('installFailed');
-        e.code = 'START_TIMEOUT'; // route through the existing 502-with-log page
+        const message = result.timedOut
+          ? `\`${result.cmd}\` did not finish within ${config.installTimeoutMs}ms`
+          : result.exitCode === null
+            ? `\`${result.cmd}\` could not be run${result.message ? `: ${result.message}` : ''}`
+            : `\`${result.cmd}\` exited with code ${result.exitCode}`;
+        const e = new Error(message);
+        e.code = 'INSTALL_FAILED';
         e.host = host;
         // Record before throwing: handleRequest no longer awaits us on the cold
         // path, so the status page reads r.lastError after startPromise clears.
-        r.lastError = { code: e.code, message: e.message, at: Date.now() };
+        // Unless the install died because someone stopped the project: that is
+        // an interrupted install, not a broken one, and memoizing it would make
+        // the next visit re-report a failure nobody had.
+        if (!stoppedByUs()) {
+          r.lastError = {
+            code: e.code,
+            kind: 'install-failed',
+            message,
+            at: Date.now(),
+            installCmd: result.cmd,
+            exitCode: result.exitCode,
+            timedOut: !!result.timedOut,
+            timeoutMs: config.installTimeoutMs, // the limit in force at failure time
+          };
+          r.installFailed = r.lastError; // the memo the next request reads
+        }
         throw e;
       }
     }
 
     const logFd = logFdFor(host);
-    log(`start: ${host} -> sh -c '${project.startCmd}' (cwd=${project.dir}, PORT=${project.port})`);
+    // Expansion happens here, at spawn time, not at registry-read time: the
+    // separator and the daemon log then quote the command that actually ran.
+    const startCmd = expandStartCmd(project.startCmd);
+    writeLogSeparator(host, logFd, 'start', startCmd, project.port);
+    const startedAt = Date.now();
+    // The dev server runs inside a real terminal when this machine has a python3
+    // for lib/pty.py, and on plain pipes when it does not (spec section 6). The
+    // command is `sh -c <startCmd>` either way, reached through pty.py in the
+    // first case; whichever of the two we spawn is the process-group leader, so
+    // stop()'s SIGTERM-group, 5s, SIGKILL order is untouched by the choice.
+    const python = ptyInterpreter();
+    const size = termSizes.get(host) || { rows: PTY_ROWS, cols: PTY_COLS };
+    const [file, args] = python
+      ? [python, [PTY_SCRIPT, String(size.rows), String(size.cols), startCmd]]
+      : ['sh', ['-c', startCmd]];
+    log(`start: ${host} -> sh -c '${startCmd}' (cwd=${project.dir}, PORT=${project.port}, ${python ? 'pty' : 'pipes'})`);
     let child;
     try {
-      child = spawn('sh', ['-c', project.startCmd], {
+      child = spawn(file, args, {
         cwd: project.dir,
         env: {
           ...process.env,
@@ -813,7 +1570,12 @@ async function ensureUp(project) {
           NEXT_TELEMETRY_DISABLED: '1',
         },
         detached: true, // own process-group leader -> kill -pid kills the group
-        stdio: ['ignore', logFd, logFd],
+        // With a pty: stdin and stdout are the terminal's two ends, stderr is
+        // pty.py's own (the command's is merged into the tty), and fd 3 takes
+        // `<rows> <cols>` resize lines. Without one: no stdin at all, which is
+        // exactly what makes the panel read-only, and the same output pipes so
+        // the panel and the log still get everything the dev server says.
+        stdio: python ? ['pipe', 'pipe', 'pipe', 'pipe'] : ['ignore', 'pipe', 'pipe'],
       });
     } catch (err) {
       if (typeof logFd === 'number') {
@@ -827,22 +1589,45 @@ async function ensureUp(project) {
       r.owned = false;
       r.child = null;
       r.pid = null;
+      // A synchronous spawn throw (no /bin/sh, EMFILE, a bad cwd caught early)
+      // used to leave lastError null, so the page said 'waking' forever. It is
+      // the same thing to the person waiting as a child that died on contact:
+      // report it as 'exited' with no code to quote.
+      r.lastError = { code: 'START_EXITED', kind: 'exited', message: err.message, at: Date.now(), exitCode: null, elapsedMs: Date.now() - startedAt };
       throw err;
     }
 
-    // We hold the fd open via the child's stdio; close our copy.
-    if (typeof logFd === 'number') {
-      try {
-        fs.closeSync(logFd);
-      } catch {
-        /* ignore */
-      }
-    }
+    // The child's stdout is a tty (or a pipe) now, never the log file, so the
+    // daemon owns the log fd for as long as this child lives and the sink is
+    // what writes it. sink.end() closes it once both output streams are done.
+    const sink = makeTermSink(host, logFd);
+    child.stdout.on('data', (buf) => sink.write(buf));
+    // pty.py's own stderr is its usage line or a python traceback, and that
+    // belongs in the same place for the same reason. On the pipe path this is
+    // the dev server's real stderr, as before.
+    child.stderr.on('data', (buf) => sink.write(buf));
+    child.stdout.on('error', () => {});
+    child.stderr.on('error', () => {});
+    // 'close' rather than 'exit': it fires once the stdio is drained too, so
+    // nothing the dying child said is lost between the last read and the close.
+    child.on('close', () => sink.end());
 
     r.child = child;
     r.pid = child.pid;
     r.owned = true;
     r.state = 'starting';
+    if (python) {
+      const resize = child.stdio[3] || null;
+      // EPIPE on a child that has already gone is expected, not fatal.
+      child.stdin.on('error', () => {});
+      resize?.on('error', () => {});
+      // startedAt is read by writePtySize: a resize asked for in the first
+      // moments of a spawn needs sending twice (see PTY_SIZE_SETTLE_MS).
+      r.pty = { stdin: child.stdin, resize, startedAt: Date.now() };
+    } else {
+      r.pty = null;
+    }
+    clearAdoption(r); // this port is ours now; no adopted pid to re-verify
 
     child.on('exit', (code, signal) => {
       log(`exit: ${host} pid=${child.pid} code=${code} signal=${signal}`);
@@ -852,6 +1637,7 @@ async function ensureUp(project) {
         r.child = null;
         r.pid = null;
         r.owned = false;
+        r.pty = null; // nothing to type into until the next start
       }
     });
     child.on('error', (err) => {
@@ -890,11 +1676,12 @@ async function ensureUp(project) {
       log(`ready: ${host} listening on ${upHost}:${project.port}`);
     } catch (err) {
       const exited = err && err.code === 'START_EXITED';
+      const deliberate = stoppedByUs();
       if (exited) {
         // The 'exit' handler above already flipped the record to stopped and
         // cleared child/pid; sweep group stragglers via the child's own pgid
         // (killGroup reads r.pid, which is null by now).
-        log(`start-failed: ${host} ${err.message}`);
+        log(deliberate ? `start-stopped: ${host} stopped while starting` : `start-failed: ${host} ${err.message}`);
         try {
           process.kill(-child.pid, 'SIGKILL');
         } catch {
@@ -917,8 +1704,17 @@ async function ensureUp(project) {
         e.signal = err.signal;
       }
       // Record before throwing (see install-failed site): the cold status page
-      // reads r.lastError after startPromise clears in the finally below.
-      r.lastError = { code: e.code, message: e.message, at: Date.now() };
+      // reads r.lastError after startPromise clears in the finally below. The
+      // numbers the copy quotes are captured here, not re-derived at render
+      // time: how long the child actually lived, or the timeout it rode out.
+      // ...but not when we are the ones who killed it: `deliberate` means a
+      // stop landed after this attempt began, so the record stays a plain
+      // 'stopped' one and the URL keeps waking the project.
+      if (!deliberate) {
+        r.lastError = exited
+          ? { code: e.code, kind: 'exited', message: e.message, at: Date.now(), exitCode: err.exitCode, signal: err.signal, elapsedMs: Date.now() - startedAt }
+          : { code: e.code, kind: 'timeout', message: e.message, at: Date.now(), port: project.port, timeoutMs: config.startTimeoutMs };
+      }
       throw e;
     }
   })();
@@ -955,6 +1751,9 @@ function stop(host, reason = 'manual') {
     return { ok: false, reason: 'not owned by lazydev' };
   }
   const pid = r.pid;
+  // Before the signal, so a bring-up that is mid-await when the child dies can
+  // tell our SIGTERM from a dev server that fell over on its own.
+  r.stopSeq = (r.stopSeq || 0) + 1;
   log(`stop: ${host} (pid group ${pid}, ${reason}) -> SIGTERM`);
   killGroup(r, 'SIGTERM');
   // Escalate to SIGKILL if still alive after 5s. unref() so this lone timer can
@@ -984,7 +1783,89 @@ function stop(host, reason = 'manual') {
   r.owned = false;
   r.child = null;
   r.pid = null;
+  // Forget the terminal handles here and not only in the exit handler: the
+  // record stops pointing at this child the moment we ask it to die, and a
+  // panel that is still open must not type into a process on its way out.
+  r.pty = null;
+  clearAdoption(r);
   return { ok: true };
+}
+
+// Free a project's port by stopping the FOREIGN process squatting it — the
+// conflict page's call to action. Every check runs at action time against the
+// live listener, never against the remembered conflict record: a conflict page
+// left open for hours must not kill whatever grabbed the port since. The rules:
+//   - nothing listening        -> the conflict is stale; clear it, done
+//   - cwd unresolved           -> refuse (never kill what we cannot identify)
+//   - cwd matches project.dir  -> nothing to kill; clear the conflict so the
+//                                 next request adopts the project's own server
+//   - cwd mismatch             -> SIGTERM the listener, wait, SIGKILL if needed
+// The pid is resolved before the cwd check and re-checked after it, so a
+// listener that changes mid-decision aborts the kill instead of hitting a
+// process nobody looked at.
+async function freePort(project, r) {
+  // A bring-up in flight owns the probe/adopt decision; let it settle first.
+  if (r.startPromise) await r.startPromise.catch(() => {});
+  // Settled into running (owned or adopted)? The port belongs to the project
+  // now — there is nothing to free, and clearing the record here would orphan
+  // an owned child.
+  if (r.state === 'running') {
+    return { ok: true, freed: false, reason: 'already running' };
+  }
+  const host = project.host;
+  const clear = () => {
+    r.state = 'stopped';
+    r.owned = false;
+    r.child = null;
+    r.pid = null;
+    r.upstreamHost = null;
+    r.conflictDir = null;
+    // The conflict is over, so its lastError must go with it. Left standing it
+    // reads as a terminal failure (stopped + lastError), which handleRequest
+    // never re-kicks: the page's "Free port and open" reloaded into a stuck
+    // "failed to start" instead of the wake page.
+    if (r.lastError && r.lastError.kind === 'conflict') r.lastError = null;
+    clearAdoption(r);
+  };
+  if (!(await probePort(project.port, 300))) {
+    clear();
+    return { ok: true, freed: false, reason: 'nothing listening' };
+  }
+  const pid = resolveListenerPid(project.port);
+  if (!pid || pid === process.pid) {
+    return { ok: false, reason: 'could not identify the listening process' };
+  }
+  const cwd = resolvePidCwd(project.port);
+  if (cwd === null) {
+    return { ok: false, reason: 'could not identify the listening process' };
+  }
+  if (sameDir(cwd, project.dir)) {
+    clear();
+    return { ok: true, freed: false, reason: 'listener is this project' };
+  }
+  if (resolveListenerPid(project.port) !== pid) {
+    return { ok: false, reason: 'the listener changed mid-check; try again' };
+  }
+  log(`free: ${host} port ${project.port} held by pid ${pid} in ${cwd} -> SIGTERM`);
+  const goneWithin = async (ms) => {
+    const deadline = Date.now() + ms;
+    do {
+      if (!(await probePort(project.port, 200))) return true;
+      await new Promise((resolve) => setTimeout(resolve, 200));
+    } while (Date.now() < deadline);
+    return !(await probePort(project.port, 200));
+  };
+  killForeign(pid, 'SIGTERM');
+  if (!(await goneWithin(4000))) {
+    log(`free: ${host} pid ${pid} still listening after SIGTERM -> SIGKILL`);
+    killForeign(pid, 'SIGKILL');
+    if (!(await goneWithin(2000))) {
+      return { ok: false, reason: 'the process did not release the port' };
+    }
+  }
+  log(`free: ${host} port ${project.port} is free`);
+  clear();
+  return { ok: true, freed: true };
 }
 
 // ---------------------------------------------------------------------------
@@ -1005,6 +1886,13 @@ function htmlPage(title, bodyInner) {
   a:hover { text-decoration: underline; }
   ul { padding-left: 1.2rem; }
   .muted { opacity: 0.65; }
+  /* The log box on the failed page is the only block of dark-on-light here,
+     and #1115 (black at 7%) landed as the same flat grey in both themes, so in
+     dark mode the log read as a slightly different background instead of a
+     panel. Give it a real surface + edge of its own. */
+  @media (prefers-color-scheme: dark) {
+    pre { background: #0d1117; border: 1px solid #ffffff1f; }
+  }
 </style></head><body>${bodyInner}</body></html>`;
 }
 
@@ -1086,52 +1974,116 @@ function phaseLabel(r) {
   return 'waking';
 }
 
+// One sentence per failure kind, with the numbers that make it checkable.
+// This is the whole of section 4's complaint: before it, every failure rendered
+// the start-timeout sentence, so a dev server that died in 100ms read as "did
+// not open 127.0.0.1:3010 within 30s" and the log was the only way to tell.
+// `kind` is the closed set ensureUp writes: exited, timeout, dir-missing,
+// install-failed, conflict. Returns HTML; every interpolated value is escaped.
+//
+// The dir-missing sentence names the folder even for an unauthorized caller,
+// unlike the raw `reason` line below it. Deliberate: the path IS the fix, the
+// two commands are useless without it, and this response is readable only from
+// the project's own origin (a cross-origin page can navigate a browser here but
+// cannot read what comes back). /__lazydev/status already ships conflictDir on
+// the same reasoning.
+function failureCopy(project, lastError) {
+  const le = lastError || {};
+  const lived = le.elapsedMs == null ? null : (le.elapsedMs / 1000).toFixed(1);
+  switch (le.kind) {
+    case 'exited':
+      if (le.exitCode != null) return `The dev server exited with code ${esc(String(le.exitCode))} after ${lived ?? '?'}s.`;
+      if (le.signal) return `The dev server was killed by ${esc(String(le.signal))} after ${lived ?? '?'}s.`;
+      return `The dev server exited before it opened <code>127.0.0.1:${project.port}</code>.`;
+    case 'timeout':
+      return `Nothing answered on port ${esc(String(le.port ?? project.port))} within ${Math.round((le.timeoutMs ?? config.startTimeoutMs) / 1000)}s. The process is still being killed.`;
+    case 'dir-missing':
+      return `The folder <code>${esc(le.dir || project.dir)}</code> is gone. Move it back, or <code>lazydev remove ${esc(project.host)}</code> / <code>lazydev add /new/path --name ${esc(project.host)}</code>.`;
+    case 'install-failed':
+      if (le.timedOut) return `<code>${esc(le.installCmd || 'npm install')}</code> did not finish within ${Math.round((le.timeoutMs ?? config.installTimeoutMs) / 1000)}s.`;
+      if (le.exitCode == null) return `<code>${esc(le.installCmd || 'npm install')}</code> could not be run.`;
+      return `<code>${esc(le.installCmd || 'npm install')}</code> exited with code ${esc(String(le.exitCode))}.`;
+    case 'conflict':
+      return `Port ${esc(String(le.port ?? project.port))} is held by another process, so this project was never started.`;
+    default:
+      // No kind recorded (a pre-0.3.0 record, or a failure path added without
+      // one): fall back to the sentence every failure used to get.
+      return `The dev server did not open <code>127.0.0.1:${project.port}</code> within ${Math.round(config.startTimeoutMs / 1000)}s.`;
+  }
+}
+
 // Self-refreshing HTML served on a cold navigation hit. Names the project + its
-// phase, tails the install/start log, and — unless the start already failed —
-// polls the SAME url with Accept: application/json and reloads once that stops
-// returning 503 (i.e. the port answered and the request proxied to the app).
+// phase, and polls the host-scoped GET /__lazydev/tail once a second. That one
+// poll drives everything: the phase line updates in place (installing turns
+// into starting without a reload), an optional terminal panel shows the live
+// log tail, and a state that left the bring-up phases reloads the page — into
+// the app when the port answered, or into the failed/conflict page otherwise.
 // `r` may be the live runtime record OR a {state, lastError} snapshot taken by
 // handleRequest before it re-kicked bring-up; only those two fields are read.
 //
-// Log tails and the raw failure message can leak filesystem paths, so they are
-// shown ONLY to an authorized caller (same-origin + capability token). An
-// ordinary browser navigation carries no token, so `authorized` is false and the
-// page redacts the log, pointing the user at `lazydev logs <host>` instead.
+// The raw failure message can leak filesystem paths, so it is shown ONLY to an
+// authorized caller (same-origin + capability token). The log tail itself is
+// no longer gated: /__lazydev/tail serves it host-scoped to the project's own
+// origin (its handler explains why that is sound), because "why is this taking
+// so long" is exactly the question this page exists to answer.
 function statusPageHtml(project, r, authorized = false) {
   const host = project.host;
   const phase = phaseLabel(r);
-  // Either the real log tail (authorized) or a redaction notice pointing at the
-  // CLI, which reads the log locally where the token isn't needed.
-  const logBlock = (lines) =>
-    authorized
-      ? `<p>Last lines of <code>logs/${esc(host)}.log</code>:</p><pre>${esc(tailLog(host, lines))}</pre>`
-      : `<p class="muted">Log output is hidden. Check it with <code>lazydev logs ${esc(host)}</code>.</p>`;
+  // The terminal panel + its dim pointer at the CLI twin. Shared by the failed
+  // page (open, fetched once) and the wake page (toggled, polled live).
+  const termNote = `<p class="muted">The same lines as <code>lazydev logs ${esc(host)}</code>.</p>`;
   if (phase === 'failed') {
     // The raw error message can leak paths too — redact it for the unauthorized.
     const reason = authorized
       ? (r.lastError && (r.lastError.message || r.lastError.code)) || 'unknown error'
       : 'The dev server failed to start.';
-    // Terminal page: no auto-refresh. Mirror the START_TIMEOUT copy so wording
-    // stays consistent, and offer a manual retry link to the same URL.
+    // A dir-missing failure never reached a spawn, so this attempt wrote nothing
+    // to the log; showing the previous run's tail under it would answer a
+    // question nobody asked. Every other kind ends in output worth reading.
+    const kind = (r.lastError && r.lastError.kind) || null;
+    const withLog = kind !== 'dir-missing';
+    const logBlock = withLog
+      ? `<pre id="term">loading the log&hellip;</pre>
+       ${termNote}
+       <script>
+         fetch('/__lazydev/tail', { cache: 'no-store' })
+           .then((res) => res.json())
+           .then((j) => {
+             const t = document.getElementById('term');
+             t.textContent = (j.ok && j.tail) || '(no log output captured)';
+             t.scrollTop = t.scrollHeight;
+           })
+           .catch(() => {});
+       </script>`
+      : '';
+    // Terminal page: no auto-refresh. The headline sentence comes from
+    // failureCopy, so each kind says what actually happened, and a manual retry
+    // link points at the same URL. The log tail arrives via /__lazydev/tail so
+    // this page shows the WHY by default.
     return htmlPage(
       `${host} — failed to start`,
       `<h1>${esc(host)} failed to start</h1>
-       <p>The dev server did not open <code>127.0.0.1:${project.port}</code> within ${Math.round(config.startTimeoutMs / 1000)}s.</p>
+       <p>${failureCopy(project, r.lastError)}</p>
        <p class="muted">${esc(reason)}</p>
-       ${logBlock(40)}
-       <p><a href="${esc('/')}">Retry</a></p>${dashboardHomeLink()}`
+       ${logBlock}
+       <p><a href="${esc('/?retry=1')}">Retry</a></p>${dashboardHomeLink()}`
     );
   }
   // Non-terminal: waking / installing / starting. A minimal centered card — a
-  // spinner, one line of copy, and a way back — plus a poll loop that hands off
-  // to the app without a manual reload once the port answers.
+  // spinner, the phase in plain words, a seconds counter, and a "show the
+  // terminal" toggle for when the seconds keep climbing.
+  // One table, both places. The tab used to say "installing" while the body
+  // said "being turned on", because the title was rendered once from the phase
+  // at request time and only the body followed the poll. Now the title and the
+  // sentence come from the same entry, and the poll below rewrites both.
   const phraseByPhase = {
-    installing: 'Installing dependencies, then starting the dev server.',
-    starting: 'The dev server is being turned on.',
-    waking: 'The dev server is being turned on.',
+    installing: { title: 'installing', body: 'Installing dependencies, then starting the dev server.' },
+    starting: { title: 'starting up', body: 'The dev server is being turned on.' },
+    waking: { title: 'starting up', body: 'The dev server is being turned on.' },
   };
+  const phrase = phraseByPhase[phase] || phraseByPhase.waking;
   return htmlPage(
-    `${host} — ${phase}`,
+    `${host} — ${phrase.title}`,
     `<style>
        .wake { min-height: calc(100vh - 6rem); display: flex; flex-direction: column;
                align-items: center; justify-content: center; text-align: center; gap: 0.25rem; }
@@ -1143,31 +2095,82 @@ function statusPageHtml(project, r, authorized = false) {
        .back { display: inline-block; margin-top: 1.75rem; padding: 0.45rem 1.1rem;
                border: 1px solid #8886; border-radius: 8px; }
        .back:hover { text-decoration: none; background: #8881; }
+       .termbtn { font: inherit; font-size: 13px; margin-top: 1.1rem; padding: 0.3rem 0.9rem;
+                  border: 1px solid #8886; border-radius: 8px; background: none;
+                  color: inherit; cursor: pointer; opacity: 0.8; }
+       .termbtn:hover { background: #8881; opacity: 1; }
+       #term { display: none; width: min(46rem, 92vw); max-height: 42vh; overflow: auto;
+               text-align: left; margin: 1rem 0 0; }
+       #termnote { display: none; }
      </style>
      <div class="wake">
        <div class="spinner" aria-hidden="true"></div>
        <h1>${esc(host)}</h1>
-       <p class="muted">${phraseByPhase[phase] || phraseByPhase.waking} This page opens the app automatically once it&#39;s ready.</p>
+       <p class="muted" id="phrase">${phrase.body} This page opens the app automatically once it&#39;s ready.</p>
+       <p class="muted" id="elapsed" aria-hidden="true">0s</p>
+       <button class="termbtn" id="termbtn">show the terminal</button>
+       <pre id="term"></pre>
+       <div id="termnote">${termNote}</div>
        <a class="back" href="${esc(frontUrl('lazydev'))}/">&larr; Back to dashboard</a>
      </div>
      <noscript><meta http-equiv="refresh" content="2"></noscript>
      <script>
-       // Poll the same URL asking for JSON: while bringing up, handleRequest
-       // returns 503; once the port answers the request proxies to the app and
-       // the status is no longer 503 — that edge is our cue to reload.
-       setInterval(async () => {
-         try {
-           const res = await fetch(location.href, { headers: { 'accept': 'application/json' }, cache: 'no-store' });
-           if (res.status !== 503) location.reload();
-         } catch (e) { /* daemon momentarily unreachable; keep polling */ }
+       const PHRASES = ${JSON.stringify(phraseByPhase)};
+       const SUFFIX = ${JSON.stringify(" This page opens the app automatically once it's ready.")};
+       const HOST = ${JSON.stringify(host)};
+       const started = Date.now();
+       const term = document.getElementById('term');
+       const termbtn = document.getElementById('termbtn');
+       let showTerm = false;
+       termbtn.onclick = () => {
+         showTerm = !showTerm;
+         term.style.display = showTerm ? 'block' : 'none';
+         document.getElementById('termnote').style.display = showTerm ? 'block' : 'none';
+         termbtn.textContent = showTerm ? 'hide the terminal' : 'show the terminal';
+         if (showTerm) tick();
+       };
+       // Seconds waited, from 0s. A first start legitimately installs for
+       // minutes; the counter plus the terminal separate "slow" from "stuck".
+       // It used to appear at 3s, which read as the page fixing a glitch.
+       setInterval(() => {
+         const s = Math.round((Date.now() - started) / 1000);
+         document.getElementById('elapsed').textContent = s + 's';
        }, 1000);
+       // One poll drives the phase line, the terminal, and the handoff. Any
+       // state outside the bring-up phases means this page is stale: reload,
+       // and land on the app, the failed page, or the conflict page. A lone
+       // 'stopped' can also be the daemon mid-decision, so it must repeat
+       // before it counts.
+       let stoppedTicks = 0;
+       async function tick() {
+         try {
+           const res = await fetch('/__lazydev/tail', { cache: 'no-store' });
+           if (!res.ok) return;
+           const j = await res.json();
+           stoppedTicks = j.state === 'stopped' ? stoppedTicks + 1 : 0;
+           if (j.state === 'running' || j.state === 'conflict' || j.phase === 'failed' || stoppedTicks >= 2) {
+             location.reload();
+             return;
+           }
+           const ph = PHRASES[j.phase] || PHRASES.waking;
+           document.getElementById('phrase').textContent = ph.body + SUFFIX;
+           document.title = HOST + ' — ' + ph.title;
+           if (showTerm) {
+             // Keep the view pinned to the newest lines unless the user
+             // scrolled up to read something.
+             const stick = term.scrollTop + term.clientHeight >= term.scrollHeight - 4;
+             term.textContent = j.tail || '(no log output yet)';
+             if (stick) term.scrollTop = term.scrollHeight;
+           }
+         } catch (e) { /* daemon momentarily unreachable; keep polling */ }
+       }
+       setInterval(tick, 1000);
      </script>`
   );
 }
 
 // Cold-hit answer for non-navigation clients (curl / XHR / webhook): a plain
-// 503 with Retry-After and NO HTML body, so simple clients keep retrying and
-// the status-page poll gets its 503 signal.
+// 503 with Retry-After and NO HTML body, so simple clients keep retrying.
 function sendRetry(res, project, r) {
   res.writeHead(503, { 'content-type': 'text/plain; charset=utf-8', 'retry-after': '1' });
   res.end(phaseLabel(r) + '\n');
@@ -1176,23 +2179,69 @@ function sendRetry(res, project, r) {
 // Terminal answer for a port CONFLICT: the project's port is held by a foreign
 // process (a dev server started from some OTHER directory). We must never proxy
 // to it and never invite a retry, so this is a hard 502 — NOT the transient 503.
-// A browser navigation gets an HTML explanation; curl/XHR gets a plain 502. The
-// foreign cwd is a filesystem path, so it is shown only to an authorized caller
-// (same-origin + token); an ordinary navigation gets it redacted.
+// But for the person standing in front of it this is a decision point, not a
+// dead end, so the page carries the fix: one button that POSTs the host-scoped
+// /__lazydev/free (no token needed; see handleControl) and reloads into the
+// normal wake flow. A browser navigation gets that page; curl/XHR gets a plain
+// 502. The foreign cwd is a filesystem path, so it is shown only to an
+// authorized caller (same-origin + token); an ordinary navigation gets the
+// button without the path.
 function sendConflict(req, res, project, r, authorized = false) {
   const host = project.host;
   const dir = r && r.conflictDir;
   if (wantsHtml(req)) {
     const detail = authorized && dir
-      ? `<p class="muted">Port <code>${project.port}</code> is held by a process running in <code>${esc(dir)}</code>, not <code>${esc(project.dir)}</code>.</p>`
-      : `<p class="muted">Its port is held by another process that lazydev did not start. Stop that process, or point this project at a free port.</p>`;
+      ? `<p class="muted">It runs from <code>${esc(dir)}</code>. This project lives in <code>${esc(project.dir)}</code>.</p>`
+      : '';
+    const freeLabel = `Free port ${project.port} and open ${host}`;
     return sendHtml(
       res,
       502,
-      `lazydev — ${host} port conflict`,
-      `<h1>${esc(host)} has a port conflict</h1>
-       <p>lazydev refused to proxy: something else is already listening on <code>127.0.0.1:${project.port}</code> and it was not started from this project's directory.</p>
-       ${detail}${dashboardHomeLink()}`
+      `lazydev · ${host} port in use`,
+      `<style>
+         .conflict { min-height: calc(100vh - 6rem); display: flex; flex-direction: column;
+                     align-items: center; justify-content: center; text-align: center; gap: 0.25rem; }
+         .conflict p { max-width: 34rem; margin: 0.25rem 0; }
+         .freebtn { font: inherit; margin-top: 1.5rem; padding: 0.55rem 1.3rem;
+                    border: 1px solid #2563eb; border-radius: 8px;
+                    background: #2563eb; color: #fff; cursor: pointer; }
+         .freebtn:hover { filter: brightness(1.1); }
+         .freebtn:disabled { opacity: 0.6; cursor: default; filter: none; }
+         .back { display: inline-block; margin-top: 1.5rem; }
+       </style>
+       <div class="conflict">
+         <h1>${esc(host)} is blocked, not broken</h1>
+         <p>Another process is sitting on port ${project.port}, and it is not this project's dev server. lazydev stopped here instead of showing you the wrong app.</p>
+         ${detail}
+         <button class="freebtn" id="free">${esc(freeLabel)}</button>
+         <p class="muted">This sends that process a normal quit signal. To keep it, give ${esc(host)} a different port in the registry instead.</p>
+         <a class="back" href="${esc(frontUrl('lazydev'))}/">&larr; lazydev dashboard</a>
+       </div>
+       <script>
+         const btn = document.getElementById('free');
+         btn.onclick = async () => {
+           btn.disabled = true;
+           btn.textContent = ${JSON.stringify(`Freeing port ${project.port}…`)};
+           // Same-origin POST, host-scoped server-side: this page can only ever
+           // free the port of the project it is served for.
+           let failed = 'The daemon did not answer.';
+           try {
+             const res = await fetch('/__lazydev/free', { method: 'POST' });
+             const j = await res.json();
+             if (j.ok) {
+               btn.textContent = ${JSON.stringify(`Starting ${host}…`)};
+               location.reload(); // cold path takes over: wake page, then the app
+               return;
+             }
+             failed = j.reason || failed;
+           } catch (e) { /* daemon unreachable; fall through */ }
+           btn.textContent = failed;
+           setTimeout(() => {
+             btn.disabled = false;
+             btn.textContent = ${JSON.stringify(freeLabel)};
+           }, 3000);
+         };
+       </script>`
     );
   }
   res.writeHead(502, { 'content-type': 'text/plain; charset=utf-8' });
@@ -1283,21 +2332,51 @@ function isControlAuthorized(req) {
 // Control plane
 // ---------------------------------------------------------------------------
 
-function liveState(host, project) {
+// `authorized` is the caller's own (same-origin + control token), not the
+// daemon's: GET /__lazydev/status answers on every project host, so a page a
+// dev server renders can read it same-origin. The fields that name the machine
+// (the start command, the raw failure message, a raw line of the dev server's
+// log) are therefore served only to a caller holding the token, the same rule
+// the failure page applies to the same strings. Everything the dashboard needs
+// to paint a row without the token (state, port, kind) stays.
+function liveState(host, project, authorized = false) {
   const r = runtime.get(host);
   const la = lastAccess.get(host) || 0;
   let state = r ? r.state : 'stopped';
   let owned = r ? r.owned : false;
+  // A dir-missing failure never reached a spawn, so this attempt wrote no
+  // separator and no output: a tail read here returns the PREVIOUS run's lines
+  // and firstErrorLine falls back to the last of them, which captioned a red
+  // row with a line from a start that worked. Same rule statusPageHtml uses to
+  // leave the log box off that page.
+  const errorLine = r && r.lastError && r.lastError.kind !== 'dir-missing'
+    ? firstErrorLine(tailLog(host, 40))
+    : null;
   return {
     host,
     url: frontUrl(host),
     port: project.port,
     enabled: project.enabled !== false,
     framework: project.framework || 'node',
+    // What the row's edit panel prefills its "start command" field with.
+    startCmd: authorized ? project.startCmd || '' : '',
     state,
     owned,
     conflict: state === 'conflict',
     conflictDir: r ? r.conflictDir || null : null,
+    // The dashboard's red `failed` badge reads this: `kind` is its tooltip and
+    // `errorLine` the line it shows beside it. Only carried for a record that
+    // actually failed, so the common poll stays a pure in-memory map and the log
+    // read happens for failed projects only.
+    lastError: r && r.lastError
+      ? {
+          kind: r.lastError.kind || null,
+          code: r.lastError.code || null,
+          message: authorized ? r.lastError.message || null : null,
+          at: r.lastError.at || null,
+          errorLine: authorized ? errorLine : null,
+        }
+      : null,
     lastAccess: la || null,
     idleForMs: la ? Date.now() - la : null,
     connCount: connCount(host),
@@ -1305,12 +2384,273 @@ function liveState(host, project) {
   };
 }
 
-function statusPayload() {
+function statusPayload(authorized = false) {
   return {
     uptimeMs: Date.now() - STARTED_AT,
     idleTimeoutMs: config.idleTimeoutMs,
-    projects: config.projects.map((p) => liveState(p.host, p)),
+    // Whether dev servers get a real terminal on this machine. `lazydev status`
+    // prints `pty.note` once at the top when there is none, which is the same
+    // line a read-only panel opens with: one sentence, one source.
+    pty: ptyStatus(),
+    projects: config.projects.map((p) => liveState(p.host, p, authorized)),
   };
+}
+
+// ---------------------------------------------------------------------------
+// Dashboard edits (section 7): add / remove / enable / disable / set / restart
+// ---------------------------------------------------------------------------
+
+// Read the registry file, mutate it with one of lib/registry-cli.mjs's edits,
+// write it back, reload. The file is the source of truth — an in-memory edit
+// would be undone by the next reload — and going through the shared module is
+// what keeps the dashboard and the subcommands from growing two ideas of what
+// a valid entry is. The explicit loadConfig is so the response we are about to
+// send already reflects the write; fs.watch would get there a beat later.
+async function editRegistry(reason, mutate) {
+  const reg = readRegistry(CONFIG_PATH);
+  const out = await mutate(reg);
+  writeRegistry(CONFIG_PATH, reg);
+  loadConfig(reason);
+  return out;
+}
+
+// A RegistryError carries the sentence the CLI prints; the dashboard shows the
+// same words under the field. A name or port someone else already holds is a
+// 409 (the request was well formed, the value is taken); everything else is a
+// 400 the user can retype.
+function sendRegistryError(res, err) {
+  const status = /already (registered|claimed)|is taken|is reserved/.test(err.message) ? 409 : 400;
+  return sendJson(res, status, { ok: false, reason: err.message });
+}
+
+// The host part of /__lazydev/<verb>/<host>, decoded.
+function hostFromPath(pathname, prefix) {
+  return decodeURIComponent(pathname.slice(prefix.length));
+}
+
+// Handles the section 7 POSTs; returns true when it answered, false when the
+// path is not one of them. Every caller is already past handleControl's token
+// guard. Grouped in one function so a RegistryError from any of them turns
+// into the same inline JSON the form and the edit panel render.
+async function handleEditControl(req, res, url) {
+  const pathname = url.pathname;
+  try {
+    // POST /__lazydev/detect — the add form's prefill, and nothing else: it
+    // writes nothing. Runs the same detectors `lazydev add` runs on one
+    // directory and hands back what the form should show.
+    if (pathname === '/__lazydev/detect') {
+      const body = (await readJsonBody(req)) || {};
+      const raw = typeof body.dir === 'string' ? body.dir.trim() : '';
+      if (!raw) {
+        sendJson(res, 400, { ok: false, reason: 'a folder path is required' });
+        return true;
+      }
+      const dir = expandTilde(raw).replace(/(.)\/+$/, '$1');
+      if (!path.isAbsolute(dir)) {
+        sendJson(res, 400, { ok: false, reason: 'the folder path must be absolute (~ is allowed)' });
+        return true;
+      }
+      let stat = null;
+      try {
+        stat = fs.statSync(dir);
+      } catch {
+        /* missing — reported below */
+      }
+      if (!stat || !stat.isDirectory()) {
+        sendJson(res, 404, { ok: false, reason: `no such folder: ${dir}` });
+        return true;
+      }
+      // Against the live registry plus a real bind probe, same as the CLI.
+      const port = await pickPort({ projects: config.projects });
+      const det = detectOne(dir);
+      // Exactly what `lazydev add` would store for this folder, placeholder and
+      // all, so the form prefills with the string that is going to be written.
+      const detected = det ? startCmdFor(det, port) : null;
+      sendJson(res, 200, {
+        ok: true,
+        dir,
+        name: sanitizeHost(path.basename(dir)),
+        port,
+        framework: det ? det.framework : null,
+        startCmd: detected,
+        // Nothing provable: the form says what was looked for, in the same
+        // words `lazydev add` prints, and waits for a typed command.
+        evidence: det ? null : DETECTOR_EVIDENCE,
+      });
+      return true;
+    }
+
+    if (pathname === '/__lazydev/add') {
+      const body = (await readJsonBody(req)) || {};
+      const dir = expandTilde(String(body.dir || '').trim()).replace(/(.)\/+$/, '$1');
+      if (!dir) {
+        sendJson(res, 400, { ok: false, reason: 'a folder path is required' });
+        return true;
+      }
+      if (!path.isAbsolute(dir)) {
+        sendJson(res, 400, { ok: false, reason: 'the folder path must be absolute (~ is allowed)' });
+        return true;
+      }
+      const host = sanitizeHost(String(body.name || '').trim() || path.basename(dir));
+      const wantPort = body.port === undefined || body.port === null || body.port === ''
+        ? null
+        : Number(body.port);
+      if (wantPort !== null && !Number.isInteger(wantPort)) {
+        sendJson(res, 400, { ok: false, reason: `port must be a number (got "${body.port}")` });
+        return true;
+      }
+      // The registry this folder may already have an entry in, remembered
+      // before the write so we can tell a re-add from a first add.
+      const before = config.projects.find((p) => p.dir === dir) || null;
+      // A port no entry claims can still be busy right now. addEntry cannot see
+      // that, and finding out at the first request would be a conflict page
+      // instead of an inline error next to the field.
+      if (wantPort !== null && (!before || before.port !== wantPort) && (await portListening(wantPort))) {
+        sendJson(res, 409, { ok: false, reason: `port ${wantPort} is in use right now` });
+        return true;
+      }
+      const det = body.framework ? null : detectOne(dir);
+      const { entry, updated } = await editRegistry('control:add', (reg) => addEntry(reg, {
+        host,
+        dir,
+        startCmd: String(body.startCmd || '').trim(),
+        port: wantPort === null ? undefined : wantPort,
+        framework: body.framework ? String(body.framework) : (det && det.framework) || 'node',
+        parked: Boolean(body.parked),
+      }));
+      // Re-adding a folder that moved port or name leaves the old server
+      // listening where nothing routes to it. Stop it; the next request cold
+      // starts under the entry as it now reads.
+      if (before && (before.port !== entry.port || before.host !== entry.host)) {
+        stop(before.host, 'add');
+        if (before.host !== entry.host) {
+          runtime.delete(before.host);
+          lastAccess.delete(before.host);
+        }
+      }
+      log(`add: ${entry.host} -> ${entry.dir} :${entry.port}${entry.enabled ? '' : ' (parked)'}${updated ? ' (updated)' : ''}`);
+      sendJson(res, 200, { ok: true, host: entry.host, port: entry.port, enabled: entry.enabled, updated });
+      return true;
+    }
+
+    if (pathname.startsWith('/__lazydev/remove/')) {
+      const host = hostFromPath(pathname, '/__lazydev/remove/');
+      const project = projectByHost(host);
+      if (!project) {
+        sendJson(res, 404, { ok: false, reason: 'unknown host' });
+        return true;
+      }
+      // Removing a running project stops it first: its entry is about to go,
+      // and a child nothing can route to or stop again is a leak.
+      stop(host, 'remove');
+      await editRegistry('control:remove', (reg) => removeEntry(reg, host));
+      runtime.delete(host);
+      lastAccess.delete(host);
+      connections.delete(host);
+      log(`remove: ${host} (registry entry only; ${project.dir} untouched)`);
+      sendJson(res, 200, { ok: true, host });
+      return true;
+    }
+
+    if (pathname.startsWith('/__lazydev/enable/') || pathname.startsWith('/__lazydev/disable/')) {
+      const on = pathname.startsWith('/__lazydev/enable/');
+      const host = hostFromPath(pathname, on ? '/__lazydev/enable/' : '/__lazydev/disable/');
+      if (!projectByHost(host)) {
+        sendJson(res, 404, { ok: false, reason: 'unknown host' });
+        return true;
+      }
+      // Disabling stops what is running: "disabled" has to mean nothing is
+      // listening, or the row lies about the state of the machine.
+      if (!on) stop(host, 'disable');
+      await editRegistry(`control:${on ? 'enable' : 'disable'}`, (reg) => setEnabled(reg, host, on));
+      log(`${on ? 'enable' : 'disable'}: ${host}`);
+      sendJson(res, 200, { ok: true, host, enabled: on });
+      return true;
+    }
+
+    // POST /__lazydev/set/<host> { port?, startCmd? } — the row's edit panel.
+    if (pathname.startsWith('/__lazydev/set/')) {
+      const host = hostFromPath(pathname, '/__lazydev/set/');
+      const project = projectByHost(host);
+      if (!project) {
+        sendJson(res, 404, { ok: false, reason: 'unknown host' });
+        return true;
+      }
+      const body = (await readJsonBody(req)) || {};
+      const wantsPort = body.port !== undefined && body.port !== null && body.port !== '';
+      const wantsCmd = typeof body.startCmd === 'string' && body.startCmd.trim() !== '';
+      if (!wantsPort && !wantsCmd) {
+        sendJson(res, 400, { ok: false, reason: 'nothing to change' });
+        return true;
+      }
+      if (wantsPort && Number(body.port) !== project.port) {
+        // A live server is bound to the OLD port; moving the entry under it
+        // would leave the daemon proxying to a port the registry no longer
+        // names. The fix is one word long, so the message is the fix.
+        const r = runtime.get(host);
+        if (r && (r.state === 'running' || r.state === 'starting' || r.state === 'installing')) {
+          sendJson(res, 409, { ok: false, reason: `${host} is running; stop it first` });
+          return true;
+        }
+        if (await portListening(Number(body.port))) {
+          sendJson(res, 409, { ok: false, reason: `port ${body.port} is in use right now` });
+          return true;
+        }
+      }
+      // Port first: setStartCmd expands a <port> placeholder against the
+      // entry's port, which must already be the new one.
+      const entry = await editRegistry('control:set', (reg) => {
+        let e;
+        if (wantsPort) e = setPort(reg, host, Number(body.port));
+        if (wantsCmd) e = setStartCmd(reg, host, body.startCmd);
+        return e;
+      });
+      // A start command changed under a running server applies at its next
+      // start; nothing is killed here, because the person editing the command
+      // is usually fixing a start that already failed.
+      log(`set: ${host} :${entry.port} ${entry.startCmd}`);
+      sendJson(res, 200, { ok: true, host, port: entry.port, startCmd: entry.startCmd });
+      return true;
+    }
+
+    // POST /__lazydev/restart/<host> — the row's restart button, and what the
+    // CLI's `lazydev restart` should call instead of stop-then-up (one call,
+    // one log separator).
+    if (pathname.startsWith('/__lazydev/restart/')) {
+      const host = hostFromPath(pathname, '/__lazydev/restart/');
+      const project = projectByHost(host);
+      if (!project) {
+        sendJson(res, 404, { ok: false, reason: 'unknown host' });
+        return true;
+      }
+      if (project.enabled === false) {
+        sendJson(res, 409, { ok: false, reason: 'disabled' });
+        return true;
+      }
+      stop(host, 'restart');
+      await waitForPortFree(project.port, 5000);
+      // A restart is as deliberate as the switch, so it re-arms a dependency
+      // install that ensureUp is otherwise skipping.
+      getRuntime(host).installFailed = null;
+      try {
+        await ensureUp(project);
+        sendJson(res, 200, { ok: true, host });
+      } catch (err) {
+        sendJson(res, 502, { ok: false, reason: err.code || err.message });
+      }
+      return true;
+    }
+
+    return false;
+  } catch (err) {
+    if (err instanceof RegistryError) {
+      sendRegistryError(res, err);
+      return true;
+    }
+    log(`control: ${pathname} failed: ${err.message}`);
+    sendJson(res, 500, { ok: false, reason: err.message });
+    return true;
+  }
 }
 
 async function handleControl(req, res, url) {
@@ -1323,14 +2663,63 @@ async function handleControl(req, res, url) {
   }
 
   if (method === 'GET' && pathname === '/__lazydev/status') {
-    return sendJson(res, 200, statusPayload());
+    return sendJson(res, 200, statusPayload(isControlAuthorized(req)));
+  }
+
+  // GET /__lazydev/tail — the wake page's terminal view. Host-scoped and
+  // tokenless for the same reasons as POST /__lazydev/free: the person staring
+  // at a slow start is standing on the project's origin, where the dashboard's
+  // token cannot reach; the same-origin policy keeps other sites from reading
+  // the response; and a local same-user process could already read the log
+  // file directly. Returns the live phase plus the log tail, so the page can
+  // say WHY a start is slow, not just that it is.
+  if (method === 'GET' && pathname === '/__lazydev/tail') {
+    if (!isSameOrigin(req)) return sendJson(res, 403, { ok: false, reason: 'unauthorized' });
+    const key = resolveHostKey(String(req.headers.host || ''));
+    const project = key ? projectByHost(key) : null;
+    if (!project) return sendJson(res, 404, { ok: false, reason: 'not a project host' });
+    const r = getRuntime(project.host);
+    // Default: this attempt only (the lines after the last separator), because
+    // the question the panel answers is "what did the run I am watching say".
+    // ?all=1 hands back the whole file, separators included, for the times the
+    // interesting line is in the run before this one.
+    const all = url.searchParams.get('all') === '1';
+    return sendJson(res, 200, { ok: true, state: r.state, phase: phaseLabel(r), all, tail: tailLog(project.host, all ? 400 : 60, { all }) });
+  }
+
+  // GET /__lazydev/vendor/<file> — the two xterm files the terminal panel
+  // needs, straight off disk. Ungated like the dashboard itself: these are
+  // published npm bytes, identical on every machine, and the panel they draw is
+  // useless without the token anyway (the socket checks it).
+  if ((method === 'GET' || method === 'HEAD') && pathname.startsWith(VENDOR_PATH)) {
+    return sendVendorFile(req, res, pathname);
+  }
+
+  // GET /term/<host> — the panel's "pop out" target: one terminal, its own tab.
+  // On the control plane, so it carries the same token the dashboard does.
+  if (method === 'GET' && pathname.startsWith('/term/')) {
+    let host = pathname.slice('/term/'.length);
+    try {
+      host = decodeURIComponent(host);
+    } catch {
+      /* keep the raw value; the lookup below fails it */
+    }
+    const project = host ? projectByHost(host) : null;
+    if (!project) {
+      return sendHtml(res, 404, 'lazydev — not found', `<h1>lazydev</h1><p class="muted">No project registered as <code>${esc(host)}</code>.</p>${dashboardHomeLink()}`);
+    }
+    return sendHtml(res, 200, `${project.host} — terminal`, termPageHtml(project));
   }
 
   // One guard for every mutating control action: reject any POST /__lazydev/*
   // that is not both same-origin AND carrying the capability token. GET / and
   // GET /__lazydev/status stay ungated so the CLI's read path and the dashboard
-  // load keep working; neither exposes anything sensitive.
-  if (method === 'POST' && pathname.startsWith('/__lazydev/') && !isControlAuthorized(req)) {
+  // load keep working; status answers a tokenless caller with the fields that
+  // name no secret and redacts the rest (see liveState), because that route is
+  // reachable from every project origin, not just this one. The one exemption is
+  // the exact path /__lazydev/free (its handler explains why); the token-gated
+  // /__lazydev/free/<host> form still falls under this guard.
+  if (method === 'POST' && pathname.startsWith('/__lazydev/') && pathname !== '/__lazydev/free' && !isControlAuthorized(req)) {
     return sendJson(res, 403, { ok: false, reason: 'unauthorized' });
   }
 
@@ -1351,11 +2740,46 @@ async function handleControl(req, res, url) {
     if (!project) return sendJson(res, 404, { ok: false, reason: 'unknown host' });
     if (project.enabled === false) return sendJson(res, 409, { ok: false, reason: 'disabled' });
     try {
+      // Flipping the dashboard switch is as deliberate as clicking Retry, so it
+      // re-arms a dependency install that ensureUp is otherwise skipping.
+      getRuntime(host).installFailed = null;
       await ensureUp(project);
       return sendJson(res, 200, { ok: true });
     } catch (err) {
       return sendJson(res, 502, { ok: false, reason: err.code || err.message });
     }
+  }
+
+  // POST /__lazydev/free — the conflict page's button. Host-scoped: it acts on
+  // the project whose host the request ARRIVED on, so a page served on
+  // proj.localhost can free proj's port and nobody else's. This is the one
+  // mutating action without the capability token, because the token lives only
+  // in the dashboard's origin and the person who needs this fix is standing on
+  // the project's origin, where it can never reach. Tokenless is sound here:
+  // the same-origin check pins browser callers to pages lazydev itself served
+  // on this host, a non-browser local caller could already kill the user's own
+  // processes without our help, and freePort refuses to touch any listener
+  // except a cwd-verified squatter, checked again at click time.
+  if (method === 'POST' && pathname === '/__lazydev/free') {
+    if (!isSameOrigin(req)) return sendJson(res, 403, { ok: false, reason: 'unauthorized' });
+    const key = resolveHostKey(String(req.headers.host || ''));
+    const project = key ? projectByHost(key) : null;
+    if (!project) return sendJson(res, 404, { ok: false, reason: 'not a project host' });
+    const result = await freePort(project, getRuntime(project.host));
+    return sendJson(res, result.ok ? 200 : 409, result);
+  }
+
+  // POST /__lazydev/free/<host> — the dashboard's form of the same action,
+  // token-gated by the blanket guard above. Frees the port and immediately
+  // re-arms bring-up: the dashboard user who clicked "free port" wants the
+  // project running, not merely unblocked.
+  if (method === 'POST' && pathname.startsWith('/__lazydev/free/')) {
+    const host = decodeURIComponent(pathname.slice('/__lazydev/free/'.length));
+    const project = projectByHost(host);
+    if (!project) return sendJson(res, 404, { ok: false, reason: 'unknown host' });
+    const result = await freePort(project, getRuntime(project.host));
+    if (result.ok && project.enabled !== false) ensureUp(project).catch(() => {});
+    return sendJson(res, result.ok ? 200 : 409, result);
   }
 
   // Rename a project: the dashboard's inline editor POSTs { to }. The daemon
@@ -1380,26 +2804,24 @@ async function handleControl(req, res, url) {
     // stopped and the next hit on the new URL is an ordinary cold start.
     // stop() no-ops (with reason) for external/stopped — exactly right here.
     stop(from, 'rename');
-    let reg;
-    try {
-      reg = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'));
-    } catch (err) {
-      return sendJson(res, 500, { ok: false, reason: 'could not read the registry' });
-    }
-    const entry = Array.isArray(reg.projects) ? reg.projects.find((p) => p.host === from) : null;
-    if (!entry) return sendJson(res, 500, { ok: false, reason: 'host missing from the registry file' });
-    entry.host = to;
-    try {
-      fs.writeFileSync(CONFIG_PATH, JSON.stringify(reg, null, 2) + '\n');
-    } catch (err) {
-      return sendJson(res, 500, { ok: false, reason: 'could not write the registry' });
-    }
     runtime.delete(from);
     lastAccess.delete(from);
-    loadConfig('control:rename');
+    // The checks above already rejected everything renameEntry rejects, with
+    // the status codes this endpoint promises; a throw from here is the file
+    // disagreeing with the loaded config, which is a 500, not a user error.
+    try {
+      await editRegistry('control:rename', (reg) => renameEntry(reg, from, to));
+    } catch (err) {
+      if (err instanceof RegistryError) return sendJson(res, 500, { ok: false, reason: err.message });
+      throw err;
+    }
     log(`rename: ${from} -> ${to}`);
     return sendJson(res, 200, { ok: true, host: to });
   }
+
+  // Section 7's edits: add, remove, enable, disable, set, restart, detect. Past
+  // the token guard above, like every other mutating action.
+  if (method === 'POST' && (await handleEditControl(req, res, url))) return;
 
   // GET requests to /__lazydev/* that aren't matched, or anything else.
   return sendHtml(res, 404, 'lazydev — not found', `<h1>lazydev</h1><p class="muted">No such control endpoint: <code>${esc(method)} ${esc(pathname)}</code></p>${dashboardHomeLink()}`);
@@ -1411,11 +2833,17 @@ function dashboardHomeLink() {
 
 // Badge classes live in dashboardHtml's <style>; the poll script rebuilds the
 // same markup client-side, so label/class logic changed here must change there.
-function stateBadge(state, owned) {
+// A stopped project that carries a lastError is 'failed', not 'sleeping'. The
+// dashboard used to show a dead dev server as asleep and you only found out by
+// opening the URL. Same rule as phaseLabel, so page and dashboard agree.
+function stateBadge(state, owned, lastError) {
   const known = ['running', 'starting', 'installing', 'conflict'];
-  const k = state === 'running' && !owned ? 'external' : known.includes(state) ? state : 'stopped';
+  const k = state === 'running' && !owned ? 'external'
+    : state === 'stopped' && lastError ? 'failed'
+    : known.includes(state) ? state : 'stopped';
   const label = k === 'external' ? 'running (external)' : k === 'stopped' ? 'sleeping' : k;
-  return `<span class="badge b-${k}">${label}</span>`;
+  const title = k === 'failed' && lastError && lastError.kind ? ` title="${esc(lastError.kind)}"` : '';
+  return `<span class="badge b-${k}"${title}>${label}</span>`;
 }
 
 // Framework marks: colored chips with the glyph inlined as SVG, because the
@@ -1455,6 +2883,248 @@ function fmtIdle(ms) {
   return `${h}h ${m % 60}m`;
 }
 
+// ---------------------------------------------------------------------------
+// Terminal panel: the vendored xterm files, the client that drives them, and
+// the pop-out page (spec 0.3.0 section 6)
+// ---------------------------------------------------------------------------
+
+// GET /__lazydev/vendor/<file>. xterm.js, its stylesheet, and the fit addon are
+// checked into lib/vendor/ instead of being an npm dependency or a CDN link:
+// the dashboard has to draw a terminal on a laptop with no network, and a
+// runtime dependency would put an install step between a git pull and a working
+// page. scripts/vendor.sh fetched what is in there and records the versions.
+const VENDOR_PATH = '/__lazydev/vendor/';
+const VENDOR_DIR = path.join(CONFIG_DIR, 'lib', 'vendor');
+const VENDOR_TYPES = { '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8' };
+
+function sendVendorFile(req, res, pathname) {
+  let name = pathname.slice(VENDOR_PATH.length);
+  try {
+    name = decodeURIComponent(name);
+  } catch {
+    /* keep the raw value; the shape check below fails it */
+  }
+  // One flat directory of two file types, so a legal name is a plain basename
+  // and nothing else: no slash, no dot segment, nothing that came in
+  // percent-encoded to get past the URL parser's own normalization. The
+  // dirname check below is the second lock on the same door.
+  const type = VENDOR_TYPES[path.extname(name)];
+  const shaped = /^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(name) && !name.includes('..');
+  const file = path.resolve(VENDOR_DIR, shaped ? name : '.');
+  if (!type || !shaped || path.dirname(file) !== VENDOR_DIR) {
+    // A name that is not a plain basename is somebody probing; that is worth a
+    // line. An unknown or unserved name is not: devtools asks for
+    // xterm.js.map on every open panel, and the log is a thing people read.
+    if (!shaped) log(`vendor-refused: ${pathname}`);
+    return sendJson(res, 404, { ok: false, reason: 'no such vendor file' });
+  }
+  let body;
+  let stat;
+  try {
+    stat = fs.statSync(file);
+    body = fs.readFileSync(file);
+  } catch {
+    // Missing means lib/vendor/ was never populated (a checkout that skipped
+    // scripts/vendor.sh). The panel says so on the page; here it is a 404.
+    return sendJson(res, 404, { ok: false, reason: 'no such vendor file' });
+  }
+  // Long, because these bytes only change when someone runs scripts/vendor.sh
+  // and restarts the daemon — but NOT `immutable`, because the URL carries no
+  // version, so a bump has to be able to reach a tab that cached the old one.
+  // The ETag makes that reload a 304 instead of 300 KB.
+  const etag = `W/"${stat.size.toString(16)}-${Math.floor(stat.mtimeMs).toString(16)}"`;
+  const headers = { 'content-type': type, 'cache-control': 'public, max-age=604800', etag };
+  if (String(req.headers['if-none-match'] || '') === etag) {
+    res.writeHead(304, headers);
+    return res.end();
+  }
+  headers['content-length'] = body.length;
+  res.writeHead(200, headers);
+  return res.end(req.method === 'HEAD' ? undefined : body);
+}
+
+// The browser half of the terminal, shared verbatim by the dashboard's row
+// panels and the pop-out page: they differ only in where the box lives and who
+// else is on the page. Both define TOKEN above this script, which is the value
+// the term socket wants as its subprotocol.
+function termClientScript() {
+  return `
+    // Loaded on the first panel anyone opens, never on page load: the dashboard
+    // is a page you leave open all day and most of those days nobody asks for a
+    // terminal. One promise, so ten rows opened at once load it once.
+    let vendorReady = null;
+    function loadTermVendor() {
+      if (vendorReady) return vendorReady;
+      const add = (tag, attrs) => new Promise((resolve, reject) => {
+        const el = document.createElement(tag);
+        Object.assign(el, attrs);
+        el.onload = () => resolve();
+        el.onerror = () => reject(new Error('could not load ' + (attrs.href || attrs.src)));
+        document.head.append(el);
+      });
+      // The stylesheet and xterm.js are independent; the addon needs the global
+      // xterm.js defines, so it goes after.
+      vendorReady = Promise.all([
+        add('link', { rel: 'stylesheet', href: '/__lazydev/vendor/xterm.css' }),
+        add('script', { src: '/__lazydev/vendor/xterm.js' }),
+      ]).then(() => add('script', { src: '/__lazydev/vendor/addon-fit.js' }));
+      return vendorReady;
+    }
+
+    // Dark regardless of the page theme, and that is deliberate: a dev server
+    // picks its colors for a dark background, so a terminal that followed a
+    // light page would render half of them unreadable.
+    const TERM_THEME = {
+      background: '#0d1117', foreground: '#d5dae2',
+      cursor: '#d5dae2', cursorAccent: '#0d1117', selectionBackground: '#2f4f7f',
+    };
+
+    // Draw a terminal into box and wire it to the host's term socket. Returns a
+    // handle: clear(), refit(), close().
+    function openLazydevTerm(box, host, opts) {
+      opts = opts || {};
+      const term = new Terminal({
+        rows: opts.rows || 24,
+        cols: 80,
+        fontSize: 12,
+        fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
+        cursorBlink: true,
+        scrollback: 5000,
+        theme: TERM_THEME,
+      });
+      const fit = new FitAddon.FitAddon();
+      term.loadAddon(fit);
+      term.open(box);
+      // Pin the box to the height xterm just drew, so every later fit() changes
+      // columns only. Without it the panel gains or loses a row each time the
+      // browser rounds the division the other way. The pop-out passes false:
+      // there the terminal is supposed to fill the window.
+      if (opts.lockRows !== false) box.style.height = box.clientHeight + 'px';
+      const refit = () => {
+        try { fit.fit(); } catch (err) { /* not laid out yet; the next one wins */ }
+        sendSize();
+      };
+      try { fit.fit(); } catch (err) { /* see above */ }
+      term.focus();
+
+      const proto = location.protocol === 'https:' ? 'wss://' : 'ws://';
+      // Relative to this page's own origin: in a real install that IS
+      // lazydev.localhost, and in a test it is whatever port the daemon got.
+      const ws = new WebSocket(proto + location.host + '/__lazydev/term/' + encodeURIComponent(host), [TOKEN]);
+      ws.binaryType = 'arraybuffer';
+      let live = false;
+      function sendSize() {
+        if (!live) return;
+        try { ws.send('r:' + term.rows + ',' + term.cols); } catch (err) { /* closing */ }
+      }
+      ws.onopen = () => {
+        live = true;
+        // The daemon remembers this size for the NEXT spawn too, so a restart
+        // does not drop the panel back to 24x80.
+        sendSize();
+      };
+      // Every frame is raw terminal bytes, escapes and all — that is the whole
+      // point of the pty. Binary arrives as an ArrayBuffer.
+      ws.onmessage = (ev) => {
+        term.write(typeof ev.data === 'string' ? ev.data : new Uint8Array(ev.data));
+      };
+      ws.onerror = () => { /* onclose says the same thing, once */ };
+      ws.onclose = () => {
+        live = false;
+        term.write('\\r\\n\\x1b[2m[lazydev] terminal disconnected\\x1b[0m\\r\\n');
+      };
+      // xterm hands us exactly the bytes a tty would get: arrow keys, Ctrl-C,
+      // a pasted block. They go through unread.
+      term.onData((d) => {
+        if (!live) return;
+        try { ws.send('i:' + d); } catch (err) { /* closing */ }
+      });
+      window.addEventListener('resize', refit);
+      return {
+        term,
+        refit,
+        clear() { term.clear(); },
+        close() {
+          window.removeEventListener('resize', refit);
+          try { ws.close(); } catch (err) { /* already gone */ }
+          term.dispose();
+        },
+      };
+    }
+  `;
+}
+
+// The dark chrome around a terminal, shared by the panel and the pop-out.
+function termPanelCss() {
+  return `
+    /* The panel is dark in both page themes; see TERM_THEME for why. */
+    .termrow td { padding: 0 0.7rem 0.8rem; }
+    .termpanel { border: 1px solid #ffffff24; border-radius: 10px; overflow: hidden;
+                 background: #0d1117; }
+    .termhead { display: flex; align-items: center; gap: 0.5rem; padding: 0.35rem 0.5rem 0.35rem 0.7rem;
+                background: #161b22; color: #d5dae2; font-size: 12px; }
+    .termtitle { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; opacity: .85; }
+    .termbtns { margin-left: auto; white-space: nowrap; }
+    .termhead .rowbtn { color: #d5dae2; border-color: #ffffff33; margin-left: 6px; }
+    .termhead .rowbtn:hover { background: #ffffff14; }
+    /* border-box so the height the panel pins on open (see openLazydevTerm) is
+       the height fit() reads back: with content-box the padding would buy an
+       extra row on every refit. */
+    .termbox { padding: 6px 4px 6px 8px; box-sizing: border-box; }
+    .termbox .xterm { height: 100%; }
+    .termfail { color: #f0a4a4; font-size: 12px; padding: 0.6rem 0.8rem; }
+  `;
+}
+
+// GET /term/<host> — the pop-out. Same terminal, its own tab, nothing else on
+// the page, which is what the panel's "pop out" button opens.
+function termPageHtml(project) {
+  const token = ensureControlToken();
+  const host = project.host;
+  return `<style>
+    body { max-width: none; padding: 0; background: #0d1117; }
+    .popwrap { display: flex; flex-direction: column; height: 100vh; }
+    .popwrap .termpanel { flex: 1; display: flex; flex-direction: column;
+                          border: 0; border-radius: 0; }
+    .popwrap .termbox { flex: 1; min-height: 0; }
+    ${termPanelCss()}
+  </style>
+  <div class="popwrap"><div class="termpanel">
+    <div class="termhead">
+      <span class="termtitle">${esc(host)}</span>
+      <span class="termbtns">
+        <button class="rowbtn" onclick="popAction('restart')">restart</button>
+        <button class="rowbtn" onclick="popAction('stop')">stop</button>
+        <button class="rowbtn" onclick="panel && panel.clear()">clear</button>
+        <a class="rowbtn" href="/" style="text-decoration:none">dashboard</a>
+      </span>
+    </div>
+    <div class="termbox" id="termbox"></div>
+  </div></div>
+  <script>
+    const TOKEN = ${JSON.stringify(token)};
+    const HOST = ${JSON.stringify(host)};
+    ${termClientScript()}
+    let panel = null;
+    const box = document.getElementById('termbox');
+    loadTermVendor().then(() => {
+      panel = openLazydevTerm(box, HOST, { lockRows: false });
+      panel.refit();
+    }).catch((err) => {
+      box.innerHTML = '<p class="termfail">' + err.message + '. Run scripts/vendor.sh in the lazydev checkout.</p>';
+    });
+    // restart and stop are the same token-gated endpoints the dashboard calls.
+    async function popAction(verb) {
+      try {
+        await fetch('/__lazydev/' + verb + '/' + encodeURIComponent(HOST), {
+          method: 'POST',
+          headers: { 'X-Lazydev-Token': TOKEN },
+        });
+      } catch (err) { /* the terminal shows what happened next */ }
+    }
+  </script>`;
+}
+
 function dashboardHtml() {
   // The dashboard is served same-origin, so injecting the control token into its
   // inline script is safe: the browser's same-origin policy stops other sites
@@ -1463,36 +3133,81 @@ function dashboardHtml() {
   const token = ensureControlToken();
   const rows = config.projects
     .map((p) => {
-      const ls = liveState(p.host, p);
+      // Authorized rows: this page is only ever served on the control host, it
+      // already carries the token in its own script, and the same-origin policy
+      // is what keeps another site from reading it — the same reasoning the
+      // failure page uses before it prints a raw error.
+      const ls = liveState(p.host, p, true);
       const on = ls.state === 'running' || ls.state === 'starting' || ls.state === 'installing';
       // The switch is inert where flipping it couldn't work: a disabled project
       // (enable it in the registry), a port conflict, and an external server
       // lazydev didn't start and therefore can't stop.
       const locked = !ls.enabled || ls.state === 'conflict' || (ls.state === 'running' && !ls.owned);
       const lockReason = !ls.enabled ? 'disabled in the registry'
-        : ls.state === 'conflict' ? 'resolve the port conflict first'
+        : ls.state === 'conflict' ? 'free the port first'
         : ls.state === 'running' && !ls.owned ? 'started outside lazydev' : '';
-      // On conflict, hovering the state cell explains which foreign cwd holds it.
+      // On conflict, hovering the state cell explains which foreign cwd holds it,
+      // and the cell offers the fix: free the port, then start the project.
+      // Mirrored client-side in stateCellHtml — change both together.
       const stateTitle = ls.state === 'conflict' && ls.conflictDir
         ? ` title="port held by ${esc(ls.conflictDir)}"`
         : '';
+      const freeBtn = ls.state === 'conflict'
+        ? ` <button class="freebtn" onclick="freeHost(this)">free port</button>`
+        : '';
+      // Failed row: the badge carries the kind as its tooltip, and the first
+      // error line of this attempt's log sits next to it so the table answers
+      // "what broke" without a click. Clicking it opens the row's terminal
+      // panel, where the rest of the output is.
+      // Mirrored client-side in stateCellHtml. Change both together.
+      const errLine = ls.lastError && ls.lastError.errorLine
+        ? ` <button class="errline" onclick="openTerm(this)" title="open the terminal">${esc(ls.lastError.errorLine)}</button>`
+        : '';
+      // target=_blank: the dashboard is the control room; opening a project
+      // must not navigate away from it, and staying here is what lets the row
+      // show the wake progressing. linkClicked flips the row optimistically.
+      // Restart sits beside the switch, and only while there is something to
+      // restart. The enable/disable button replaces the old "(disabled)" text
+      // next to the link: the state it reports is now the state you change.
+      const restartBtn = `<button class="rowbtn restart" title="stop it and start it again"${ls.state === 'running' ? '' : ' hidden'} onclick="restartHost(this)">restart</button>`;
+      // The terminal button is on every row, running or not: opening a panel IS
+      // a wake request (the socket calls ensureUp), which is the point for a
+      // dev server that will not finish starting until someone answers it.
+      const termBtn = `<button class="rowbtn term" title="open this project's terminal" onclick="openTerm(this)">terminal</button>`;
+      const enableBtn = `<button class="rowbtn" onclick="toggleEnabled(this)">${ls.enabled ? 'disable' : 'enable'}</button>`;
+      const removeBtn = `<button class="rowbtn danger" onclick="removeHost(this)">remove</button>`;
+      // A disabled project is greyed cell by cell rather than by a class on the
+      // <tr>: the row tag carries data-host and nothing else, because that is
+      // the handle everything else in this file (and the tests) grabs a row by.
+      // Its registry values ride on the first cell, where the edit panel reads
+      // them without a second request.
+      const dim = ls.enabled ? '' : ' off';
       return `<tr data-host="${esc(p.host)}">
-        <td class="c-proj"><a href="${esc(frontUrl(p.host))}/">${esc(frontUrl(p.host))}</a>${ls.enabled ? '' : ' <span class="muted">(disabled)</span>'} <button class="edit" title="rename" aria-label="rename ${esc(p.host)}" onclick="editHost(this)">&#9998;</button></td>
-        <td class="c-fw">${frameworkIcon(ls.framework)} ${esc(ls.framework)}</td>
-        <td class="c-state"${stateTitle}>${stateBadge(ls.state, ls.owned)}</td>
-        <td class="c-idle">${ls.state === 'running' ? fmtIdle(ls.idleForMs) : '—'}</td>
-        <td class="c-conn">${ls.connCount}</td>
-        <td><label class="switch"${lockReason ? ` title="${lockReason}"` : ''}><input type="checkbox" role="switch" aria-label="run ${esc(p.host)}"${on ? ' checked' : ''}${locked ? ' disabled' : ''} onchange="toggleHost(this)"><span class="track"></span></label></td>
+        <td class="c-proj${dim}" data-port="${esc(String(ls.port))}" data-cmd="${esc(ls.startCmd)}"><a href="${esc(frontUrl(p.host))}/" target="_blank" rel="noopener" onclick="linkClicked(this)">${esc(frontUrl(p.host))}</a> <button class="edit" title="edit name, port, start command" aria-label="edit ${esc(p.host)}" onclick="editHost(this)">&#9998;</button></td>
+        <td class="c-fw${dim}">${frameworkIcon(ls.framework)} ${esc(ls.framework)}</td>
+        <td class="c-state${dim}"${stateTitle}>${stateBadge(ls.state, ls.owned, ls.lastError)}${freeBtn}${errLine}</td>
+        <td class="c-idle${dim}">${ls.state === 'running' ? fmtIdle(ls.idleForMs) : '—'}</td>
+        <td class="c-conn${dim}">${ls.connCount}</td>
+        <td class="c-act${dim}">${termBtn}${restartBtn}<label class="switch"${lockReason ? ` title="${lockReason}"` : ''}><input type="checkbox" role="switch" aria-label="run ${esc(p.host)}"${on ? ' checked' : ''}${locked ? ' disabled' : ''} onchange="toggleHost(this)"><span class="track"></span></label>${enableBtn}${removeBtn}</td>
       </tr>`;
     })
     .join('');
 
-  return `<pre class="logo" role="img" aria-label="lazydev">${esc(LOGO.join('\n'))}</pre>
-  <p class="muted">On-demand local dev proxy · uptime <span id="uptime">${fmtIdle(Date.now() - STARTED_AT)}</span> · idle sleep after ${Math.round(config.idleTimeoutMs / 60000)}m</p>
+  // The ASCII LOGO stays in lib/ui.mjs for the terminal, where it is drawn with
+  // a fixed cell grid. A browser is not that: every mac font stack smeared it
+  // into a grey block. The word itself, set in the monospace stack, plus the
+  // sleeping z's, says the same thing and survives a font substitution.
+  return `<h1 class="logo">lazydev<span class="zzz" aria-hidden="true">z<b>z</b><i>z</i></span></h1>
+  <p class="muted">On-demand local dev proxy · uptime <span id="uptime">${fmtIdle(Date.now() - STARTED_AT)}</span> · idle sleep after ${fmtIdle(config.idleTimeoutMs)}</p>
   <style>
-    .logo { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px;
-            line-height: 1.25; color: #0891b2; background: none; padding: 0;
-            margin: 0 0 0.35rem; overflow-x: auto; }
+    .logo { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 28px;
+            font-weight: 600; letter-spacing: -0.02em; color: #0891b2;
+            margin: 0 0 0.35rem; }
+    /* The z's drift up and grow, the way a comic draws sleep. */
+    .zzz { font-size: 11px; opacity: .7; margin-left: 4px; }
+    .zzz b, .zzz i { font-weight: inherit; font-style: normal; }
+    .zzz b { font-size: 1.3em; vertical-align: 0.35em; }
+    .zzz i { font-size: 1.7em; vertical-align: 0.75em; }
     table { border-collapse: collapse; width: 100%; margin-top: 1rem; }
     th, td { text-align: left; padding: 0.5rem 0.7rem; border-bottom: 1px solid #8884; }
     th { font-size: 12px; text-transform: uppercase; letter-spacing: .04em; opacity: .6; }
@@ -1500,6 +3215,12 @@ function dashboardHtml() {
     .b-running { background: #16a34a; } .b-external { background: #0891b2; }
     .b-starting { background: #d97706; } .b-installing { background: #7c3aed; }
     .b-conflict { background: #dc2626; } .b-stopped { background: #64748b; }
+    .b-failed { background: #dc2626; }
+    .errline { font: inherit; font-size: 12px; margin-left: 6px; padding: 0; border: 0;
+               background: none; color: inherit; opacity: .7; cursor: pointer;
+               max-width: 34ch; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+               vertical-align: bottom; text-align: left; }
+    .errline:hover { opacity: 1; text-decoration: underline; }
     .c-fw { white-space: nowrap; }
     .fwicon { vertical-align: -3px; margin-right: 2px; }
     .switch { position: relative; display: inline-block; width: 40px; height: 22px; vertical-align: middle; }
@@ -1515,13 +3236,70 @@ function dashboardHtml() {
     .switch input:disabled + .track { opacity: .35; }
     .switch input:focus-visible + .track { outline: 2px solid #2563eb; outline-offset: 2px; }
     @media (prefers-reduced-motion: reduce) { .switch .track, .switch .track::after { transition: none; } }
+    .freebtn { font: inherit; font-size: 12px; margin-left: 6px; padding: 1px 9px;
+               border: 1px solid #8886; border-radius: 999px; background: none;
+               color: inherit; cursor: pointer; white-space: nowrap; }
+    .freebtn:hover { background: #8881; }
+    .freebtn:disabled { opacity: .5; cursor: default; }
     .edit { border: none; background: none; cursor: pointer; opacity: 0; font: inherit; padding: 0 4px; color: inherit; }
     tr:hover .edit, .edit:focus-visible { opacity: .55; }
     .edit:hover { opacity: 1; }
     .rename { font: inherit; width: 12ch; padding: 1px 6px; border: 1px solid #8886;
               border-radius: 6px; background: transparent; color: inherit; }
     .rename.bad { border-color: #dc2626; outline: none; }
+    .rowbtn { font: inherit; font-size: 12px; margin-left: 8px; padding: 1px 9px;
+              border: 1px solid #8886; border-radius: 999px; background: none;
+              color: inherit; cursor: pointer; white-space: nowrap; }
+    .rowbtn:hover { background: #8881; }
+    .rowbtn:disabled { opacity: .5; cursor: default; }
+    .rowbtn.danger:hover { border-color: #dc2626; color: #dc2626; background: none; }
+    .c-act { white-space: nowrap; text-align: right; }
+    /* A disabled project is registered and parked: still listed, still
+       editable, but nothing about it is going to run, so the switch that
+       would lie about that is not drawn at all. */
+    td.off { opacity: .55; }
+    td.off .switch { display: none; }
+    td.c-idle.off, td.c-conn.off { visibility: hidden; }
+    .editrow td { padding-top: 0; }
+    .editpanel { display: flex; flex-wrap: wrap; gap: 0.6rem 1.1rem; align-items: center;
+                 padding: 0.1rem 0 0.45rem; font-size: 13px; }
+    .editpanel label { display: inline-flex; align-items: center; gap: 0.35rem; opacity: .75; }
+    .editpanel input { font: inherit; padding: 2px 6px; border: 1px solid #8886;
+                       border-radius: 6px; background: transparent; color: inherit; }
+    .editpanel input.bad { border-color: #dc2626; outline: none; }
+    .editpanel input:disabled { opacity: .5; }
+    .f-name { width: 12ch; } .f-port { width: 8ch; } .f-cmd { width: 34ch; }
+    .ederr { flex-basis: 100%; margin: 0; font-size: 12px; opacity: .6; }
+    .ederr.bad { opacity: 1; color: #dc2626; }
+    .addbar { margin-top: 1.2rem; }
+    .addbar .rowbtn { margin-left: 0; }
+    .addform { margin-top: 0.8rem; padding: 0.9rem 1rem; border: 1px solid #8884;
+               border-radius: 10px; display: flex; flex-wrap: wrap; gap: 0.7rem 1.1rem;
+               align-items: center; font-size: 13px; }
+    .addform label { display: inline-flex; align-items: center; gap: 0.35rem; opacity: .75; }
+    .addform input[type=text], .addform input[type=number] {
+      font: inherit; padding: 3px 7px; border: 1px solid #8886; border-radius: 6px;
+      background: transparent; color: inherit; }
+    .addform input.bad { border-color: #dc2626; outline: none; }
+    #a-dir { width: 26ch; } #a-name { width: 12ch; } #a-cmd { width: 30ch; } #a-port { width: 8ch; }
+    .addactions { margin-left: auto; }
+    .addactions button { font: inherit; font-size: 13px; padding: 3px 12px; border-radius: 8px;
+                         border: 1px solid #8886; background: none; color: inherit; cursor: pointer; }
+    .addactions button[type=submit] { border-color: #2563eb; background: #2563eb; color: #fff; }
+    .adderr { flex-basis: 100%; margin: 0; font-size: 12px; opacity: .6; }
+    .adderr.bad { opacity: 1; color: #dc2626; }
+    ${termPanelCss()}
   </style>
+  <div class="addbar"><button class="rowbtn" id="addtoggle" onclick="toggleAdd()">add project</button></div>
+  <form class="addform" id="addform" hidden onsubmit="return submitAdd(event)">
+    <label>folder <input type="text" id="a-dir" placeholder="~/code/app" autocomplete="off" spellcheck="false"></label>
+    <label>name <input type="text" id="a-name" autocomplete="off" spellcheck="false"><span class="muted">.localhost</span></label>
+    <label>start command <input type="text" id="a-cmd" autocomplete="off" spellcheck="false"></label>
+    <label>port <input type="number" id="a-port" autocomplete="off"></label>
+    <label>parked <input type="checkbox" id="a-parked"></label>
+    <span class="addactions"><button type="submit">add</button> <button type="button" onclick="toggleAdd()">cancel</button></span>
+    <p class="adderr" id="a-err">The folder is read, never changed. Tab out of it to fill in the rest.</p>
+  </form>
   <table>
     <thead><tr><th>Project</th><th>Framework</th><th>State</th><th>Idle</th><th>Conn</th><th></th></tr></thead>
     <tbody>${rows || '<tr><td colspan="6" class="muted">No projects registered.</td></tr>'}</tbody>
@@ -1534,11 +3312,145 @@ function dashboardHtml() {
     const pending = new Map();
 
     // Mirrors the server's stateBadge — change both together.
-    function badgeHtml(state, owned) {
+    function badgeHtml(state, owned, lastError) {
       const known = ['running', 'starting', 'installing', 'conflict'];
-      const k = state === 'running' && !owned ? 'external' : known.includes(state) ? state : 'stopped';
+      const k = state === 'running' && !owned ? 'external'
+        : state === 'stopped' && lastError ? 'failed'
+        : known.includes(state) ? state : 'stopped';
       const label = k === 'external' ? 'running (external)' : k === 'stopped' ? 'sleeping' : k;
-      return '<span class="badge b-' + k + '">' + label + '</span>';
+      const title = k === 'failed' && lastError && lastError.kind ? ' title="' + escAttr(lastError.kind) + '"' : '';
+      return '<span class="badge b-' + k + '"' + title + '>' + label + '</span>';
+    }
+
+    // Mirrors the server's state cell (badge + the free-port button on
+    // conflict + the failed row's first error line). Change both together.
+    function stateCellHtml(state, owned, lastError) {
+      let h = badgeHtml(state, owned, lastError);
+      if (state === 'conflict') h += ' <button class="freebtn" onclick="freeHost(this)">free port</button>';
+      if (lastError && lastError.errorLine) {
+        h += ' <button class="errline" onclick="openTerm(this)" title="open the terminal">' + escAttr(lastError.errorLine) + '</button>';
+      }
+      return h;
+    }
+
+    function escAttr(s) {
+      return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+    }
+
+    ${termClientScript()}
+
+    // --- terminal panels -----------------------------------------------------
+
+    // host -> the handle openLazydevTerm returned. One per row, so a second
+    // click on the same row closes and disposes instead of stacking a second
+    // terminal on the same socket. Several different rows can be open at once.
+    const panels = new Map();
+
+    // Both click targets land here: the row's terminal button and, on a failed
+    // row, the error line next to the badge.
+    function openTerm(el) {
+      const row = el.closest('tr');
+      const host = row.dataset.host;
+      if (panels.has(host) || termRowFor(host)) { closeTerm(host); return; }
+      const tr = document.createElement('tr');
+      tr.className = 'termrow';
+      tr.dataset.termHost = host;
+      const td = document.createElement('td');
+      td.colSpan = 6;
+      td.innerHTML =
+        '<div class="termpanel">' +
+          '<div class="termhead">' +
+            '<span class="termtitle">' + escAttr(host) + '</span>' +
+            '<span class="termbtns">' +
+              '<button class="rowbtn" onclick="termAction(this, \\'restart\\')">restart</button>' +
+              '<button class="rowbtn" onclick="termAction(this, \\'stop\\')">stop</button>' +
+              '<button class="rowbtn" onclick="termClear(this)">clear</button>' +
+              '<button class="rowbtn" onclick="termPop(this)">pop out</button>' +
+              '<button class="rowbtn" onclick="termClose(this)">close</button>' +
+            '</span>' +
+          '</div>' +
+          '<div class="termbox"></div>' +
+        '</div>';
+      tr.append(td);
+      // Under the edit panel when that one is open, so a row's two panels stay
+      // in the order they were asked for.
+      const edit = row.nextElementSibling;
+      (edit && edit.classList.contains('editrow') ? edit : row).after(tr);
+      loadTermVendor().then(() => {
+        // The row may have been closed again while 300 KB loaded.
+        if (!tr.isConnected) return;
+        panels.set(host, openLazydevTerm(td.querySelector('.termbox'), host, { rows: 24 }));
+      }).catch((err) => {
+        td.querySelector('.termbox').innerHTML =
+          '<p class="termfail">' + escAttr(err.message) + '. Run scripts/vendor.sh in the lazydev checkout.</p>';
+      });
+    }
+
+    function termRowFor(host) {
+      return document.querySelector('tr.termrow[data-term-host="' + CSS.escape(host) + '"]');
+    }
+
+    function hostOfPanel(btn) {
+      return btn.closest('tr.termrow').dataset.termHost;
+    }
+
+    function closeTerm(host) {
+      const panel = panels.get(host);
+      if (panel) { panel.close(); panels.delete(host); }
+      const tr = termRowFor(host);
+      if (tr) tr.remove();
+    }
+
+    function termClose(btn) { closeTerm(hostOfPanel(btn)); }
+    function termClear(btn) {
+      const panel = panels.get(hostOfPanel(btn));
+      if (panel) panel.clear();
+    }
+
+    // Pop out to this page's own origin: in an install that is
+    // http://lazydev.localhost/term/<host>, and in a test it is whatever port
+    // the daemon got. Closing the panel behind it keeps one terminal per host.
+    function termPop(btn) {
+      const host = hostOfPanel(btn);
+      closeTerm(host);
+      window.open('/term/' + encodeURIComponent(host), '_blank', 'noopener');
+    }
+
+    // restart and stop from the panel header. The daemon echoes its own
+    // separator line into the terminal, so nothing is written here: what the
+    // panel shows is what actually happened.
+    async function termAction(btn, verb) {
+      const host = hostOfPanel(btn);
+      btn.disabled = true;
+      if (verb === 'restart') pending.set(host, { on: true, at: Date.now() });
+      const j = await post('/__lazydev/' + verb + '/' + encodeURIComponent(host));
+      btn.disabled = false;
+      if (!j.ok) btn.title = j.reason || (verb + ' failed');
+      schedulePoll(300);
+    }
+
+    // The conflict fix: free the port, and the endpoint re-arms bring-up, so
+    // one click takes the row from conflict to starting to running.
+    async function freeHost(btn) {
+      const row = btn.closest('tr');
+      const host = row.dataset.host;
+      btn.disabled = true;
+      btn.textContent = 'freeing…';
+      try {
+        const res = await fetch('/__lazydev/free/' + encodeURIComponent(host), {
+          method: 'POST',
+          headers: { 'X-Lazydev-Token': TOKEN },
+        });
+        const j = await res.json();
+        if (j.ok) {
+          pending.set(host, { on: true, at: Date.now() });
+          row.querySelector('.c-state').innerHTML = stateCellHtml('starting', true);
+          return;
+        }
+        btn.textContent = j.reason || 'failed';
+      } catch (err) {
+        btn.textContent = 'daemon unreachable';
+      }
     }
 
     function fmtIdle(ms) {
@@ -1559,73 +3471,298 @@ function dashboardHtml() {
       // The switch itself already flipped (native checkbox); reflect it in the
       // badge immediately and let the poll settle the truth.
       row.querySelector('.c-state').innerHTML = badgeHtml(on ? 'starting' : 'stopped', true);
+      schedulePoll(400);
       fetch('/__lazydev/' + (on ? 'up/' : 'stop/') + encodeURIComponent(host), {
         method: 'POST',
         headers: { 'X-Lazydev-Token': TOKEN },
       }).catch(() => {});
     }
 
-    function editHost(btn) {
-      const td = btn.closest('td');
-      const host = btn.closest('tr').dataset.host;
-      if (td.querySelector('.rename')) return;
-      const saved = td.innerHTML;
-      td.innerHTML = '';
-      const input = document.createElement('input');
-      input.className = 'rename';
-      input.value = host;
-      input.setAttribute('aria-label', 'new name');
-      const suffix = document.createElement('span');
-      suffix.className = 'muted';
-      suffix.textContent = '.localhost';
-      td.append(input, suffix);
-      input.focus();
-      input.select();
-      const bail = () => { td.innerHTML = saved; };
-      input.onblur = () => setTimeout(() => { if (td.querySelector('.rename') === input) bail(); }, 150);
-      input.onkeydown = async (e) => {
-        if (e.key === 'Escape') return bail();
-        if (e.key !== 'Enter') { input.classList.remove('bad'); return; }
-        const to = input.value.trim();
-        if (to === host) return bail();
-        if (!/^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$/.test(to) || to === 'lazydev') {
-          input.classList.add('bad');
-          input.title = 'lowercase letters, digits, and hyphens';
-          return;
-        }
+    // Clicking a sleeping project's link IS a wake request — show it starting
+    // now, not a poll from now. The disabled switch screens out rows a click
+    // cannot wake (registry-disabled, conflict, external), and only a
+    // 'sleeping' badge flips, so a running project's row is left alone.
+    function linkClicked(a) {
+      const row = a.closest('tr');
+      const sw = row.querySelector('.switch input');
+      if (sw && sw.disabled) return;
+      const badge = row.querySelector('.badge');
+      if (!badge || badge.textContent !== 'sleeping') return;
+      pending.set(row.dataset.host, { on: true, at: Date.now() });
+      row.querySelector('.c-state').innerHTML = stateCellHtml('starting', true);
+      if (sw) sw.checked = true;
+      schedulePoll(400); // catch the real phase (installing vs starting) fast
+    }
+
+    // Every mutating call carries the capability token and never throws: a
+    // daemon that went away is just another inline message.
+    async function post(pathname, body) {
+      const headers = { 'X-Lazydev-Token': TOKEN };
+      if (body !== undefined) headers['content-type'] = 'application/json';
+      try {
+        const res = await fetch(pathname, {
+          method: 'POST',
+          headers,
+          body: body === undefined ? undefined : JSON.stringify(body),
+        });
         try {
-          const res = await fetch('/__lazydev/rename/' + encodeURIComponent(host), {
-            method: 'POST',
-            headers: { 'X-Lazydev-Token': TOKEN, 'content-type': 'application/json' },
-            body: JSON.stringify({ to }),
-          });
-          const j = await res.json();
-          if (j.ok) { location.reload(); return; }
-          input.classList.add('bad');
-          input.title = j.reason || 'rename failed';
+          return await res.json();
         } catch (err) {
-          input.classList.add('bad');
-          input.title = 'daemon unreachable';
+          return { ok: res.ok, reason: 'the daemon answered ' + res.status };
         }
+      } catch (err) {
+        return { ok: false, reason: 'daemon unreachable' };
+      }
+    }
+
+    // The row's registry values (port, start command) ride on its first cell;
+    // the <tr> carries data-host and nothing else. See the server's comment.
+    function rowData(row) {
+      return row.querySelector('.c-proj').dataset;
+    }
+
+    // Is this row's dev server up or coming up? The badge is the truth the
+    // page already shows, so read it instead of keeping a second copy.
+    function rowBusy(row) {
+      const badge = row.querySelector('.badge');
+      const label = badge ? badge.textContent : '';
+      return label === 'running' || label === 'running (external)' || label === 'starting' || label === 'installing';
+    }
+
+    // Stop and start again in one call, so the log gets one separator and the
+    // daemon owns the wait for the old port to go quiet.
+    async function restartHost(btn) {
+      const row = btn.closest('tr');
+      const host = row.dataset.host;
+      btn.disabled = true;
+      btn.textContent = 'restarting…';
+      pending.set(host, { on: true, at: Date.now() });
+      row.querySelector('.c-state').innerHTML = stateCellHtml('starting', true);
+      schedulePoll(400);
+      const j = await post('/__lazydev/restart/' + encodeURIComponent(host));
+      btn.disabled = false;
+      btn.textContent = 'restart';
+      if (!j.ok) btn.title = j.reason || 'restart failed';
+      schedulePoll(200);
+    }
+
+    // enable / disable. Both change the shape of the row (the switch appears or
+    // goes, the greying flips), so the answer is a reload rather than six lines
+    // of DOM surgery that would have to mirror the server's markup.
+    async function toggleEnabled(btn) {
+      const row = btn.closest('tr');
+      const host = row.dataset.host;
+      const enable = row.querySelector('.c-proj').classList.contains('off');
+      btn.disabled = true;
+      const j = await post('/__lazydev/' + (enable ? 'enable/' : 'disable/') + encodeURIComponent(host));
+      if (j.ok) { location.reload(); return; }
+      btn.disabled = false;
+      btn.title = j.reason || 'failed';
+    }
+
+    // The confirm names the host and says what is NOT deleted, because that is
+    // the question anyone hesitates over: the folder stays exactly where it is.
+    async function removeHost(btn) {
+      const row = btn.closest('tr');
+      const host = row.dataset.host;
+      if (!confirm('Remove ' + host + ' from lazydev?\\n\\nThis deletes the registry entry only. The project folder on disk is never touched, and you can add it back any time.')) return;
+      btn.disabled = true;
+      const j = await post('/__lazydev/remove/' + encodeURIComponent(host));
+      if (j.ok) { location.reload(); return; }
+      btn.disabled = false;
+      btn.title = j.reason || 'failed';
+    }
+
+    // The pencil opens one panel under the row holding everything the registry
+    // has for it. Enter saves the field you are in, Esc closes — the two keys
+    // rename has always used. Clicking the pencil again closes it, so nothing
+    // here hangs off blur: tabbing between three fields would fight it.
+    function editHost(btn) {
+      const row = btn.closest('tr');
+      const open = row.nextElementSibling;
+      if (open && open.classList.contains('editrow')) { open.remove(); return; }
+      const host = row.dataset.host;
+      const busy = rowBusy(row);
+      const tr = document.createElement('tr');
+      tr.className = 'editrow';
+      const td = document.createElement('td');
+      td.colSpan = 6;
+      td.innerHTML =
+        '<div class="editpanel">' +
+          '<label>name <input class="f-name" value="' + escAttr(host) + '" aria-label="new name" spellcheck="false"><span class="muted">.localhost</span></label>' +
+          '<label>port <input class="f-port" type="number" value="' + escAttr(rowData(row).port) + '" aria-label="port"' + (busy ? ' disabled' : '') + '></label>' +
+          '<label>start command <input class="f-cmd" value="' + escAttr(rowData(row).cmd) + '" aria-label="start command" spellcheck="false"></label>' +
+          '<p class="ederr"></p>' +
+        '</div>';
+      tr.append(td);
+      row.after(tr);
+
+      const hint = busy
+        ? 'Enter saves, Esc cancels. The port cannot move while it runs: stop it first.'
+        : 'Enter saves, Esc cancels.';
+      const note = td.querySelector('.ederr');
+      note.textContent = hint;
+      const close = () => { tr.remove(); row.querySelector('.edit').focus(); };
+      const fail = (input, msg) => {
+        input.classList.add('bad');
+        note.classList.add('bad');
+        note.textContent = msg;
       };
+
+      const saveName = async (input) => {
+        const to = input.value.trim();
+        if (to === host) return close();
+        if (!/^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$/.test(to) || to === 'lazydev') {
+          return fail(input, 'lowercase letters, digits, and hyphens');
+        }
+        const j = await post('/__lazydev/rename/' + encodeURIComponent(host), { to });
+        if (j.ok) { location.reload(); return; }
+        fail(input, j.reason || 'rename failed');
+      };
+      const savePort = async (input) => {
+        const port = Number(input.value);
+        if (!Number.isInteger(port) || port < 1 || port > 65535) return fail(input, 'port must be 1-65535');
+        if (port === Number(rowData(row).port)) return close();
+        const j = await post('/__lazydev/set/' + encodeURIComponent(host), { port });
+        if (j.ok) { location.reload(); return; }
+        fail(input, j.reason || 'could not set the port');
+      };
+      const saveCmd = async (input) => {
+        const startCmd = input.value.trim();
+        if (!startCmd) return fail(input, 'a start command is required');
+        if (startCmd === rowData(row).cmd) return close();
+        const j = await post('/__lazydev/set/' + encodeURIComponent(host), { startCmd });
+        if (j.ok) { location.reload(); return; }
+        fail(input, j.reason || 'could not set the start command');
+      };
+
+      const wire = (sel, save) => {
+        const input = td.querySelector(sel);
+        input.onkeydown = (e) => {
+          if (e.key === 'Escape') return close();
+          if (e.key !== 'Enter') {
+            input.classList.remove('bad');
+            note.classList.remove('bad');
+            note.textContent = hint;
+            return;
+          }
+          e.preventDefault();
+          save(input);
+        };
+        return input;
+      };
+      wire('.f-port', savePort);
+      wire('.f-cmd', saveCmd);
+      const name = wire('.f-name', saveName);
+      name.focus();
+      name.select();
+    }
+
+    // --- add project ---------------------------------------------------------
+
+    const addForm = document.getElementById('addform');
+    const addErr = document.getElementById('a-err');
+    const ADD_HINT = addErr.textContent;
+    // Fields the user typed into: a later detect must not overwrite them.
+    const typed = new Set();
+    for (const id of ['a-name', 'a-cmd', 'a-port']) {
+      document.getElementById(id).addEventListener('input', (e) => typed.add(e.target.id));
+    }
+
+    function toggleAdd() {
+      addForm.hidden = !addForm.hidden;
+      document.getElementById('addtoggle').textContent = addForm.hidden ? 'add project' : 'close';
+      if (!addForm.hidden) document.getElementById('a-dir').focus();
+    }
+
+    function addSay(msg, bad) {
+      addErr.textContent = msg;
+      addErr.classList.toggle('bad', !!bad);
+    }
+
+    // Leaving the folder field (tab, or Enter) asks the daemon what that folder
+    // proves, and fills in every field the user has not touched. The same
+    // detectors "lazydev add" runs, so the form and the CLI agree about what a
+    // folder is before anything is written.
+    async function detectDir() {
+      const dirEl = document.getElementById('a-dir');
+      const dir = dirEl.value.trim();
+      if (!dir) return;
+      const j = await post('/__lazydev/detect', { dir });
+      if (!j.ok) {
+        dirEl.classList.add('bad');
+        addSay(j.reason || 'could not read that folder', true);
+        return;
+      }
+      dirEl.classList.remove('bad');
+      const fill = (id, value) => {
+        if (typed.has(id) || value === null || value === undefined || value === '') return;
+        document.getElementById(id).value = value;
+      };
+      fill('a-name', j.name);
+      fill('a-port', j.port);
+      fill('a-cmd', j.startCmd);
+      if (j.startCmd) addSay('detected ' + j.framework + '; change anything before you add it.');
+      else addSay('nothing provable there (looked for ' + (j.evidence || []).map((e) => e[0]).join(', ') + '); type a start command.', true);
+    }
+
+    document.getElementById('a-dir').addEventListener('change', detectDir);
+    document.getElementById('a-dir').addEventListener('keydown', (e) => {
+      // Enter in the folder field means "look at this folder", not "submit".
+      if (e.key !== 'Enter') return;
+      e.preventDefault();
+      detectDir();
+    });
+
+    async function submitAdd(e) {
+      e.preventDefault();
+      const btn = addForm.querySelector('button[type=submit]');
+      btn.disabled = true;
+      addSay('adding…');
+      const j = await post('/__lazydev/add', {
+        dir: document.getElementById('a-dir').value.trim(),
+        name: document.getElementById('a-name').value.trim(),
+        startCmd: document.getElementById('a-cmd').value.trim(),
+        port: document.getElementById('a-port').value.trim(),
+        parked: document.getElementById('a-parked').checked,
+      });
+      if (j.ok) { location.reload(); return false; }
+      btn.disabled = false;
+      addSay(j.reason || 'could not add it', true);
+      return false;
     }
 
     async function poll() {
       try {
-        const res = await fetch('/__lazydev/status', { cache: 'no-store' });
+        // With the token, because the payload's start command and failure
+        // detail are served only to a caller that has it, and this table shows
+        // both. Same header every mutating call here sends.
+        const res = await fetch('/__lazydev/status', { cache: 'no-store', headers: { 'X-Lazydev-Token': TOKEN } });
         if (!res.ok) return;
         const data = await res.json();
         document.getElementById('uptime').textContent = fmtIdle(data.uptimeMs);
         for (const p of data.projects) {
           const row = document.querySelector('tr[data-host="' + CSS.escape(p.host) + '"]');
-          if (!row || row.querySelector('.rename')) continue;
+          if (!row) continue;
+          // The registry can change under us (the CLI writes the same file), so
+          // keep the edit panel's prefill fresh — unless the panel is open, in
+          // which case the values must not shift while someone types in them.
+          const editing = row.nextElementSibling && row.nextElementSibling.classList.contains('editrow');
+          if (!editing) {
+            const data = rowData(row);
+            data.port = p.port;
+            data.cmd = p.startCmd || '';
+          }
           const on = ON_STATES.includes(p.state);
           const pend = pending.get(p.host);
           if (pend && Date.now() - pend.at < 10000 && on !== pend.on) continue;
           pending.delete(p.host);
-          row.querySelector('.c-state').innerHTML = badgeHtml(p.state, p.owned);
+          row.querySelector('.c-state').innerHTML = stateCellHtml(p.state, p.owned, p.lastError);
           row.querySelector('.c-idle').textContent = p.state === 'running' ? fmtIdle(p.idleForMs) : '—';
           row.querySelector('.c-conn').textContent = p.connCount;
+          // Restart only makes sense against something that is running.
+          const rb = row.querySelector('.restart');
+          if (rb && document.activeElement !== rb) rb.hidden = p.state !== 'running';
           const sw = row.querySelector('.switch input');
           if (sw && document.activeElement !== sw) {
             sw.checked = on;
@@ -1634,7 +3771,24 @@ function dashboardHtml() {
         }
       } catch (err) { /* daemon momentarily unreachable; keep polling */ }
     }
-    setInterval(poll, 2000);
+
+    // Adaptive cadence: fast while anything is in flight (a wake the user just
+    // clicked, an install, a start), settled otherwise. One self-scheduling
+    // timer instead of setInterval so an action can pull the next poll forward.
+    let pollTimer = null;
+    function schedulePoll(ms) {
+      clearTimeout(pollTimer);
+      pollTimer = setTimeout(runPoll, ms);
+    }
+    async function runPoll() {
+      await poll();
+      const busy = pending.size > 0 || !!document.querySelector('.b-starting, .b-installing');
+      schedulePoll(busy ? 700 : 2000);
+    }
+    schedulePoll(700);
+    // Coming back to the tab deserves fresh truth immediately.
+    window.addEventListener('focus', () => schedulePoll(0));
+    document.addEventListener('visibilitychange', () => { if (!document.hidden) schedulePoll(0); });
   </script>`;
 }
 
@@ -1731,7 +3885,8 @@ function proxyHttp(req, res, project) {
       r.child = null;
       r.pid = null;
       r.upstreamHost = null;
-      r.lastError = { code: err.code, message: `upstream ${upHost}:${project.port} stopped answering`, at: Date.now() };
+      clearAdoption(r);
+      r.lastError = { code: err.code, kind: 'exited', message: `upstream ${upHost}:${project.port} stopped answering`, at: Date.now(), exitCode: null };
       if (!r.startPromise) ensureUp(project).catch(() => {});
       if (!res.headersSent) {
         // Answer like the cold path so the browser self-recovers: the status
@@ -1797,20 +3952,25 @@ const daemonServers = [];
 // once per loopback listener under RUN_AS_MAIN, and directly by the self-test.
 function createDaemonServer() {
   const srv = http.createServer((req, res) => {
-    try {
-      handleRequest(req, res);
-    } catch (err) {
-      log(`request-handler crash: ${err && err.stack ? err.stack : err}`);
-      try {
-        if (!res.headersSent) {
-          sendHtml(res, 500, 'lazydev — error', `<h1>Internal error</h1><pre>${esc(String(err && err.message))}</pre>`);
-        } else {
-          res.destroy();
+    // .catch, not try/catch: handleRequest is async, so anything it throws past
+    // its first await comes back as a rejected promise. A plain try/catch here
+    // saw none of it, and the request was left hanging with no response at all
+    // (the only trace was an unhandledRejection line in daemon.log). Same shape
+    // as the upgrade handler below.
+    Promise.resolve()
+      .then(() => handleRequest(req, res))
+      .catch((err) => {
+        log(`request-handler crash: ${err && err.stack ? err.stack : err}`);
+        try {
+          if (!res.headersSent) {
+            sendHtml(res, 500, 'lazydev — error', `<h1>Internal error</h1><pre>${esc(String(err && err.message))}</pre>`);
+          } else {
+            res.destroy();
+          }
+        } catch {
+          /* ignore */
         }
-      } catch {
-        /* ignore */
-      }
-    }
+      });
   });
 
   srv.on('upgrade', (req, clientSocket, head) => {
@@ -1877,7 +4037,13 @@ async function handleRequest(req, res) {
   // Warm path: the project is running AND a probe/adopt already pinned the
   // family that answered. upstreamHost is the honest "port answered" signal, so
   // this is the only case where we proxy straight through (WS/HMR keep working).
-  if (r.state === 'running' && r.upstreamHost) {
+  //
+  // For an ADOPTED upstream that signal is stale by construction: nothing tells
+  // us when a server we did not spawn goes away. verifyAdoptedUpstream re-checks
+  // the listening pid (at most once every ADOPT_VERIFY_TTL_MS) and returns false
+  // after dropping a record whose pid changed — falling through to the cold path
+  // below, which re-runs bring-up and lands on adopt, spawn or conflict.
+  if (r.state === 'running' && r.upstreamHost && verifyAdoptedUpstream(project, r)) {
     lastAccess.set(project.host, Date.now());
     return proxyHttp(req, res, project);
   }
@@ -1897,6 +4063,7 @@ async function handleRequest(req, res) {
   // show the failure that just occurred. The snapshot is what a slow-path client
   // sees; the kick starts a new bring-up behind it so a reload lands on the app.
   const snapshot = { state: r.state, lastError: r.lastError };
+  const wantsRetry = url.searchParams.has('retry');
 
   // Kick bring-up in the background exactly once. ensureUp claims r.startPromise
   // synchronously before any await (the #9cb548a fix), so kicking it here yields
@@ -1904,7 +4071,19 @@ async function handleRequest(req, res) {
   // start-timeout / conflict rejection would otherwise surface as an
   // unhandledRejection. lastError is recorded inside ensureUp before it throws,
   // so swallowing the rejection here loses nothing.
-  if (!r.startPromise) {
+  //
+  // A terminal failure (stopped + lastError) is left alone so the wake page's
+  // reload lands on the failure page instead of spawning another child. Only
+  // an explicit ?retry=1 (the failure page's Retry link) starts over.
+  const kicked =
+    !r.startPromise && (wantsRetry || !(r.state === 'stopped' && r.lastError));
+  if (kicked) {
+    // An explicit Retry is the one thing that re-arms a dependency install that
+    // already failed: ensureUp skips the install while this memo stands, so a
+    // plain reload of a broken project answers instantly instead of paying
+    // installTimeoutMs again (spec 4: "does not re-run npm install on the next
+    // request"). A human who just fixed their network clicks Retry and gets it.
+    if (wantsRetry) r.installFailed = null;
     ensureUp(project).catch(() => {});
   }
   // Wait only a GRACE window for the attempt to settle — long enough for the
@@ -1920,6 +4099,10 @@ async function handleRequest(req, res) {
   }
 
   // Adopt settled within the grace -> the port answered; proxy straight through.
+  // No verifyAdoptedUpstream here: ensureUp just resolved the listener's pid AND
+  // its cwd a few milliseconds ago, which is the stronger check, and it stamped
+  // verifiedAt — so calling the pid check now would short-circuit on the cache
+  // anyway.
   if (r.state === 'running' && r.upstreamHost) {
     lastAccess.set(project.host, Date.now());
     return proxyHttp(req, res, project);
@@ -1930,8 +4113,14 @@ async function handleRequest(req, res) {
   }
 
   // Still bringing up (or the fresh attempt already failed): answer immediately
-  // and let the client (or the status page's poll) drive the retry, rendering
-  // from the PRE-KICK snapshot so a reload after a failure shows that failure.
+  // and let the client (or the status page's poll) drive the retry.
+  //
+  // When THIS request kicked a fresh attempt, render from the live record so a
+  // Retry click shows the wake page (installing/starting) instead of immediately
+  // re-showing the stale failure from the pre-kick snapshot. A concurrent hit
+  // that shares an in-flight startPromise keeps the snapshot so an idle reload
+  // after a terminal failure still names that failure.
+  const renderState = kicked ? r : snapshot;
 
   // Navigation (browser) -> self-refreshing status page (200 so the browser
   // renders it and runs the poll script instead of showing its own error UI).
@@ -1940,14 +4129,14 @@ async function handleRequest(req, res) {
   // the log/error is redacted (see statusPageHtml).
   if (wantsHtml(req)) {
     res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
-    res.end(statusPageHtml(project, snapshot, isControlAuthorized(req)));
+    res.end(statusPageHtml(project, renderState, isControlAuthorized(req)));
     return;
   }
 
   // Everything else (curl / XHR / webhook, including the status page's own poll)
   // -> plain 503 with Retry-After, no HTML. Also covers the failed state: keep
   // it 503 so simple clients keep retrying; the failure detail is for humans.
-  return sendRetry(res, project, snapshot);
+  return sendRetry(res, project, renderState);
 }
 
 // ---------------------------------------------------------------------------
@@ -1969,6 +4158,15 @@ async function handleUpgrade(req, clientSocket, head) {
   const hostHeader = req.headers.host || '';
   noteRenderPort(hostHeader);
   const key = resolveHostKey(hostHeader);
+
+  // The terminal socket (section 6). An http server takes exactly one 'upgrade'
+  // listener and the HMR proxy below owns the rest of it, so this is a branch
+  // here rather than a second listener. It has to come before the control-plane
+  // destroy below, since the terminal IS on the control plane.
+  const url = new URL(req.url || '/', 'http://localhost');
+  if (url.pathname.startsWith(TERM_PATH)) {
+    return handleTermUpgrade(req, clientSocket, head, url, key);
+  }
 
   // Never proxy the control plane over websockets.
   if (key === 'lazydev') {
@@ -2336,10 +4534,35 @@ export {
   CONTROL_TOKEN_PATH,
   sameDir,
   __setResolvePidCwd,
+  __setResolveListenerPid,
+  __setKillForeign,
+  freePort,
   rotateIfNeeded,
   log,
   logFdFor,
   LOGS_DIR,
+  // Section 4 (failures you can see): the per-kind copy table, the
+  // since-the-last-separator tail, and the dashboard's one-line error summary,
+  // exposed so test/failures.test.mjs can assert each without a browser.
+  failureCopy,
+  tailLog,
+  firstErrorLine,
+  statusPayload,
+  // Section 6 (a terminal per dev server): which interpreter runs lib/pty.py
+  // (null on the read-only fallback), the line a read-only panel opens with,
+  // and the scrollback a fresh socket replays.
+  ptyStatus,
+  NO_PTY_NOTE,
+  termRingBytes,
+  // Section 5 (adoption that re-checks): the pid gate in front of an adopted
+  // upstream, and the TTL a test needs to know to step over the cache.
+  verifyAdoptedUpstream,
+  ADOPT_VERIFY_TTL_MS,
+  // Section 8 (static sites survive an npx cache prune): the placeholder, its
+  // spawn-time expansion, and the one-time registry migration.
+  STATIC_PLACEHOLDER,
+  expandStartCmd,
+  rewriteStaticStartCmds,
   // #9 — npx front door: state-dir resolution + bind fallback. Re-exported from
   // their libs so a test importing ../lazydev.mjs reaches the same helpers the
   // daemon uses, and STATE_DIR/CONFIG_PATH expose what this module resolved.
