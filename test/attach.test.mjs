@@ -1,6 +1,6 @@
-// Section 6, the CLI half: `lazydev attach <host>` and `lazydev logs -f <host>`.
+// Section 6, the CLI half: `xerb attach <host>` and `xerb logs -f <host>`.
 //
-// The daemon half (the pty, the ring buffer, GET /__lazydev/term/<host>) has
+// The daemon half (the pty, the ring buffer, GET /__xerb/term/<host>) has
 // its own tests in test/term.test.mjs and is taken as given here. What this
 // file proves is the other end of that socket: the real entrypoint, spawned as
 // a child, driving a real daemon on an OS-assigned port with a throwaway state
@@ -21,7 +21,7 @@
 // reason rather than faked.
 //
 // Nothing here installs a LaunchAgent or touches the developer's own daemon:
-// LAZYDEV_STATE_DIR, LAZYDEV_PORT and LAZYDEV_FALLBACK_PORT are all pinned.
+// XERB_STATE_DIR, XERB_PORT and XERB_FALLBACK_PORT are all pinned.
 
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
@@ -34,8 +34,8 @@ import { spawn, spawnSync, execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const BIN = path.join(ROOT, 'bin', 'lazydev.mjs');
-const DAEMON = path.join(ROOT, 'lazydev.mjs');
+const BIN = path.join(ROOT, 'bin', 'xerb.mjs');
+const DAEMON = path.join(ROOT, 'xerb.mjs');
 
 // Without a python3 there is no pty, so there is nothing to type into: the
 // typing tests are skipped with a reason instead of failing on a machine that
@@ -89,11 +89,11 @@ function env(extra = {}) {
   return {
     ...process.env,
     HOME: homeDir,
-    LAZYDEV_STATE_DIR: stateDir,
-    LAZYDEV_PORT: String(frontPort),
-    LAZYDEV_FALLBACK_PORT: String(frontPort),
-    LAZYDEV_REAP_INTERVAL_MS: '60000',
-    LAZYDEV_QUIET: '1',
+    XERB_STATE_DIR: stateDir,
+    XERB_PORT: String(frontPort),
+    XERB_FALLBACK_PORT: String(frontPort),
+    XERB_REAP_INTERVAL_MS: '60000',
+    XERB_QUIET: '1',
     NO_COLOR: '1', // plain output, so assertions read exact text
     ...extra,
   };
@@ -159,8 +159,8 @@ function statusJson() {
       {
         host: '127.0.0.1',
         port: frontPort,
-        path: '/__lazydev/status',
-        headers: { host: 'lazydev.localhost', 'x-lazydev-token': token },
+        path: '/__xerb/status',
+        headers: { host: 'xerb.localhost', 'x-xerb-token': token },
       },
       (res) => {
         let b = '';
@@ -186,8 +186,8 @@ function stateOf(status, host) {
 }
 
 before(async () => {
-  stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'lazydev-attach-state-'));
-  homeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'lazydev-attach-home-'));
+  stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'xerb-attach-state-'));
+  homeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'xerb-attach-home-'));
   frontPort = await freePort();
   readbackPort = await freePort();
   chattyPort = await freePort();
@@ -277,29 +277,29 @@ after(async () => {
 test('attach with no host says what it needs, exit 1', () => {
   const r = cli(['attach']);
   assert.equal(r.code, 1);
-  assert.match(r.stderr, /usage: lazydev attach <host>/);
+  assert.match(r.stderr, /usage: xerb attach <host>/);
 });
 
 test('logs -f with no host says what it needs, exit 1', () => {
   const r = cli(['logs', '-f']);
   assert.equal(r.code, 1);
-  assert.match(r.stderr, /usage: lazydev logs <host> -f/);
+  assert.match(r.stderr, /usage: xerb logs <host> -f/);
 });
 
 test('attach to an unknown host names the command that lists them, exit 1', () => {
   const r = cli(['attach', 'nope']);
   assert.equal(r.code, 1);
   assert.match(r.stderr, /no project named "nope"/);
-  assert.match(r.stderr, /lazydev status/);
+  assert.match(r.stderr, /xerb status/);
 });
 
 test('no daemon: attach and logs -f both give the section 1 line and exit 3', async () => {
-  // A port nothing answers on, so this cannot find the developer's own lazydev.
+  // A port nothing answers on, so this cannot find the developer's own xerb.
   const dead = String(await freePort());
   for (const args of [['attach', 'readback'], ['logs', 'readback', '-f']]) {
-    const r = cli(args, { LAZYDEV_PORT: dead, LAZYDEV_FALLBACK_PORT: dead });
+    const r = cli(args, { XERB_PORT: dead, XERB_FALLBACK_PORT: dead });
     assert.equal(r.code, 3, `${args.join(' ')}: ${r.stderr}`);
-    assert.match(r.stderr, /lazydev is not running; run `lazydev` to start it/);
+    assert.match(r.stderr, /xerb is not running; run `xerb` to start it/);
   }
 });
 
@@ -336,7 +336,7 @@ test('attach types into the dev server and prints what it says back', { skip: NO
     const running = await poll(async () => (stateOf(await statusJson(), 'readback') === 'running' ? true : null), 30_000);
     assert.ok(running, 'readback came up after being typed into');
 
-    // Ctrl-] detaches. The dev server is lazydev's, so it survives.
+    // Ctrl-] detaches. The dev server is xerb's, so it survives.
     a.write(Buffer.from([0x1d]));
     const { code } = await a.exited;
     assert.equal(code, 0, `detach exit: ${a.stderr}`);

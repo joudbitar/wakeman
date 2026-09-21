@@ -5,13 +5,13 @@
 // been moved, or `npm install` 404'd. These tests pin the five kinds
 // (exited, timeout, dir-missing, install-failed, conflict), the copy each one
 // gets with its numbers interpolated, the lastError the dashboard reads from
-// /__lazydev/status, the separator line every start writes to <host>.log, and
+// /__xerb/status, the separator line every start writes to <host>.log, and
 // the tail endpoint that slices from it.
 //
-// ISOLATION: LAZYDEV_CONFIG / LAZYDEV_LOGS_DIR are read at module load, so they
-// are assigned BEFORE the dynamic import of ../lazydev.mjs (static imports are
+// ISOLATION: XERB_CONFIG / XERB_LOGS_DIR are read at module load, so they
+// are assigned BEFORE the dynamic import of ../xerb.mjs (static imports are
 // hoisted; a dynamic one is not). Everything lands in a throwaway temp dir:
-// no real state dir, no LaunchAgent, no `lazydev` binary. Pure node:test.
+// no real state dir, no LaunchAgent, no `xerb` binary. Pure node:test.
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -23,7 +23,7 @@ import path from 'node:path';
 
 // --- temp state, wired up before the module loads ---------------------------
 
-const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'lazydev-failures-'));
+const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'xerb-failures-'));
 const CONFIG_FILE = path.join(tmpDir, 'projects.json');
 const LOGS = path.join(tmpDir, 'logs');
 fs.mkdirSync(LOGS, { recursive: true });
@@ -35,8 +35,8 @@ const PROJECT_DIR = path.join(tmpDir, 'app');
 fs.mkdirSync(path.join(PROJECT_DIR, 'node_modules'), { recursive: true });
 
 fs.writeFileSync(CONFIG_FILE, JSON.stringify({ port: 0, projects: [] }));
-process.env.LAZYDEV_CONFIG = CONFIG_FILE;
-process.env.LAZYDEV_LOGS_DIR = LOGS;
+process.env.XERB_CONFIG = CONFIG_FILE;
+process.env.XERB_LOGS_DIR = LOGS;
 
 const {
   createDaemonServer,
@@ -48,7 +48,7 @@ const {
   tailLog,
   firstErrorLine,
   ensureControlToken,
-} = await import('../lazydev.mjs');
+} = await import('../xerb.mjs');
 
 // --- helpers ----------------------------------------------------------------
 
@@ -101,11 +101,11 @@ function httpGet(port, hostHeader, reqPath = '/', headers = {}) {
 // A browser navigation: what gets the HTML page instead of the plain 503.
 const NAV = { accept: 'text/html', 'sec-fetch-mode': 'navigate' };
 
-// The dashboard and `lazydev status` both read this with the control token, and
+// The dashboard and `xerb status` both read this with the control token, and
 // the payload's failure detail (the raw message, the log line) is only served to
 // a caller that has it — so the helper carries it, like its real callers do.
 async function statusFor(daemonPort, host) {
-  const res = await httpGet(daemonPort, 'lazydev.localhost', '/__lazydev/status', { 'x-lazydev-token': ensureControlToken() });
+  const res = await httpGet(daemonPort, 'xerb.localhost', '/__xerb/status', { 'x-xerb-token': ensureControlToken() });
   assert.equal(res.status, 200, 'status endpoint answers');
   return JSON.parse(res.body).projects.find((p) => p.host === host);
 }
@@ -240,7 +240,7 @@ test('dir-missing: a moved folder fails instantly and the copy carries both fixe
   assert.ok(firstMs < 3000, `failed without riding out the start timeout (took ${firstMs}ms)`);
   assert.match(
     page.body,
-    new RegExp(`The folder <code>${gone}</code> is gone\\. Move it back, or <code>lazydev remove moved</code> / <code>lazydev add /new/path --name moved</code>\\.`),
+    new RegExp(`The folder <code>${gone}</code> is gone\\. Move it back, or <code>xerb remove moved</code> / <code>xerb add /new/path --name moved</code>\\.`),
     'dir-missing copy names the folder and both commands'
   );
   assert.doesNotMatch(page.body, /id="term"/, 'no log box: this attempt never spawned anything');
@@ -334,7 +334,7 @@ test('failureCopy renders one sentence per kind, numbers included', () => {
   );
   assert.equal(
     failureCopy(project, { kind: 'dir-missing', dir: '/Users/x/code/app' }),
-    'The folder <code>/Users/x/code/app</code> is gone. Move it back, or <code>lazydev remove app</code> / <code>lazydev add /new/path --name app</code>.'
+    'The folder <code>/Users/x/code/app</code> is gone. Move it back, or <code>xerb remove app</code> / <code>xerb add /new/path --name app</code>.'
   );
   assert.equal(
     failureCopy(project, { kind: 'install-failed', installCmd: 'npm install', exitCode: 1 }),
@@ -398,7 +398,7 @@ test('the tail endpoint returns this attempt by default and everything with ?all
     ].join('\n')
   );
 
-  const res = await httpGet(daemonPort, 'tailcheck.localhost', '/__lazydev/tail');
+  const res = await httpGet(daemonPort, 'tailcheck.localhost', '/__xerb/tail');
   assert.equal(res.status, 200);
   const j = JSON.parse(res.body);
   assert.equal(j.ok, true);
@@ -408,7 +408,7 @@ test('the tail endpoint returns this attempt by default and everything with ?all
   assert.doesNotMatch(j.tail, /──/, 'the separator itself is not echoed back');
   assert.equal(j.tail.split('\n').filter((l) => l === 'compiling...').length, 1, 'one compile, not two runs read as one');
 
-  const all = JSON.parse((await httpGet(daemonPort, 'tailcheck.localhost', '/__lazydev/tail?all=1')).body);
+  const all = JSON.parse((await httpGet(daemonPort, 'tailcheck.localhost', '/__xerb/tail?all=1')).body);
   assert.equal(all.all, true);
   assert.match(all.tail, /older attempt line/, '?all=1 reaches back past the separator');
   assert.equal(all.tail.split('\n').filter((l) => l === 'compiling...').length, 2);
@@ -441,7 +441,7 @@ test('firstErrorLine picks the error line, strips color, and falls back to the l
 // --- a stop is not a failure ------------------------------------------------
 
 // The dashboard switch is live during 'starting' and 'installing', and so is
-// `lazydev stop`. Flipping it off there used to land as kind 'exited' with
+// `xerb stop`. Flipping it off there used to land as kind 'exited' with
 // signal SIGTERM: a red `failed` badge for something the user asked for, and
 // worse, a URL that stopped waking, because handleRequest refuses to kick a
 // record that is stopped-with-lastError.
@@ -462,7 +462,7 @@ test('a stop while the project is still starting is not recorded as a failure', 
   await httpGet(daemonPort, 'stopmid.localhost', '/', NAV); // kicks the bring-up
   assert.ok(await waitFor(() => getRuntime('stopmid').state === 'starting', 5000), 'reached starting');
 
-  // Exactly what the dashboard switch and `lazydev stop` post.
+  // Exactly what the dashboard switch and `xerb stop` post.
   assert.deepEqual(stop('stopmid', 'control'), { ok: true });
   const r = getRuntime('stopmid');
   if (r.startPromise) await r.startPromise.catch(() => {});
@@ -490,7 +490,7 @@ test('a failed project renders a red failed badge, not "sleeping"', async (t) =>
   });
   assert.equal(entry.lastError.kind, 'exited');
 
-  const dash = await httpGet(daemonPort, 'lazydev.localhost', '/', NAV);
+  const dash = await httpGet(daemonPort, 'xerb.localhost', '/', NAV);
   assert.equal(dash.status, 200);
   const row = (dash.body.split('<tr data-host="badged">')[1] || '').split('</tr>')[0];
   assert.match(row, /<span class="badge b-failed" title="exited">failed<\/span>/, 'red failed badge with the kind as its tooltip');

@@ -15,7 +15,7 @@ import os from 'node:os';
 
 import { detectRails, detectDjango, detectStatic, detectNode, normalizeScanRoots, hardcodedPort } from '../lib/detect.mjs';
 
-const ROOT = mkdtempSync(join(os.tmpdir(), 'lazydev-detect-'));
+const ROOT = mkdtempSync(join(os.tmpdir(), 'xerb-detect-'));
 after(() => rmSync(ROOT, { recursive: true, force: true }));
 
 let n = 0;

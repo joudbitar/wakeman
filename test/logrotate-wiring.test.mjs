@@ -5,7 +5,7 @@
 // log() for daemon.log, logFdFor() for a per-project log — so deleting either
 // call site fails a test (the coverage gap that made isolated-helper tests
 // insufficient). We point the daemon's whole log dir at a throwaway temp dir
-// via LAZYDEV_LOGS_DIR (set BEFORE importing the module, since LOGS_DIR is
+// via XERB_LOGS_DIR (set BEFORE importing the module, since LOGS_DIR is
 // resolved at load), so nothing touches the real logs/.
 
 import fs from 'node:fs';
@@ -14,11 +14,11 @@ import path from 'node:path';
 import { test, after } from 'node:test';
 import assert from 'node:assert/strict';
 
-const LOGS_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'lazydev-wiring-'));
-process.env.LAZYDEV_LOGS_DIR = LOGS_DIR;
+const LOGS_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'xerb-wiring-'));
+process.env.XERB_LOGS_DIR = LOGS_DIR;
 after(() => fs.rmSync(LOGS_DIR, { recursive: true, force: true }));
 
-const { log, logFdFor } = await import('../lazydev.mjs');
+const { log, logFdFor } = await import('../xerb.mjs');
 
 test('log() rotates daemon.log at the 1 MB cap (wiring)', () => {
   const daemonLog = path.join(LOGS_DIR, 'daemon.log');

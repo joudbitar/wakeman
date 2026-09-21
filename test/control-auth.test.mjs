@@ -4,9 +4,9 @@
 // foreign Origin, succeeds with the token on a clean origin, that GET /status
 // stays readable (so the CLI keeps working), that error pages redact the raw
 // failure reason for unauthorized callers while the log tail is served by the
-// host-scoped GET /__lazydev/tail, and that the token file is owner-only (0600).
+// host-scoped GET /__xerb/tail, and that the token file is owner-only (0600).
 //
-// ISOLATION: the env vars below MUST be set BEFORE lazydev.mjs is imported,
+// ISOLATION: the env vars below MUST be set BEFORE xerb.mjs is imported,
 // because the module evaluates CONTROL_TOKEN_PATH / CONFIG_PATH at import time.
 // ESM hoists static `import` above all other code, so we assign the envs first
 // and then load the module with a dynamic `await import()`. That points the
@@ -37,7 +37,7 @@ function freePort() {
 }
 
 // --- temp state dir, wired up before the module loads --------------------------
-const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'lazydev-auth-'));
+const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'xerb-auth-'));
 const CONFIG_FILE = path.join(tmpDir, 'projects.json');
 const TOKEN_FILE = path.join(tmpDir, 'control-token');
 
@@ -60,8 +60,8 @@ fs.writeFileSync(
   })
 );
 
-process.env.LAZYDEV_CONFIG = CONFIG_FILE;
-process.env.LAZYDEV_CONTROL_TOKEN_PATH = TOKEN_FILE;
+process.env.XERB_CONFIG = CONFIG_FILE;
+process.env.XERB_CONTROL_TOKEN_PATH = TOKEN_FILE;
 
 const {
   createDaemonServer,
@@ -70,7 +70,7 @@ const {
   isSameOrigin,
   isControlAuthorized,
   CONTROL_TOKEN_PATH,
-} = await import('../lazydev.mjs');
+} = await import('../xerb.mjs');
 
 // Load the temp registry so the project + short startTimeoutMs are live.
 loadConfig('test');
@@ -112,10 +112,10 @@ function httpReq(port, { method = 'GET', pathname = '/', headers = {} } = {}) {
 
 test('isSameOrigin: missing/matching origin ok, foreign/malformed refused', () => {
   // No Origin at all (CLI / curl) -> allowed.
-  assert.equal(isSameOrigin({ headers: { host: 'lazydev.localhost' } }), true);
+  assert.equal(isSameOrigin({ headers: { host: 'xerb.localhost' } }), true);
   // Matching Origin host -> allowed.
   assert.equal(
-    isSameOrigin({ headers: { origin: 'http://lazydev.localhost', host: 'lazydev.localhost' } }),
+    isSameOrigin({ headers: { origin: 'http://xerb.localhost', host: 'xerb.localhost' } }),
     true
   );
   // Matching Origin host including port -> allowed.
@@ -125,25 +125,25 @@ test('isSameOrigin: missing/matching origin ok, foreign/malformed refused', () =
   );
   // Foreign Origin -> refused.
   assert.equal(
-    isSameOrigin({ headers: { origin: 'http://evil.com', host: 'lazydev.localhost' } }),
+    isSameOrigin({ headers: { origin: 'http://evil.com', host: 'xerb.localhost' } }),
     false
   );
   // Malformed Origin -> refused.
   assert.equal(
-    isSameOrigin({ headers: { origin: 'not a url', host: 'lazydev.localhost' } }),
+    isSameOrigin({ headers: { origin: 'not a url', host: 'xerb.localhost' } }),
     false
   );
 });
 
-test('POST /__lazydev/reload without token is refused', async (t) => {
+test('POST /__xerb/reload without token is refused', async (t) => {
   const server = createDaemonServer();
   t.after(() => server.close());
   const port = await listen(server);
 
   const res = await httpReq(port, {
     method: 'POST',
-    pathname: '/__lazydev/reload',
-    headers: { host: 'lazydev.localhost' },
+    pathname: '/__xerb/reload',
+    headers: { host: 'xerb.localhost' },
   });
   assert.equal(res.status, 403, `no-token POST should be 403 (got ${res.status})`);
   assert.match(res.body, /"ok":false/);
@@ -157,10 +157,10 @@ test('POST with correct token but foreign Origin is refused', async (t) => {
   const token = ensureControlToken();
   const res = await httpReq(port, {
     method: 'POST',
-    pathname: '/__lazydev/reload',
+    pathname: '/__xerb/reload',
     headers: {
-      host: 'lazydev.localhost',
-      'x-lazydev-token': token,
+      host: 'xerb.localhost',
+      'x-xerb-token': token,
       origin: 'http://evil.example',
     },
   });
@@ -175,26 +175,26 @@ test('POST with token + clean origin succeeds', async (t) => {
   const token = ensureControlToken();
   const res = await httpReq(port, {
     method: 'POST',
-    pathname: '/__lazydev/reload',
+    pathname: '/__xerb/reload',
     headers: {
-      host: 'lazydev.localhost',
-      'x-lazydev-token': token,
-      origin: 'http://lazydev.localhost',
+      host: 'xerb.localhost',
+      'x-xerb-token': token,
+      origin: 'http://xerb.localhost',
     },
   });
   assert.equal(res.status, 200, `token + clean origin should be 200 (got ${res.status})`);
   assert.match(res.body, /"ok":true/);
 });
 
-test('GET /__lazydev/status stays readable without a token', async (t) => {
+test('GET /__xerb/status stays readable without a token', async (t) => {
   const server = createDaemonServer();
   t.after(() => server.close());
   const port = await listen(server);
 
   const res = await httpReq(port, {
     method: 'GET',
-    pathname: '/__lazydev/status',
-    headers: { host: 'lazydev.localhost' },
+    pathname: '/__xerb/status',
+    headers: { host: 'xerb.localhost' },
   });
   assert.equal(res.status, 200, `status GET should be 200 (got ${res.status})`);
   const parsed = JSON.parse(res.body);
@@ -233,9 +233,9 @@ test('start-error page redacts the failure reason for unauthorized callers, show
   assert.match(unauth.body, /failed to start/i, 'failure page reached (start timed out)');
   // The raw failure reason (which can leak paths) stays behind the token; the
   // log tail is no longer inlined for anyone — the page fetches it from the
-  // host-scoped GET /__lazydev/tail instead.
+  // host-scoped GET /__xerb/tail instead.
   assert.match(unauth.body, /The dev server failed to start\./, 'unauthorized page shows the generic reason only');
-  assert.match(unauth.body, /__lazydev\/tail/, 'the page fetches the tail from the host-scoped endpoint');
+  assert.match(unauth.body, /__xerb\/tail/, 'the page fetches the tail from the host-scoped endpoint');
 
   // Authorized caller (valid token): same nav, but the raw reason is included.
   // Poll the same way so we land on the failure page even if a fresh re-kick
@@ -243,7 +243,7 @@ test('start-error page redacts the failure reason for unauthorized callers, show
   const token = ensureControlToken();
   let auth;
   for (let i = 0; i < 40; i++) {
-    auth = await navHit({ 'x-lazydev-token': token });
+    auth = await navHit({ 'x-xerb-token': token });
     if (/failed to start/i.test(auth.body)) break;
     await new Promise((r) => setTimeout(r, 50));
   }
@@ -251,34 +251,34 @@ test('start-error page redacts the failure reason for unauthorized callers, show
   assert.doesNotMatch(auth.body, /The dev server failed to start\./, 'authorized page shows the raw reason, not the generic one');
 });
 
-test('GET /__lazydev/tail is host-scoped and same-origin: project host ok, dashboard host 404, foreign origin 403', async (t) => {
+test('GET /__xerb/tail is host-scoped and same-origin: project host ok, dashboard host 404, foreign origin 403', async (t) => {
   const server = createDaemonServer();
   t.after(() => server.close());
   const port = await listen(server);
 
-  const onProj = await httpReq(port, { pathname: '/__lazydev/tail', headers: { host: 'fake.localhost' } });
+  const onProj = await httpReq(port, { pathname: '/__xerb/tail', headers: { host: 'fake.localhost' } });
   assert.equal(onProj.status, 200, 'the project origin may read its own tail');
   const j = JSON.parse(onProj.body);
   assert.equal(j.ok, true);
   assert.equal(typeof j.tail, 'string', 'tail is the log text');
   assert.equal(typeof j.state, 'string', 'state rides along for the wake page poll');
 
-  const onDash = await httpReq(port, { pathname: '/__lazydev/tail', headers: { host: 'lazydev.localhost' } });
+  const onDash = await httpReq(port, { pathname: '/__xerb/tail', headers: { host: 'xerb.localhost' } });
   assert.equal(onDash.status, 404, 'the dashboard host names no project to tail');
 
   const crossOrigin = await httpReq(port, {
-    pathname: '/__lazydev/tail',
+    pathname: '/__xerb/tail',
     headers: { host: 'fake.localhost', origin: 'http://evil.example' },
   });
   assert.equal(crossOrigin.status, 403, 'a foreign Origin is refused');
 });
 
-// /__lazydev/* is routed to the control plane whatever Host it arrives on, so a
+// /__xerb/* is routed to the control plane whatever Host it arrives on, so a
 // page any registered dev server renders can fetch the status JSON same-origin.
 // What that page may read is therefore the same question the failure page
 // already answers: the start command, the raw failure message and a raw line of
 // another project's log stay behind the token.
-test('GET /__lazydev/status redacts start commands and failure detail for a tokenless caller', async (t) => {
+test('GET /__xerb/status redacts start commands and failure detail for a tokenless caller', async (t) => {
   const server = createDaemonServer();
   t.after(() => server.close());
   const port = await listen(server);
@@ -295,7 +295,7 @@ test('GET /__lazydev/status redacts start commands and failure detail for a toke
 
   // A page served by a dev server, reading the control plane on its own origin.
   const open = await httpReq(port, {
-    pathname: '/__lazydev/status',
+    pathname: '/__xerb/status',
     headers: { host: 'fake.localhost', origin: 'http://fake.localhost' },
   });
   assert.equal(open.status, 200, 'status stays readable, as the CLI needs');
@@ -309,8 +309,8 @@ test('GET /__lazydev/status redacts start commands and failure detail for a toke
 
   // The dashboard and the CLI hold the token, and they get all of it.
   const authed = await httpReq(port, {
-    pathname: '/__lazydev/status',
-    headers: { host: 'lazydev.localhost', 'x-lazydev-token': ensureControlToken() },
+    pathname: '/__xerb/status',
+    headers: { host: 'xerb.localhost', 'x-xerb-token': ensureControlToken() },
   });
   const full = JSON.parse(authed.body).projects.find((p) => p.host === 'fake');
   assert.equal(full.startCmd, 'sleep 5', 'the edit panel still prefills');
@@ -319,7 +319,7 @@ test('GET /__lazydev/status redacts start commands and failure detail for a toke
 
 test('control-token file is created readable only by the owner (0600)', () => {
   ensureControlToken();
-  assert.equal(CONTROL_TOKEN_PATH, TOKEN_FILE, 'token path derives from LAZYDEV_CONTROL_TOKEN_PATH');
+  assert.equal(CONTROL_TOKEN_PATH, TOKEN_FILE, 'token path derives from XERB_CONTROL_TOKEN_PATH');
   if (process.platform === 'win32') {
     // Mode bits aren't meaningful on Windows; skip gracefully.
     return;

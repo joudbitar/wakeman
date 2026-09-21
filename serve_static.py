@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tiny static server with Vercel-style cleanUrls, for lazydev.
+"""Tiny static server with Vercel-style cleanUrls, for xerb.
 
 Serves the current working directory. Resolves extensionless paths to their
 .html file (so /cpi -> cpi.html, /blog/cpi -> blog/cpi.html), matching the

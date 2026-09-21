@@ -10,8 +10,8 @@
 // subcommands use, so what is asserted here is the daemon's half: the right
 // status code, the right stop-before-write, and the file on disk afterwards.
 //
-// LAZYDEV_CONFIG is captured at module load, so the env vars are set and the
-// registry written BEFORE the dynamic import of ../lazydev.mjs.
+// XERB_CONFIG is captured at module load, so the env vars are set and the
+// registry written BEFORE the dynamic import of ../xerb.mjs.
 
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
@@ -23,7 +23,7 @@ import path from 'node:path';
 
 // --- fixtures ---------------------------------------------------------------
 
-const TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'lazydev-dash-'));
+const TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'xerb-dash-'));
 const CONFIG_PATH = path.join(TMP, 'projects.json');
 
 // Project dirs. node_modules is what makes ensureUp skip the install step, so
@@ -95,9 +95,9 @@ function writeRegistry(extra = []) {
 }
 writeRegistry();
 
-process.env.LAZYDEV_CONFIG = CONFIG_PATH;
-process.env.LAZYDEV_CONTROL_TOKEN_PATH = path.join(TMP, 'control-token');
-process.env.LAZYDEV_LOGS_DIR = path.join(TMP, 'logs');
+process.env.XERB_CONFIG = CONFIG_PATH;
+process.env.XERB_CONTROL_TOKEN_PATH = path.join(TMP, 'control-token');
+process.env.XERB_LOGS_DIR = path.join(TMP, 'logs');
 
 const {
   createDaemonServer,
@@ -108,7 +108,7 @@ const {
   stop,
   statusPageHtml,
   upstreamAgent,
-} = await import('../lazydev.mjs');
+} = await import('../xerb.mjs');
 
 // --- helpers ----------------------------------------------------------------
 
@@ -120,10 +120,10 @@ function listen(server) {
 }
 
 // One request to the daemon's control plane on the dashboard host.
-function req(pathname, { method = 'POST', token, body, host = 'lazydev.localhost', origin } = {}) {
+function req(pathname, { method = 'POST', token, body, host = 'xerb.localhost', origin } = {}) {
   const payload = body === undefined ? '' : JSON.stringify(body);
   const headers = { host, 'content-type': 'application/json' };
-  if (token) headers['x-lazydev-token'] = token;
+  if (token) headers['x-xerb-token'] = token;
   if (origin) headers.origin = origin;
   return new Promise((resolve, reject) => {
     const r = http.request({ host: '127.0.0.1', port: daemonPort, method, path: pathname, headers }, (res) => {
@@ -153,7 +153,7 @@ const readReg = () => JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'));
 const entryFor = (host) => readReg().projects.find((p) => p.host === host) || null;
 
 async function statusFor(host) {
-  const res = await req('/__lazydev/status', { method: 'GET' });
+  const res = await req('/__xerb/status', { method: 'GET' });
   return res.json.projects.find((p) => p.host === host) || null;
 }
 
@@ -202,13 +202,13 @@ after(() => {
 // --- the token gate (spec section 10) ---------------------------------------
 
 const ROUTES = [
-  ['/__lazydev/add', { dir: SPARE_DIR, name: 'sneaky', startCmd: 'true' }],
-  ['/__lazydev/remove/alpha', undefined],
-  ['/__lazydev/enable/parked', undefined],
-  ['/__lazydev/disable/alpha', undefined],
-  ['/__lazydev/set/alpha', { port: 65001 }],
-  ['/__lazydev/restart/alpha', undefined],
-  ['/__lazydev/detect', { dir: NODE_DIR }],
+  ['/__xerb/add', { dir: SPARE_DIR, name: 'sneaky', startCmd: 'true' }],
+  ['/__xerb/remove/alpha', undefined],
+  ['/__xerb/enable/parked', undefined],
+  ['/__xerb/disable/alpha', undefined],
+  ['/__xerb/set/alpha', { port: 65001 }],
+  ['/__xerb/restart/alpha', undefined],
+  ['/__xerb/detect', { dir: NODE_DIR }],
 ];
 
 test('every section 7 route refuses a missing or wrong token, and writes nothing', async () => {
@@ -224,7 +224,7 @@ test('every section 7 route refuses a missing or wrong token, and writes nothing
   }
   // A page on another site holding the token is still refused: the same guard,
   // asserted here because these routes are the ones that write.
-  const crossSite = await post('/__lazydev/remove/alpha', { origin: 'http://evil.example' });
+  const crossSite = await post('/__xerb/remove/alpha', { origin: 'http://evil.example' });
   assert.equal(crossSite.status, 403, 'foreign Origin, correct token');
 
   assert.equal(fs.readFileSync(CONFIG_PATH, 'utf8'), before, 'no rejected call touched the registry');
@@ -234,7 +234,7 @@ test('every section 7 route refuses a missing or wrong token, and writes nothing
 
 test('detect prefills name, port and start command from a folder, and writes nothing', async () => {
   const before = fs.readFileSync(CONFIG_PATH, 'utf8');
-  const res = await post('/__lazydev/detect', { body: { dir: NODE_DIR } });
+  const res = await post('/__xerb/detect', { body: { dir: NODE_DIR } });
   assert.equal(res.status, 200);
   assert.equal(res.json.ok, true);
   assert.equal(res.json.name, 'detectme');
@@ -245,29 +245,29 @@ test('detect prefills name, port and start command from a folder, and writes not
 });
 
 test('detect expands ~, refuses a relative path, and names a folder that is not there', async () => {
-  const tilde = await post('/__lazydev/detect', { body: { dir: '~' } });
+  const tilde = await post('/__xerb/detect', { body: { dir: '~' } });
   assert.equal(tilde.status, 200);
   assert.equal(tilde.json.dir, os.homedir(), '~ expands to the home dir');
 
-  const relative = await post('/__lazydev/detect', { body: { dir: 'code/app' } });
+  const relative = await post('/__xerb/detect', { body: { dir: 'code/app' } });
   assert.equal(relative.status, 400);
   assert.match(relative.json.reason, /absolute/);
 
   const missing = path.join(TMP, 'not-here');
-  const gone = await post('/__lazydev/detect', { body: { dir: missing } });
+  const gone = await post('/__xerb/detect', { body: { dir: missing } });
   assert.equal(gone.status, 404);
   assert.equal(gone.json.reason, `no such folder: ${missing}`);
 });
 
 test('detect hands back the static placeholder, not an absolute serve_static.py path', async () => {
-  const res = await post('/__lazydev/detect', { body: { dir: STATIC_DIR } });
+  const res = await post('/__xerb/detect', { body: { dir: STATIC_DIR } });
   assert.equal(res.status, 200);
   assert.equal(res.json.framework, 'static');
-  assert.equal(res.json.startCmd, '$LAZYDEV_STATIC');
+  assert.equal(res.json.startCmd, '$XERB_STATIC');
 });
 
 test('detect says what it looked for when a folder proves nothing', async () => {
-  const res = await post('/__lazydev/detect', { body: { dir: SPARE_DIR } });
+  const res = await post('/__xerb/detect', { body: { dir: SPARE_DIR } });
   assert.equal(res.status, 200);
   assert.equal(res.json.startCmd, null);
   assert.deepEqual(
@@ -281,7 +281,7 @@ test('detect says what it looked for when a folder proves nothing', async () => 
 
 test('add registers a project, and the daemon serves it without a restart', async () => {
   const port = await freePort();
-  const res = await post('/__lazydev/add', {
+  const res = await post('/__xerb/add', {
     body: { dir: NODE_DIR, name: 'added', startCmd: 'npm run dev', port, parked: false },
   });
   assert.equal(res.status, 200);
@@ -302,7 +302,7 @@ test('add registers a project, and the daemon serves it without a restart', asyn
 });
 
 test('add on an already-registered folder updates the entry instead of failing', async () => {
-  const res = await post('/__lazydev/add', {
+  const res = await post('/__xerb/add', {
     body: { dir: NODE_DIR, name: 'added', startCmd: 'npm run dev -- --host' },
   });
   assert.equal(res.status, 200);
@@ -313,18 +313,18 @@ test('add on an already-registered folder updates the entry instead of failing',
 
 test('add errors land inline: missing folder, taken name, port already in use', async () => {
   const missing = path.join(TMP, 'nope');
-  const gone = await post('/__lazydev/add', { body: { dir: missing, name: 'ghost', startCmd: 'true' } });
+  const gone = await post('/__xerb/add', { body: { dir: missing, name: 'ghost', startCmd: 'true' } });
   assert.equal(gone.status, 400);
   assert.equal(gone.json.reason, `no such directory: ${missing}`);
 
-  const taken = await post('/__lazydev/add', { body: { dir: SPARE_DIR, name: 'alpha', startCmd: 'true' } });
+  const taken = await post('/__xerb/add', { body: { dir: SPARE_DIR, name: 'alpha', startCmd: 'true' } });
   assert.equal(taken.status, 409);
   assert.match(taken.json.reason, /already registered/);
 
   // Something really listening on the port the form asked for.
   const squatter = net.createServer();
   const busyPort = await new Promise((resolve) => squatter.listen(0, '127.0.0.1', () => resolve(squatter.address().port)));
-  const inUse = await post('/__lazydev/add', {
+  const inUse = await post('/__xerb/add', {
     body: { dir: SPARE_DIR, name: 'busy', startCmd: 'true', port: busyPort },
   });
   squatter.close();
@@ -336,8 +336,8 @@ test('add errors land inline: missing folder, taken name, port already in use', 
 });
 
 test('add parks a project when the checkbox is ticked', async () => {
-  const res = await post('/__lazydev/add', {
-    body: { dir: STATIC_DIR, name: 'site', startCmd: '$LAZYDEV_STATIC', parked: true },
+  const res = await post('/__xerb/add', {
+    body: { dir: STATIC_DIR, name: 'site', startCmd: '$XERB_STATIC', parked: true },
   });
   assert.equal(res.status, 200);
   assert.equal(res.json.enabled, false);
@@ -347,27 +347,27 @@ test('add parks a project when the checkbox is ticked', async () => {
 // --- enable / disable ---------------------------------------------------------
 
 test('enable and disable rewrite the registry and show up in status', async () => {
-  const on = await post('/__lazydev/enable/parked');
+  const on = await post('/__xerb/enable/parked');
   assert.equal(on.status, 200);
   assert.equal(entryFor('parked').enabled, true);
   assert.equal((await statusFor('parked')).enabled, true);
 
-  const off = await post('/__lazydev/disable/parked');
+  const off = await post('/__xerb/disable/parked');
   assert.equal(off.status, 200);
   assert.equal(entryFor('parked').enabled, false);
   assert.equal((await statusFor('parked')).enabled, false);
 
-  const ghost = await post('/__lazydev/disable/nosuchhost');
+  const ghost = await post('/__xerb/disable/nosuchhost');
   assert.equal(ghost.status, 404);
 });
 
 test('disabling a running project stops it first', async () => {
   const port = await freePort();
-  await post('/__lazydev/add', { body: { dir: STOPME_DIR, name: 'stopme', startCmd: SERVER_CMD, port } });
+  await post('/__xerb/add', { body: { dir: STOPME_DIR, name: 'stopme', startCmd: SERVER_CMD, port } });
   await ensureUp(entryFor('stopme'));
   assert.equal(getRuntime('stopme').state, 'running');
 
-  const res = await post('/__lazydev/disable/stopme');
+  const res = await post('/__xerb/disable/stopme');
   assert.equal(res.status, 200);
   assert.equal(entryFor('stopme').enabled, false);
   assert.equal(await portQuiet(port), true, 'the dev server let go of its port');
@@ -376,44 +376,44 @@ test('disabling a running project stops it first', async () => {
 // --- set ----------------------------------------------------------------------
 
 test('set changes the start command, and the port while the project is asleep', async () => {
-  const cmd = await post('/__lazydev/set/parked', { body: { startCmd: 'python3 -m http.server' } });
+  const cmd = await post('/__xerb/set/parked', { body: { startCmd: 'python3 -m http.server' } });
   assert.equal(cmd.status, 200);
   assert.equal(entryFor('parked').startCmd, 'python3 -m http.server');
 
   const port = await freePort();
-  const moved = await post('/__lazydev/set/parked', { body: { port } });
+  const moved = await post('/__xerb/set/parked', { body: { port } });
   assert.equal(moved.status, 200);
   assert.equal(entryFor('parked').port, port);
   assert.equal((await statusFor('parked')).port, port);
 
-  const nothing = await post('/__lazydev/set/parked', { body: {} });
+  const nothing = await post('/__xerb/set/parked', { body: {} });
   assert.equal(nothing.status, 400);
   assert.equal(nothing.json.reason, 'nothing to change');
 
-  const ghost = await post('/__lazydev/set/nosuchhost', { body: { port: 3100 } });
+  const ghost = await post('/__xerb/set/nosuchhost', { body: { port: 3100 } });
   assert.equal(ghost.status, 404);
 });
 
 test('set refuses to move the port while the project runs, and names the fix', async () => {
   const port = await freePort();
-  await post('/__lazydev/add', { body: { dir: RESTART_DIR, name: 'restartme', startCmd: SERVER_CMD, port } });
+  await post('/__xerb/add', { body: { dir: RESTART_DIR, name: 'restartme', startCmd: SERVER_CMD, port } });
   await ensureUp(entryFor('restartme'));
   assert.equal(getRuntime('restartme').state, 'running');
 
-  const blocked = await post('/__lazydev/set/restartme', { body: { port: await freePort() } });
+  const blocked = await post('/__xerb/set/restartme', { body: { port: await freePort() } });
   assert.equal(blocked.status, 409);
   assert.equal(blocked.json.reason, 'restartme is running; stop it first');
   assert.equal(entryFor('restartme').port, port, 'the registry kept the port it is actually serving');
 
   // The start command is editable either way: it applies at the next start.
-  const cmd = await post('/__lazydev/set/restartme', { body: { startCmd: SERVER_CMD } });
+  const cmd = await post('/__xerb/set/restartme', { body: { startCmd: SERVER_CMD } });
   assert.equal(cmd.status, 200);
 });
 
 test('set refuses a port something else is listening on', async () => {
   const squatter = net.createServer();
   const busyPort = await new Promise((resolve) => squatter.listen(0, '127.0.0.1', () => resolve(squatter.address().port)));
-  const res = await post('/__lazydev/set/parked', { body: { port: busyPort } });
+  const res = await post('/__xerb/set/parked', { body: { port: busyPort } });
   squatter.close();
   assert.equal(res.status, 409);
   assert.equal(res.json.reason, `port ${busyPort} is in use right now`);
@@ -425,9 +425,9 @@ test('restart gives the project a new process', async () => {
   const before = getRuntime('restartme');
   assert.equal(before.state, 'running');
   const beforePid = before.pid;
-  assert.ok(beforePid, 'the running server is one lazydev spawned');
+  assert.ok(beforePid, 'the running server is one xerb spawned');
 
-  const res = await post('/__lazydev/restart/restartme');
+  const res = await post('/__xerb/restart/restartme');
   assert.equal(res.status, 200);
   assert.equal(res.json.ok, true);
 
@@ -440,11 +440,11 @@ test('restart gives the project a new process', async () => {
 });
 
 test('restart refuses a disabled project and an unknown host', async () => {
-  const disabled = await post('/__lazydev/restart/parked');
+  const disabled = await post('/__xerb/restart/parked');
   assert.equal(disabled.status, 409);
   assert.equal(disabled.json.reason, 'disabled');
 
-  const ghost = await post('/__lazydev/restart/nosuchhost');
+  const ghost = await post('/__xerb/restart/nosuchhost');
   assert.equal(ghost.status, 404);
 });
 
@@ -455,7 +455,7 @@ test('remove stops a running project, drops its entry, and leaves the folder alo
   assert.equal(running.state, 'running');
   const port = entryFor('restartme').port;
 
-  const res = await post('/__lazydev/remove/restartme');
+  const res = await post('/__xerb/remove/restartme');
   assert.equal(res.status, 200);
   assert.equal(res.json.ok, true);
   assert.equal(entryFor('restartme'), null, 'gone from the registry file');
@@ -463,7 +463,7 @@ test('remove stops a running project, drops its entry, and leaves the folder alo
   assert.equal(await portQuiet(port), true, 'its dev server was stopped first');
   assert.equal(fs.existsSync(path.join(RESTART_DIR, 'node_modules')), true, 'the folder is never touched');
 
-  const ghost = await post('/__lazydev/remove/nosuchhost');
+  const ghost = await post('/__xerb/remove/nosuchhost');
   assert.equal(ghost.status, 404);
 });
 
@@ -476,7 +476,7 @@ test('the dashboard draws a word mark, the real idle time, and every per-row act
 
   // Polish 1: the word, in the monospace stack, with the sleeping z's. The
   // ASCII block art stays in lib/ui.mjs for the terminal.
-  assert.match(html, /<h1 class="logo">lazydev<span class="zzz"/);
+  assert.match(html, /<h1 class="logo">xerb<span class="zzz"/);
   assert.equal(html.includes('_ __ _ ___') || /<pre class="logo"/.test(html), false, 'no ASCII logo in the page');
 
   // Polish 2: idle sleep reads 45s, not "0m".

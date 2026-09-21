@@ -1,7 +1,7 @@
 // Boot smoke for the daemon (issue #9).
 //
 // Scans a throwaway $HOME with the real scan.mjs, then runs the real
-// lazydev.mjs on a random LAZYDEV_PORT, and asserts:
+// xerb.mjs on a random XERB_PORT, and asserts:
 //   - the scan writes the registry INTO the state dir and discovers the
 //     planted project;
 //   - http://<host>.localhost:<port> proxies to the dev server the daemon
@@ -10,7 +10,7 @@
 //     artifact (registry, logs, control token) landed in the state dir.
 // Then Ctrl-C (SIGINT) stops it cleanly. Zero deps: node:test + built-ins.
 //
-// It drives lazydev.mjs rather than bin/lazydev.mjs because the entrypoint's
+// It drives xerb.mjs rather than bin/xerb.mjs because the entrypoint's
 // one path is now a launchd install, and a GitHub runner has no GUI domain to
 // bootstrap into. The entrypoint's own surface (consent, scan, help, version,
 // the non-darwin exit, every subcommand) is test/cli.test.mjs.
@@ -25,7 +25,7 @@ import { spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const DAEMON = path.join(ROOT, 'lazydev.mjs');
+const DAEMON = path.join(ROOT, 'xerb.mjs');
 const SCANNER = path.join(ROOT, 'scan.mjs');
 
 // A free 127.0.0.1 port (opened then closed), for forcing a non-privileged
@@ -75,8 +75,8 @@ async function poll(fn, ms) {
 }
 
 test('scan discovers a project and the daemon proxies to it on a forced port', async (t) => {
-  const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'lazydev-npx-state-'));
-  const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'lazydev-npx-home-'));
+  const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'xerb-npx-state-'));
+  const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'xerb-npx-home-'));
 
   // Plant ONE discoverable project under the temp HOME: a package.json with a
   // `dev` script whose name looks like a server (so scan keeps it), and a
@@ -116,12 +116,12 @@ test('scan discovers a project and the daemon proxies to it on a forced port', a
   const childEnv = {
     ...process.env,
     HOME: homeDir, // scan walks HOME; keep it tiny and contained
-    LAZYDEV_STATE_DIR: stateDir,
-    LAZYDEV_PORT: String(frontPort), // force a bindable non-privileged front door
-    LAZYDEV_FALLBACK_PORT: String(frontPort),
-    LAZYDEV_SCAN_QUIET: '1',
+    XERB_STATE_DIR: stateDir,
+    XERB_PORT: String(frontPort), // force a bindable non-privileged front door
+    XERB_FALLBACK_PORT: String(frontPort),
+    XERB_SCAN_QUIET: '1',
     // Fail a stuck start fast so the test can't hang on a bad spawn.
-    LAZYDEV_REAP_INTERVAL_MS: '60000',
+    XERB_REAP_INTERVAL_MS: '60000',
   };
 
   // The scan runs first, exactly as the entrypoint runs it: a child of this
@@ -168,7 +168,7 @@ test('scan discovers a project and the daemon proxies to it on a forced port', a
   // daemon ends the wait immediately instead of burning the cap.
   const up = await poll(async () => {
     if (exited) return { exited: true };
-    const r = await get('lazydev.localhost', frontPort);
+    const r = await get('xerb.localhost', frontPort);
     return r && r.status ? r : null;
   }, 30000);
   assert.ok(up && up.status, `daemon should answer on 127.0.0.1:${frontPort}\n--- child output ---\n${out}`);

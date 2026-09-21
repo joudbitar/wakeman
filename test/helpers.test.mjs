@@ -9,7 +9,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import net from 'node:net';
 
-import { resolveHostKey, inferInstallCmd, probePort } from '../lazydev.mjs';
+import { resolveHostKey, inferInstallCmd, probePort } from '../xerb.mjs';
 
 test('resolveHostKey documented cases', () => {
   // Project subdomain, tenant subdomain, bare localhost.
@@ -28,8 +28,8 @@ test('resolveHostKey documented cases', () => {
   assert.equal(resolveHostKey('[::1]:4000'), null);
   assert.equal(resolveHostKey('[::1]'), null);
   // Reserved host passes through; lowercasing applies.
-  assert.equal(resolveHostKey('lazydev.localhost'), 'lazydev');
-  assert.equal(resolveHostKey('LAZYDEV.LOCALHOST'), 'lazydev');
+  assert.equal(resolveHostKey('xerb.localhost'), 'xerb');
+  assert.equal(resolveHostKey('XERB.LOCALHOST'), 'xerb');
 });
 
 test('inferInstallCmd for each package manager + fallbacks', () => {

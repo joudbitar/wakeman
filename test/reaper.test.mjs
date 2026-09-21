@@ -6,7 +6,7 @@
 // deferring; that an adopted/external project is never reaped; and that the live
 // connection count shows up in the status JSON. Pure node:test + node:assert.
 //
-// Ordering gotcha: lazydev.mjs captures CONFIG_PATH from process.env.LAZYDEV_CONFIG
+// Ordering gotcha: xerb.mjs captures CONFIG_PATH from process.env.XERB_CONFIG
 // at module load, so we write a temp registry and set the env var BEFORE the
 // dynamic import, then call the exported loadConfig() to read it.
 //
@@ -26,7 +26,7 @@ import path from 'node:path';
 
 // --- Scratch config, written before the daemon module loads ------------------
 
-const scratchDir = fs.mkdtempSync(path.join(os.tmpdir(), 'lazydev-reaper-'));
+const scratchDir = fs.mkdtempSync(path.join(os.tmpdir(), 'xerb-reaper-'));
 const CONFIG_PATH = path.join(scratchDir, 'projects.json');
 
 // Rewrite the registry to a SINGLE project on `host`, so reapIdle only ever sees
@@ -43,7 +43,7 @@ function writeConfig({ host, port = 0, idleTimeoutMs = 50, connectionHardCapMs =
 
 // Seed a valid file so the import-time boot path (if any) has something to read.
 writeConfig({ host: 'seed', port: 0 });
-process.env.LAZYDEV_CONFIG = CONFIG_PATH;
+process.env.XERB_CONFIG = CONFIG_PATH;
 
 const {
   createDaemonServer,
@@ -54,7 +54,7 @@ const {
   __setLastAccessForTest,
   __liveConnInfo,
   __setResolvePidCwd,
-} = await import('../lazydev.mjs');
+} = await import('../xerb.mjs');
 
 // The adopt-path tests here point projects at fake dev servers whose real cwd is
 // the test runner's, not the project dir — which the cwd-verified adoption added
@@ -128,7 +128,7 @@ function httpGetThrough(daemonPort, host, pathname = '/', { agent, keepAlive = f
 
 // GET the daemon's control-plane status JSON.
 function statusThrough(daemonPort) {
-  return httpGetThrough(daemonPort, 'lazydev', '/__lazydev/status').then((r) => JSON.parse(r.body));
+  return httpGetThrough(daemonPort, 'xerb', '/__xerb/status').then((r) => JSON.parse(r.body));
 }
 
 // Find a project's live state in a status payload.
@@ -246,7 +246,7 @@ test('an open HMR socket with recent bytes survives the idle timeout (criterion 
   const status = await statusThrough(port);
   const p = findProject(status, host);
   assert.equal(p.state, 'running', 'project with a live socket must survive the idle timeout');
-  assert.equal(p.owned, true, 'still owned by lazydev');
+  assert.equal(p.owned, true, 'still owned by xerb');
   let dead = false;
   try {
     process.kill(child.pid, 0);
@@ -348,7 +348,7 @@ test('an adopted / external project is never reaped (criterion 4)', async (t) =>
     await sleep(50);
   }
   assert.equal(p.state, 'running', 'adopted server should be running');
-  assert.equal(p.owned, false, 'adopted server is not owned by lazydev');
+  assert.equal(p.owned, false, 'adopted server is not owned by xerb');
 
   // Once adopted, a real GET proxies straight through to the fake dev server.
   const res = await httpGetThrough(port, host);

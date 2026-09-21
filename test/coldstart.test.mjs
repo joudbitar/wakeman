@@ -6,8 +6,8 @@
 // a start that never opens the port surfaces its failure, and N concurrent hits
 // still spawn exactly one child. Pure node:test + node:assert, zero deps.
 //
-// LAZYDEV_CONFIG is read at module load (CONFIG_PATH, captured once), so we set
-// it and write the temp registry BEFORE the dynamic import of ../lazydev.mjs,
+// XERB_CONFIG is read at module load (CONFIG_PATH, captured once), so we set
+// it and write the temp registry BEFORE the dynamic import of ../xerb.mjs,
 // then call the exported loadConfig() explicitly (the daemon only auto-loads
 // under RUN_AS_MAIN, which a test import deliberately skips).
 
@@ -21,7 +21,7 @@ import path from 'node:path';
 
 // --- temp registry + import (must precede importing the module) -------------
 
-const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'lazydev-coldstart-'));
+const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'xerb-coldstart-'));
 const configPath = path.join(tmpDir, 'projects.json');
 // A node_modules dir makes ensureUp skip the install step for every project that
 // uses tmpDir as its cwd — so the tests never shell out to a real `npm install`
@@ -36,7 +36,7 @@ function writeConfig(cfg) {
 }
 writeConfig({ port: 0, projects: [] });
 
-process.env.LAZYDEV_CONFIG = configPath;
+process.env.XERB_CONFIG = configPath;
 
 const {
   createDaemonServer,
@@ -49,7 +49,7 @@ const {
   stop,
   upstreamAgent,
   __setResolvePidCwd,
-} = await import('../lazydev.mjs');
+} = await import('../xerb.mjs');
 
 // These tests adopt fake HTTP servers whose real working directory is the test
 // runner's cwd, not the project dir. Under the cwd-verified adoption added later,
@@ -316,7 +316,7 @@ test('failed start surfaces the reason + log tail in the status page', async (t)
   assert.equal(res.status, 200, 'retry nav -> 200 status page');
   assert.doesNotMatch(res.body, /failed to start/i, 'retry does not immediately re-show the failure page');
   assert.match(res.body, /being turned on/i, 'retry shows the wake page while bring-up runs');
-  assert.match(res.body, /__lazydev\/tail/, 'wake page wires up the terminal panel');
+  assert.match(res.body, /__xerb\/tail/, 'wake page wires up the terminal panel');
 
   // Settle the re-kicked attempt now (config is still 300ms here) so it times
   // out fast and doesn't run under a later test's larger startTimeout.
@@ -331,7 +331,7 @@ test('N concurrent cold hits spawn exactly one child', async (t) => {
   // shared tmpDir (which other tests mutate). startCmd is a node one-liner that
   // (a) appends a unique line to a marker file on boot and (b) listens on the
   // project port, so we can count how many children actually launched.
-  const projDir = fs.mkdtempSync(path.join(os.tmpdir(), 'lazydev-spawn-'));
+  const projDir = fs.mkdtempSync(path.join(os.tmpdir(), 'xerb-spawn-'));
   fs.mkdirSync(path.join(projDir, 'node_modules'), { recursive: true }); // skip install
   const markerFile = path.join(projDir, 'boot-marker.txt');
 
@@ -385,7 +385,7 @@ test('N concurrent cold hits spawn exactly one child', async (t) => {
   // And no second listener collided on the port (EADDRINUSE would appear if a
   // second child had raced the first).
   const logTail = (() => {
-    try { return fs.readFileSync(path.join(path.dirname(new URL('../lazydev.mjs', import.meta.url).pathname), 'logs', 'spawn.log'), 'utf8'); } catch { return ''; }
+    try { return fs.readFileSync(path.join(path.dirname(new URL('../xerb.mjs', import.meta.url).pathname), 'logs', 'spawn.log'), 'utf8'); } catch { return ''; }
   })();
   assert.doesNotMatch(logTail, /EADDRINUSE/, 'no port collision in the child log');
 });

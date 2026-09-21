@@ -1,9 +1,9 @@
 #!/usr/bin/env node
-// lazydev REGISTRY scanner.
+// xerb REGISTRY scanner.
 // Scans scanRoots (default ~) for projects whose start command is provable
 // from marker files alone — Node with a `dev` script, Rails apps, Django with
 // a visible interpreter, static folders that are their own repo — and
-// writes/merges projects.json per the lazydev BUILD CONTRACT (SPEC.md).
+// writes/merges projects.json per the xerb BUILD CONTRACT (SPEC.md).
 // On an interactive run, newly found projects go through a picker first:
 // registering is a choice, and a "no" is remembered in scanDeclined so a
 // rescan never nags about the same directory twice.
@@ -25,10 +25,10 @@ const HOME = os.homedir();
 // not a hardcoded ~/.config path, so the project is relocatable. HOME below is
 // still the directory tree we SCAN for projects.
 //
-// When LAZYDEV_STATE_DIR is set (the npx entrypoint sets it), the registry is
+// When XERB_STATE_DIR is set (the npx entrypoint sets it), the registry is
 // written into that state dir instead, so scan and the daemon agree on ONE
 // location. preferXdg stays false: a bare `node scan.mjs` with no state dir
-// keeps the existing next-to-script layout. The per-path LAZYDEV_CONFIG override
+// keeps the existing next-to-script layout. The per-path XERB_CONFIG override
 // still wins, matching the daemon's own resolution.
 const CONFIG_DIR = import.meta.dirname;
 const STATE_DIR = resolveStateDir({ env: process.env, home: HOME, scriptDir: CONFIG_DIR, preferXdg: false });
@@ -40,14 +40,14 @@ const tilde = (p) => p.replace(HOME, '~');
 const ui = makeStyler({ isTTY: process.stdout.isTTY, env: process.env });
 
 // The picker runs when a human is at both ends of the terminal. Pipes, CI,
-// and callers who asked for everything (`--all`, or LAZYDEV_SCAN_ALL=1 — the
-// entrypoint sets it for `lazydev --yes`, which promised no prompts) keep the
+// and callers who asked for everything (`--all`, or XERB_SCAN_ALL=1 — the
+// entrypoint sets it for `xerb --yes`, which promised no prompts) keep the
 // old register-everything behavior.
 const PICK =
   process.stdin.isTTY === true &&
   process.stdout.isTTY === true &&
   !process.argv.includes('--all') &&
-  process.env.LAZYDEV_SCAN_ALL !== '1';
+  process.env.XERB_SCAN_ALL !== '1';
 
 // Heavy / irrelevant dirs we never descend into.
 const SKIP = new Set([
@@ -59,7 +59,7 @@ const SKIP = new Set([
 ]);
 
 // Host name we must never emit (the daemon owns it).
-const RESERVED_HOST = 'lazydev';
+const RESERVED_HOST = 'xerb';
 
 const POOL_START = 3010;
 const POOL_STEP = 10;
@@ -265,11 +265,11 @@ mkdirSync(OUT_DIR, { recursive: true });
 writeFileSync(OUT, JSON.stringify(out, null, 2) + '\n');
 
 // ---------------------------------------------------------------------------
-// 7. Report. LAZYDEV_SCAN_QUIET=1 (set by the npx entrypoint, which prints its
+// 7. Report. XERB_SCAN_QUIET=1 (set by the npx entrypoint, which prints its
 //    own banner from the registry) skips the table; a direct `node scan.mjs`
-//    or `lazydev scan` keeps it.
+//    or `xerb scan` keeps it.
 // ---------------------------------------------------------------------------
-if (process.env.LAZYDEV_SCAN_QUIET === '1') process.exit(0);
+if (process.env.XERB_SCAN_QUIET === '1') process.exit(0);
 
 const rowsOut = [...projects].sort((a, b) => a.port - b.port);
 const w = {

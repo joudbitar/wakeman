@@ -4,7 +4,7 @@
 // What is asserted here is everything a browser would need before it could draw
 // a terminal, checked without one:
 //
-//   - GET /__lazydev/vendor/<file> serves the three checked-in files with their
+//   - GET /__xerb/vendor/<file> serves the three checked-in files with their
 //     content type and a long cache header, and revalidates on the ETag.
 //   - the same route 404s anything that is not a plain name in lib/vendor/,
 //     including the percent-encoded traversal the URL parser does NOT normalize
@@ -19,8 +19,8 @@
 //     exactly where a lost backslash hides, and the repo owner checks the UI
 //     himself: this is the check a browser would otherwise be needed for.
 //
-// LAZYDEV_CONFIG and friends are set at module load, BEFORE the dynamic import
-// of ../lazydev.mjs, so the daemon reads this file's throwaway state dir.
+// XERB_CONFIG and friends are set at module load, BEFORE the dynamic import
+// of ../xerb.mjs, so the daemon reads this file's throwaway state dir.
 // Nothing here starts a dev server: every assertion is about bytes the daemon
 // serves, and the rows render from the registry alone.
 
@@ -36,9 +36,9 @@ import { fileURLToPath } from 'node:url';
 
 // --- fixtures ---------------------------------------------------------------
 
-const ROOT = path.dirname(fileURLToPath(new URL('../lazydev.mjs', import.meta.url)));
+const ROOT = path.dirname(fileURLToPath(new URL('../xerb.mjs', import.meta.url)));
 const VENDOR_DIR = path.join(ROOT, 'lib', 'vendor');
-const TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'lazydev-vendor-'));
+const TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'xerb-vendor-'));
 const CONFIG_PATH = path.join(TMP, 'projects.json');
 
 function projectDir(name) {
@@ -79,11 +79,11 @@ fs.writeFileSync(
   ) + '\n'
 );
 
-process.env.LAZYDEV_CONFIG = CONFIG_PATH;
-process.env.LAZYDEV_CONTROL_TOKEN_PATH = path.join(TMP, 'control-token');
-process.env.LAZYDEV_LOGS_DIR = path.join(TMP, 'logs');
+process.env.XERB_CONFIG = CONFIG_PATH;
+process.env.XERB_CONTROL_TOKEN_PATH = path.join(TMP, 'control-token');
+process.env.XERB_LOGS_DIR = path.join(TMP, 'logs');
 
-const { createDaemonServer, loadConfig, ensureControlToken } = await import('../lazydev.mjs');
+const { createDaemonServer, loadConfig, ensureControlToken } = await import('../xerb.mjs');
 
 // --- plumbing ---------------------------------------------------------------
 
@@ -96,7 +96,7 @@ function listen(server) {
 
 // Raw path on purpose: http.request does not re-encode what it is handed, so a
 // test can ask for `..%2Ffoo` and have the daemon see exactly that.
-function req(port, pathname, { host = 'lazydev.localhost', headers = {} } = {}) {
+function req(port, pathname, { host = 'xerb.localhost', headers = {} } = {}) {
   return new Promise((resolve, reject) => {
     const r = http.request({ host: '127.0.0.1', port, path: pathname, headers: { host, ...headers } }, (res) => {
       const chunks = [];
@@ -156,7 +156,7 @@ test('the vendor route serves each file with a long cache header', async () => {
     'xterm.css': 'text/css',
   };
   for (const [name, type] of Object.entries(expect)) {
-    const res = await req(port, `/__lazydev/vendor/${name}`);
+    const res = await req(port, `/__xerb/vendor/${name}`);
     assert.equal(res.status, 200, name);
     assert.match(res.headers['content-type'], new RegExp(type));
     // Long, and public: these bytes only change when someone runs vendor.sh.
@@ -170,10 +170,10 @@ test('the vendor route serves each file with a long cache header', async () => {
 });
 
 test('a cached tab revalidates on the ETag instead of refetching 300 KB', async () => {
-  const first = await req(port, '/__lazydev/vendor/xterm.js');
+  const first = await req(port, '/__xerb/vendor/xterm.js');
   const etag = first.headers.etag;
   assert.ok(etag, 'no ETag on the vendor response');
-  const second = await req(port, '/__lazydev/vendor/xterm.js', { headers: { 'if-none-match': etag } });
+  const second = await req(port, '/__xerb/vendor/xterm.js', { headers: { 'if-none-match': etag } });
   assert.equal(second.status, 304);
   assert.equal(second.body.length, 0);
 });
@@ -182,13 +182,13 @@ test('the vendor route 404s anything outside lib/vendor/', async () => {
   // `..%2F` survives the URL parser (it normalizes `..` segments, not an
   // encoded slash), so this is the traversal that actually reaches the handler.
   const outside = [
-    '/__lazydev/vendor/..%2Fpty.py',
-    '/__lazydev/vendor/..%2F..%2Fpackage.json',
-    '/__lazydev/vendor/%2Fetc%2Fpasswd',
-    '/__lazydev/vendor/pty.py', // a real file, one directory up, right extension shape
-    '/__lazydev/vendor/nope.js',
-    '/__lazydev/vendor/VERSIONS', // served by neither type: this is a note to a human
-    '/__lazydev/vendor/',
+    '/__xerb/vendor/..%2Fpty.py',
+    '/__xerb/vendor/..%2F..%2Fpackage.json',
+    '/__xerb/vendor/%2Fetc%2Fpasswd',
+    '/__xerb/vendor/pty.py', // a real file, one directory up, right extension shape
+    '/__xerb/vendor/nope.js',
+    '/__xerb/vendor/VERSIONS', // served by neither type: this is a note to a human
+    '/__xerb/vendor/',
   ];
   for (const pathname of outside) {
     const res = await req(port, pathname);
@@ -217,7 +217,7 @@ test('the dashboard carries the terminal panel', async () => {
   // openTerm opens a panel now. The old no-op said so in its own comment.
   assert.ok(!/section 6: open the row's terminal panel/.test(html), 'openTerm is still the no-op');
   assert.match(html, /function openTerm\(el\)/);
-  assert.match(html, /openLazydevTerm\(/);
+  assert.match(html, /openXerbTerm\(/);
   assert.match(html, /loadTermVendor\(\)/);
 
   // The panel's own markup and header buttons.
@@ -229,10 +229,10 @@ test('the dashboard carries the terminal panel', async () => {
   assert.match(html, /window\.open\('\/term\/' \+ encodeURIComponent\(host\)/);
 
   // The vendored files it loads, and the socket it opens.
-  assert.match(html, /\/__lazydev\/vendor\/xterm\.js/);
-  assert.match(html, /\/__lazydev\/vendor\/xterm\.css/);
-  assert.match(html, /\/__lazydev\/vendor\/addon-fit\.js/);
-  assert.match(html, /'\/__lazydev\/term\/' \+ encodeURIComponent\(host\)/);
+  assert.match(html, /\/__xerb\/vendor\/xterm\.js/);
+  assert.match(html, /\/__xerb\/vendor\/xterm\.css/);
+  assert.match(html, /\/__xerb\/vendor\/addon-fit\.js/);
+  assert.match(html, /'\/__xerb\/term\/' \+ encodeURIComponent\(host\)/);
 
   // Dark regardless of the page theme (spec section 6's stated default): the
   // panel paints its own background instead of inheriting the page's.
@@ -248,7 +248,7 @@ test('GET /term/<host> is that project and nothing else', async () => {
   const html = res.body.toString('utf8');
   assert.match(html, /<title>alpha — terminal<\/title>/);
   assert.match(html, /id="termbox"/);
-  assert.match(html, /\/__lazydev\/vendor\/xterm\.js/);
+  assert.match(html, /\/__xerb\/vendor\/xterm\.js/);
   assert.match(html, /const HOST = "alpha"/);
   assert.ok(!html.includes('"beta"'), 'the pop-out page mentions another project');
   // Its own token, same as the dashboard's: the term socket takes it as the
@@ -265,7 +265,7 @@ test('GET /term/<unknown> is a 404 with the way back', async () => {
   assert.equal(res.status, 404);
   const html = res.body.toString('utf8');
   assert.match(html, /No project registered as/);
-  assert.match(html, /lazydev dashboard/);
+  assert.match(html, /xerb dashboard/);
 });
 
 // --- the part a browser would otherwise have to prove ------------------------
@@ -281,6 +281,6 @@ test('the inline scripts on both pages parse', async () => {
       assert.doesNotThrow(() => new Function(src), `${pathname} script ${i} does not parse`);
     }
     // The terminal client is on both pages, from the one copy of it.
-    assert.ok(scripts.some((s) => s.includes('function openLazydevTerm(')), `${pathname} is missing the terminal client`);
+    assert.ok(scripts.some((s) => s.includes('function openXerbTerm(')), `${pathname} is missing the terminal client`);
   }
 });

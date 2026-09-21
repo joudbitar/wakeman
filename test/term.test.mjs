@@ -21,8 +21,8 @@
 // term socket is refused anywhere but the control plane, and that is half of
 // what is being asserted here.
 //
-// LAZYDEV_CONFIG and friends are set at module load, BEFORE the dynamic import
-// of ../lazydev.mjs, so the daemon reads this file's throwaway state dir.
+// XERB_CONFIG and friends are set at module load, BEFORE the dynamic import
+// of ../xerb.mjs, so the daemon reads this file's throwaway state dir.
 
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
@@ -38,8 +38,8 @@ import { fileURLToPath } from 'node:url';
 
 // --- fixtures ---------------------------------------------------------------
 
-const ROOT = path.dirname(fileURLToPath(new URL('../lazydev.mjs', import.meta.url)));
-const TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'lazydev-term-'));
+const ROOT = path.dirname(fileURLToPath(new URL('../xerb.mjs', import.meta.url)));
+const TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'xerb-term-'));
 const CONFIG_PATH = path.join(TMP, 'projects.json');
 const LOGS = path.join(TMP, 'logs');
 
@@ -130,9 +130,9 @@ fs.writeFileSync(
   ) + '\n'
 );
 
-process.env.LAZYDEV_CONFIG = CONFIG_PATH;
-process.env.LAZYDEV_CONTROL_TOKEN_PATH = path.join(TMP, 'control-token');
-process.env.LAZYDEV_LOGS_DIR = LOGS;
+process.env.XERB_CONFIG = CONFIG_PATH;
+process.env.XERB_CONTROL_TOKEN_PATH = path.join(TMP, 'control-token');
+process.env.XERB_LOGS_DIR = LOGS;
 
 const {
   createDaemonServer,
@@ -147,7 +147,7 @@ const {
   NO_PTY_NOTE,
   termRingBytes,
   upstreamAgent,
-} = await import('../lazydev.mjs');
+} = await import('../xerb.mjs');
 
 // --- a WebSocket client that lets the test choose the Host header ------------
 
@@ -197,7 +197,7 @@ function parseFrames(buf) {
 
 // Open a term socket. Resolves as soon as the response head is parsed, so a
 // refusal is inspected the same way a 101 is.
-async function termSocket(port, host, { token, path: pathname = '/__lazydev/term/readback' } = {}) {
+async function termSocket(port, host, { token, path: pathname = '/__xerb/term/readback' } = {}) {
   const socket = net.connect(port, '127.0.0.1');
   await once(socket, 'connect');
   const key = crypto.randomBytes(16).toString('base64');
@@ -287,9 +287,9 @@ function listen(server) {
   });
 }
 
-function req(port, pathname, { method = 'GET', host = 'lazydev.localhost', token } = {}) {
+function req(port, pathname, { method = 'GET', host = 'xerb.localhost', token } = {}) {
   const headers = { host, 'content-type': 'application/json' };
-  if (token) headers['x-lazydev-token'] = token;
+  if (token) headers['x-xerb-token'] = token;
   return new Promise((resolve, reject) => {
     const r = http.request({ host: '127.0.0.1', port, method, path: pathname, headers }, (res) => {
       let text = '';
@@ -366,8 +366,8 @@ after(() => {
 
 test('the term socket refuses no token, a wrong token, and the wrong host', async () => {
   const cases = [
-    ['no token at all', { token: undefined, host: 'lazydev.localhost' }],
-    ['a wrong token', { token: 'deadbeef', host: 'lazydev.localhost' }],
+    ['no token at all', { token: undefined, host: 'xerb.localhost' }],
+    ['a wrong token', { token: 'deadbeef', host: 'xerb.localhost' }],
     // The real token, asked for on a project's own host: a page a dev server
     // serves must not be able to open anybody's terminal.
     ['the right token on a project host', { token: () => token, host: 'readback.localhost' }],
@@ -383,7 +383,7 @@ test('the term socket refuses no token, a wrong token, and the wrong host', asyn
   }
 
   // A valid token for a host that is not registered is a 404, not a terminal.
-  const unknown = await termSocket(daemonPort, 'lazydev.localhost', { token, path: '/__lazydev/term/ghost' });
+  const unknown = await termSocket(daemonPort, 'xerb.localhost', { token, path: '/__xerb/term/ghost' });
   assert.equal(unknown.status, 404);
   await unknown.closed;
 });
@@ -391,7 +391,7 @@ test('the term socket refuses no token, a wrong token, and the wrong host', asyn
 // --- the acceptance test the spec words -------------------------------------
 
 test('typing into the term socket reaches the dev server, and then its port comes up', { skip: NO_PTY }, async (t) => {
-  const ws = await termSocket(daemonPort, 'lazydev.localhost', { token });
+  const ws = await termSocket(daemonPort, 'xerb.localhost', { token });
   t.after(() => {
     ws.close();
     stop('readback', 'test');
@@ -430,14 +430,14 @@ test('typing into the term socket reaches the dev server, and then its port come
   await waitFor(() => getRuntime('readback').state === 'running', 5000, 'state running');
 
   // <host>.log keeps the plain-text copy: same output, escapes stripped, CRLF
-  // from the tty folded back to newlines, so `lazydev logs` and grep still work.
+  // from the tty folded back to newlines, so `xerb logs` and grep still work.
   const text = logFor('readback');
   assert.ok(text.split('\n').includes('got hello'), `log should hold a clean line: ${JSON.stringify(text)}`);
   assert.doesNotMatch(text, /\r/, 'no carriage returns survive into the log');
   assert.doesNotMatch(text, /\u001b/, 'no escape sequences survive into the log');
 
   // A second panel opens on the scrollback: the first frame is the ring buffer.
-  const second = await termSocket(daemonPort, 'lazydev.localhost', { token });
+  const second = await termSocket(daemonPort, 'xerb.localhost', { token });
   t.after(() => second.close());
   assert.equal(second.status, 101);
   await second.waitForText('got hello', 5000);
@@ -450,7 +450,7 @@ test('an open terminal counts as an active connection, so the project does not s
   // Its own project: this one is about the reaper, and a project another test
   // has already started and stopped could be re-ADOPTED here (owned=false),
   // which the reaper skips for a reason that has nothing to do with terminals.
-  const ws = await termSocket(daemonPort, 'lazydev.localhost', { token, path: '/__lazydev/term/watched' });
+  const ws = await termSocket(daemonPort, 'xerb.localhost', { token, path: '/__xerb/term/watched' });
   t.after(() => {
     ws.close();
     stop('watched', 'test');
@@ -476,7 +476,7 @@ test('an open terminal counts as an active connection, so the project does not s
 // --- the ring buffer --------------------------------------------------------
 
 test('the ring keeps 256 KB of raw output while the log keeps the plain copy', { skip: NO_PTY }, async (t) => {
-  const ws = await termSocket(daemonPort, 'lazydev.localhost', { token, path: '/__lazydev/term/chatty' });
+  const ws = await termSocket(daemonPort, 'xerb.localhost', { token, path: '/__xerb/term/chatty' });
   t.after(() => {
     ws.close();
     stop('chatty', 'test');
@@ -492,7 +492,7 @@ test('the ring keeps 256 KB of raw output while the log keeps the plain copy', {
   assert.ok(ring.toString('utf8').includes('\u001b[31mred\u001b[0m'), 'ANSI survives in the ring');
 
   // The log is the same output with the escapes taken out, which is what makes
-  // `lazydev logs` and grep usable.
+  // `xerb logs` and grep usable.
   const text = logFor('chatty');
   assert.match(text, /red/);
   assert.doesNotMatch(text, /\u001b/, 'no escapes in the log');
@@ -502,7 +502,7 @@ test('the ring keeps 256 KB of raw output while the log keeps the plain copy', {
 // --- restart with a panel open ----------------------------------------------
 
 test('restart from an open panel gives a new pid and a new separator', { skip: NO_PTY }, async (t) => {
-  const ws = await termSocket(daemonPort, 'lazydev.localhost', { token, path: '/__lazydev/term/restarter' });
+  const ws = await termSocket(daemonPort, 'xerb.localhost', { token, path: '/__xerb/term/restarter' });
   t.after(() => {
     ws.close();
     stop('restarter', 'test');
@@ -514,7 +514,7 @@ test('restart from an open panel gives a new pid and a new separator', { skip: N
   assert.ok(firstPid);
   assert.equal(separators('restarter'), 1, 'one start, one separator');
 
-  const res = await req(daemonPort, '/__lazydev/restart/restarter', { method: 'POST', token });
+  const res = await req(daemonPort, '/__xerb/restart/restarter', { method: 'POST', token });
   assert.equal(res.status, 200, res.body);
   assert.equal(res.json.ok, true);
 
@@ -555,7 +555,7 @@ test('with no python3 the panel is read-only, says so, and status carries the li
   const bootScript = path.join(TMP, 'nopy-daemon.mjs');
   fs.writeFileSync(
     bootScript,
-    `import { createDaemonServer, loadConfig, ensureControlToken } from ${JSON.stringify(path.join(ROOT, 'lazydev.mjs'))};\n` +
+    `import { createDaemonServer, loadConfig, ensureControlToken } from ${JSON.stringify(path.join(ROOT, 'xerb.mjs'))};\n` +
       `loadConfig('test:nopy');\n` +
       `const token = ensureControlToken();\n` +
       `const srv = createDaemonServer();\n` +
@@ -565,12 +565,12 @@ test('with no python3 the panel is read-only, says so, and status carries the li
   const child = spawn(process.execPath, [bootScript], {
     env: {
       ...process.env,
-      LAZYDEV_CONFIG: configPath,
-      LAZYDEV_LOGS_DIR: logsDir,
-      LAZYDEV_CONTROL_TOKEN_PATH: path.join(TMP, 'nopy-token'),
+      XERB_CONFIG: configPath,
+      XERB_LOGS_DIR: logsDir,
+      XERB_CONTROL_TOKEN_PATH: path.join(TMP, 'nopy-token'),
       // The switch that makes this machine look like one without python3.
-      LAZYDEV_PYTHON: '',
-      LAZYDEV_QUIET: '1',
+      XERB_PYTHON: '',
+      XERB_QUIET: '1',
     },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
@@ -588,11 +588,11 @@ test('with no python3 the panel is read-only, says so, and status carries the li
     setTimeout(() => reject(new Error('the no-python daemon never printed its port')), 10_000).unref();
   });
 
-  const status = await req(boot.port, '/__lazydev/status');
+  const status = await req(boot.port, '/__xerb/status');
   assert.equal(status.json.pty.available, false, 'no interpreter, no pty');
-  assert.equal(status.json.pty.note, NO_PTY_NOTE, 'the one line `lazydev status` prints');
+  assert.equal(status.json.pty.note, NO_PTY_NOTE, 'the one line `xerb status` prints');
 
-  const ws = await termSocket(boot.port, 'lazydev.localhost', { token: boot.token, path: '/__lazydev/term/nopy' });
+  const ws = await termSocket(boot.port, 'xerb.localhost', { token: boot.token, path: '/__xerb/term/nopy' });
   assert.equal(ws.status, 101);
   // One line, at the top of the panel, before anything the dev server said.
   assert.ok(ws.frames[0].includes(NO_PTY_NOTE), `first frame should carry the note: ${JSON.stringify(ws.frames[0])}`);
@@ -607,22 +607,22 @@ test('with no python3 the panel is read-only, says so, and status carries the li
   assert.doesNotMatch(ws.text, /this goes nowhere/, 'nothing typed is echoed: there is no tty to type into');
 
   // The other half of spec section 6's sentence: the panel says it in one line
-  // at the top, and `lazydev status` prints the same line once. The daemon has
+  // at the top, and `xerb status` prints the same line once. The daemon has
   // shipped `pty.note` for a while; this is the CLI actually printing it.
-  const cli = spawnSync(process.execPath, [path.join(ROOT, 'bin', 'lazydev.mjs'), 'status'], {
+  const cli = spawnSync(process.execPath, [path.join(ROOT, 'bin', 'xerb.mjs'), 'status'], {
     env: {
       ...process.env,
-      LAZYDEV_PORT: String(boot.port),
-      LAZYDEV_FALLBACK_PORT: String(boot.port),
-      LAZYDEV_STATE_DIR: TMP,
-      LAZYDEV_CONFIG: configPath,
-      LAZYDEV_CONTROL_TOKEN_PATH: path.join(TMP, 'nopy-token'),
+      XERB_PORT: String(boot.port),
+      XERB_FALLBACK_PORT: String(boot.port),
+      XERB_STATE_DIR: TMP,
+      XERB_CONFIG: configPath,
+      XERB_CONTROL_TOKEN_PATH: path.join(TMP, 'nopy-token'),
       NO_COLOR: '1',
     },
     encoding: 'utf8',
     timeout: 20_000,
   });
-  assert.equal(cli.status, 0, `lazydev status: ${cli.stderr}`);
+  assert.equal(cli.status, 0, `xerb status: ${cli.stderr}`);
   assert.ok(cli.stdout.includes(NO_PTY_NOTE), `status prints the read-only line: ${JSON.stringify(cli.stdout)}`);
   assert.equal(
     cli.stdout.split(NO_PTY_NOTE).length - 1,
@@ -631,7 +631,7 @@ test('with no python3 the panel is read-only, says so, and status carries the li
   );
 
   // Leave nothing running behind this test's own daemon.
-  await req(boot.port, '/__lazydev/stop/nopy', { method: 'POST', token: boot.token });
+  await req(boot.port, '/__xerb/stop/nopy', { method: 'POST', token: boot.token });
   ws.close();
 });
 

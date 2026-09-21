@@ -12,7 +12,7 @@ import http from 'node:http';
 import net from 'node:net';
 import os from 'node:os';
 
-import { createDaemonServer, isLoopbackAddress } from '../lazydev.mjs';
+import { createDaemonServer, isLoopbackAddress } from '../xerb.mjs';
 
 // First non-internal IPv4 on this machine, or null if the box has none.
 function lanIPv4() {

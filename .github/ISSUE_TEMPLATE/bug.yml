@@ -12,9 +12,9 @@ body:
   - type: dropdown
     id: mode
     attributes:
-      label: How are you running lazydev
+      label: How are you running xerb
       options:
-        - npx @jbitar/lazydev / installed lazydev (background service)
+        - npx xerb / installed xerb (background service)
         - a checkout run in place (the dev install)
         - other
     validations:
@@ -36,5 +36,5 @@ body:
     id: logs
     attributes:
       label: Relevant log lines
-      description: "npx path: ~/.local/state/lazydev/logs. Installed path: logs/ inside the checkout, or `lazydev logs <project>`."
+      description: "npx path: ~/.local/state/xerb/logs. Installed path: logs/ inside the checkout, or `xerb logs <project>`."
       render: text

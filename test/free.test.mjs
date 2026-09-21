@@ -1,8 +1,8 @@
 // Free-the-port tests: the conflict page's call to action.
 //
-// A conflicted project's port can be freed two ways: POST /__lazydev/free
+// A conflicted project's port can be freed two ways: POST /__xerb/free
 // (tokenless, same-origin, scoped to the host the request arrived on — the
-// conflict page's button) and POST /__lazydev/free/<host> (token-gated — the
+// conflict page's button) and POST /__xerb/free/<host> (token-gated — the
 // dashboard's button). Both funnel into freePort, which only ever signals a
 // listener whose cwd mismatches the project, re-verified at action time. These
 // tests prove the kill path end-to-end against a real daemon and a real fake
@@ -18,12 +18,12 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
-// LAZYDEV_CONFIG is read at module load, so the temp registry must exist and the
-// env var must point at it BEFORE importing lazydev.mjs.
-const TMP_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), 'lazydev-free-'));
+// XERB_CONFIG is read at module load, so the temp registry must exist and the
+// env var must point at it BEFORE importing xerb.mjs.
+const TMP_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), 'xerb-free-'));
 const CONFIG_PATH = path.join(TMP_ROOT, 'projects.json');
 // A real directory for the matching-cwd case (sameDir realpaths its inputs).
-const PROJECT_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'lazydev-projdir-'));
+const PROJECT_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'xerb-projdir-'));
 
 function writeRegistry(port, dir) {
   const registry = {
@@ -36,10 +36,10 @@ function writeRegistry(port, dir) {
 }
 
 writeRegistry(0, PROJECT_DIR);
-process.env.LAZYDEV_CONFIG = CONFIG_PATH;
-process.env.LAZYDEV_CONTROL_TOKEN_PATH = path.join(TMP_ROOT, 'control-token');
+process.env.XERB_CONFIG = CONFIG_PATH;
+process.env.XERB_CONTROL_TOKEN_PATH = path.join(TMP_ROOT, 'control-token');
 // Contain any accidental spawn's log writes to the temp dir.
-process.env.LAZYDEV_LOGS_DIR = path.join(TMP_ROOT, 'logs');
+process.env.XERB_LOGS_DIR = path.join(TMP_ROOT, 'logs');
 
 const {
   createDaemonServer,
@@ -49,7 +49,7 @@ const {
   __setResolveListenerPid,
   __setKillForeign,
   __setRuntimeForTest,
-} = await import('../lazydev.mjs');
+} = await import('../xerb.mjs');
 
 function listen(server) {
   return new Promise((resolve, reject) => {
@@ -78,7 +78,7 @@ function httpGet(port, hostHeader, reqPath = '/') {
 // the tokenless same-origin path, the token-gated path, and the CSRF refusal.
 function httpPost(port, hostHeader, reqPath, { token, origin } = {}) {
   const headers = { host: hostHeader };
-  if (token) headers['x-lazydev-token'] = token;
+  if (token) headers['x-xerb-token'] = token;
   if (origin) headers.origin = origin;
   return new Promise((resolve, reject) => {
     const req = http.request(
@@ -132,7 +132,7 @@ afterEach(() => {
   });
 });
 
-test('A: tokenless POST /__lazydev/free on the project host kills the squatter and clears the conflict', async (t) => {
+test('A: tokenless POST /__xerb/free on the project host kills the squatter and clears the conflict', async (t) => {
   const fake = fakeListener();
   const fakePort = await listen(fake);
   writeRegistry(fakePort, '/some/project/dir');
@@ -156,14 +156,14 @@ test('A: tokenless POST /__lazydev/free on the project host kills the squatter a
   const nav = await httpGet(daemonPort, 'proj.localhost', '/');
   assert.equal(nav.status, 502, 'sanity: the mismatched listener is a conflict');
 
-  const res = await httpPost(daemonPort, 'proj.localhost', '/__lazydev/free');
+  const res = await httpPost(daemonPort, 'proj.localhost', '/__xerb/free');
   const j = JSON.parse(res.body);
   assert.equal(res.status, 200, `free should succeed, got ${res.status}: ${res.body}`);
   assert.equal(j.ok, true);
   assert.equal(j.freed, true, 'the squatter was actually signalled');
   assert.deepEqual(kills[0], [424242, 'SIGTERM'], 'SIGTERM to the resolved listener pid');
 
-  const status = await httpGet(daemonPort, 'lazydev.localhost', '/__lazydev/status');
+  const status = await httpGet(daemonPort, 'xerb.localhost', '/__xerb/status');
   const entry = JSON.parse(status.body).projects.find((p) => p.host === 'proj');
   assert.equal(entry.conflict, false, 'the conflict is cleared');
   assert.equal(entry.conflictDir, null, 'the foreign cwd is forgotten');
@@ -174,12 +174,12 @@ test('A: tokenless POST /__lazydev/free on the project host kills the squatter a
   // not exist, so the fresh attempt ends as dir-missing: a NEW failure, which
   // proves the old conflict no longer blocks the kick.
   await httpGet(daemonPort, 'proj.localhost', '/');
-  const status2 = await httpGet(daemonPort, 'lazydev.localhost', '/__lazydev/status');
+  const status2 = await httpGet(daemonPort, 'xerb.localhost', '/__xerb/status');
   const entry2 = JSON.parse(status2.body).projects.find((p) => p.host === 'proj');
   assert.equal(entry2.lastError && entry2.lastError.kind, 'dir-missing', 'bring-up ran again after the free');
 });
 
-test('B: a cross-origin POST /__lazydev/free is refused and nothing is killed', async (t) => {
+test('B: a cross-origin POST /__xerb/free is refused and nothing is killed', async (t) => {
   const fake = fakeListener();
   const fakePort = await listen(fake);
   writeRegistry(fakePort, '/some/project/dir');
@@ -196,14 +196,14 @@ test('B: a cross-origin POST /__lazydev/free is refused and nothing is killed', 
     await closeServer(fake);
   });
 
-  const res = await httpPost(daemonPort, 'proj.localhost', '/__lazydev/free', {
+  const res = await httpPost(daemonPort, 'proj.localhost', '/__xerb/free', {
     origin: 'http://evil.example',
   });
   assert.equal(res.status, 403, 'foreign Origin is refused');
   assert.equal(kills.length, 0, 'no signal was sent');
 });
 
-test('C: POST /__lazydev/free is scoped to the arrival host — the dashboard host has no project to free', async (t) => {
+test('C: POST /__xerb/free is scoped to the arrival host — the dashboard host has no project to free', async (t) => {
   const fake = fakeListener();
   const fakePort = await listen(fake);
   writeRegistry(fakePort, '/some/project/dir');
@@ -220,8 +220,8 @@ test('C: POST /__lazydev/free is scoped to the arrival host — the dashboard ho
     await closeServer(fake);
   });
 
-  const res = await httpPost(daemonPort, 'lazydev.localhost', '/__lazydev/free');
-  assert.equal(res.status, 404, 'lazydev.localhost names no project');
+  const res = await httpPost(daemonPort, 'xerb.localhost', '/__xerb/free');
+  assert.equal(res.status, 404, 'xerb.localhost names no project');
   assert.equal(kills.length, 0, 'no signal was sent');
 });
 
@@ -242,7 +242,7 @@ test('D: a listener that IS the project is never killed; the conflict clears for
     await closeServer(fake);
   });
 
-  const res = await httpPost(daemonPort, 'proj.localhost', '/__lazydev/free');
+  const res = await httpPost(daemonPort, 'proj.localhost', '/__xerb/free');
   const j = JSON.parse(res.body);
   assert.equal(res.status, 200);
   assert.equal(j.ok, true);
@@ -267,14 +267,14 @@ test('E: an unresolved cwd refuses to kill', async (t) => {
     await closeServer(fake);
   });
 
-  const res = await httpPost(daemonPort, 'proj.localhost', '/__lazydev/free');
+  const res = await httpPost(daemonPort, 'proj.localhost', '/__xerb/free');
   const j = JSON.parse(res.body);
   assert.equal(res.status, 409, 'refusal is a 409, not a success');
   assert.equal(j.ok, false);
   assert.equal(kills.length, 0, 'never kill what we cannot identify');
 });
 
-test('F: POST /__lazydev/free/<host> requires the token; with it, the guards still hold', async (t) => {
+test('F: POST /__xerb/free/<host> requires the token; with it, the guards still hold', async (t) => {
   const fake = fakeListener();
   const fakePort = await listen(fake);
   writeRegistry(fakePort, '/some/project/dir');
@@ -291,10 +291,10 @@ test('F: POST /__lazydev/free/<host> requires the token; with it, the guards sti
     await closeServer(fake);
   });
 
-  const noToken = await httpPost(daemonPort, 'lazydev.localhost', '/__lazydev/free/proj');
+  const noToken = await httpPost(daemonPort, 'xerb.localhost', '/__xerb/free/proj');
   assert.equal(noToken.status, 403, 'the per-host form is token-gated');
 
-  const withToken = await httpPost(daemonPort, 'lazydev.localhost', '/__lazydev/free/proj', {
+  const withToken = await httpPost(daemonPort, 'xerb.localhost', '/__xerb/free/proj', {
     token: ensureControlToken(),
   });
   const j = JSON.parse(withToken.body);

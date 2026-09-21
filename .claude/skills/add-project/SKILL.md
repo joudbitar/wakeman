@@ -1,11 +1,11 @@
 ---
 name: add-project
-description: Register any project with lazydev so it gets a permanent http://<name>.localhost URL with on-demand start and idle sleep. Use when the user asks to add or register a project with lazydev, when a project the scanner cannot detect (Flask, FastAPI, Go, docker-compose, a Django project without a visible interpreter, anything whose start command is not provable from its files) needs a URL, or when a registered project's entry is broken and needs fixing.
+description: Register any project with xerb so it gets a permanent http://<name>.localhost URL with on-demand start and idle sleep. Use when the user asks to add or register a project with xerb, when a project the scanner cannot detect (Flask, FastAPI, Go, docker-compose, a Django project without a visible interpreter, anything whose start command is not provable from its files) needs a URL, or when a registered project's entry is broken and needs fixing.
 ---
 
-# add a project to lazydev
+# add a project to xerb
 
-lazydev's scanner auto-detects the common cases. Everything else is one JSON
+xerb's scanner auto-detects the common cases. Everything else is one JSON
 entry in its registry, and you are the detection logic: read the project,
 work out how it serves HTTP, and register it. The bundled script does the
 mechanical part (find the registry, validate, pick a free port, write valid
@@ -16,11 +16,11 @@ All script paths below are relative to this skill directory.
 ## quick start
 
 ```bash
-# a static folder: $LAZYDEV_STATIC is a placeholder the daemon expands to
+# a static folder: $XERB_STATIC is a placeholder the daemon expands to
 # its own serve_static.py at spawn time, so the entry keeps working wherever
-# lazydev itself lives
+# xerb itself lives
 node scripts/registry.mjs add --host myblog --dir /abs/path/to/blog \
-  --start-cmd '$LAZYDEV_STATIC'
+  --start-cmd '$XERB_STATIC'
 
 # a Django app with a project venv
 node scripts/registry.mjs add --host crm --dir /abs/path/to/crm \
@@ -44,7 +44,7 @@ the registry file, so `add` is the whole deployment — no restart, no signal.
    spelled out (`.venv/bin/python`, `bin/rails`), never left to the shell.
    Per-ecosystem commands: [PORTS.md](PORTS.md).
 3. **Register.** `scripts/registry.mjs add` as above. Hosts are lowercase
-   `a-z0-9-`, unique, never `lazydev`; dirs are absolute. The script picks
+   `a-z0-9-`, unique, never `xerb`; dirs are absolute. The script picks
    the port unless you pass `--port`.
 4. **Verify.** `scripts/registry.mjs verify --host <host>` polls through the
    front door for up to two minutes; a 503 meanwhile is the cold-start page,
@@ -56,8 +56,8 @@ the registry file, so `add` is the whole deployment — no restart, no signal.
 
 ## facts you can rely on
 
-- Registry location: `$LAZYDEV_STATE_DIR/projects.json`, else
-  `~/.local/state/lazydev/projects.json`, else `projects.json` in the
+- Registry location: `$XERB_STATE_DIR/projects.json`, else
+  `~/.local/state/xerb/projects.json`, else `projects.json` in the
   checkout. The script resolves this; a running daemon's boot line in
   `<state-dir>/logs/daemon.log` says `config=<path>` if in doubt.
 - Rescans never clobber this entry: the merge preserves port, startCmd, and

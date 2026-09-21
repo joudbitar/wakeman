@@ -153,7 +153,7 @@ function drive(argv, env, keys, ready) {
 }
 
 test('q exits the whole run with one line, and never resolves', async () => {
-  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'lazydev-picker-'));
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'xerb-picker-'));
   const driver = path.join(tmp, 'driver.mjs');
   fs.writeFileSync(driver, `
 import { runPicker } from ${JSON.stringify(path.join(ROOT, 'lib', 'picker.mjs'))};
@@ -174,12 +174,12 @@ setTimeout(() => fake._fn(Buffer.from('q')), 10);
   const r = await drive([driver], { ...process.env, NO_COLOR: '1' }, '', 'READY');
   fs.rmSync(tmp, { recursive: true, force: true });
   assert.equal(r.code, CANCEL_EXIT, 'the run ends with the back-out code, not 0 or 130');
-  assert.match(r.out, /ok, nothing registered\. run `lazydev` again whenever\./);
+  assert.match(r.out, /ok, nothing registered\. run `xerb` again whenever\./);
   assert.ok(!r.out.includes('RESOLVED'), 'the caller never gets a value to carry on with');
 });
 
 test('q in a real scan writes no registry and remembers nothing', async () => {
-  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'lazydev-picker-scan-'));
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'xerb-picker-scan-'));
   const home = path.join(tmp, 'home');
   const state = path.join(tmp, 'state');
   fs.mkdirSync(state, { recursive: true });
@@ -203,7 +203,7 @@ process.stdin.setRawMode = () => {};
 
   const r = await drive(
     ['--import', `file://${stub}`, path.join(ROOT, 'scan.mjs')],
-    { ...process.env, HOME: home, LAZYDEV_STATE_DIR: state, NO_COLOR: '1' },
+    { ...process.env, HOME: home, XERB_STATE_DIR: state, NO_COLOR: '1' },
     'q',
     'siteapp'
   );

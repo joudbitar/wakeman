@@ -1,10 +1,10 @@
 #!/usr/bin/env node
-// lazydev entrypoint — the ONE way in.
+// xerb entrypoint — the ONE way in.
 //
-//   npx @jbitar/lazydev        first run: ask consent, scan ~, install the
+//   npx xerb        first run: ask consent, scan ~, install the
 //                              background service, print the URLs, exit
-//   lazydev                    (the installed command) rescan + refresh
-//   lazydev --help             the whole command table
+//   xerb                    (the installed command) rescan + refresh
+//   xerb --help             the whole command table
 //
 // Every run installs a user LaunchAgent (no sudo) so the URLs survive reboots;
 // the daemon serves :80 itself with a per-connection loopback guard (ADR 0002),
@@ -22,7 +22,7 @@
 // Nothing is ever written into a project directory. Everything lands in the
 // state dir (registry, logs, control token, the installed app copy) plus, when
 // installed, one plist in ~/Library/LaunchAgents and one symlink in
-// ~/.local/bin. `lazydev uninstall` removes all of it.
+// ~/.local/bin. `xerb uninstall` removes all of it.
 //
 // Zero npm dependencies — Node built-ins only.
 
@@ -43,12 +43,12 @@ import {
   setPort, renameEntry, pickPort, sanitizeHost, expandTilde, detectOne, startCmdFor,
   DETECTOR_EVIDENCE,
 } from '../lib/registry-cli.mjs';
-import { LAUNCHD_LABEL, assembleLaunchdPath, renderPlist, stripCaddyBlock, extractWorkingDirectory, toolsToVerify, parseLaunchdPid, waitForExit } from '../lib/install.mjs';
+import { LAUNCHD_LABEL, LEGACY_NAME, LEGACY_LAUNCHD_LABEL, assembleLaunchdPath, renderPlist, stripCaddyBlock, legacyRegistryCandidates, toolsToVerify, parseLaunchdPid, waitForExit } from '../lib/install.mjs';
 
 const ui = makeStyler({ isTTY: process.stdout.isTTY, env: process.env });
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
-const ROOT = path.resolve(HERE, '..'); // package root — where lazydev.mjs / scan.mjs live
+const ROOT = path.resolve(HERE, '..'); // package root — where xerb.mjs / scan.mjs live
 const SCANNER = path.join(ROOT, 'scan.mjs');
 
 const VERSION = (() => {
@@ -62,11 +62,11 @@ const VERSION = (() => {
 // The front-door port, and the numbered port to fall back to when :80 can't be
 // bound. Both overridable so the boot smoke test can force a non-privileged
 // port on CI (no :80 there).
-const FRONT_PORT = Number(process.env.LAZYDEV_PORT) || 80;
-const FALLBACK_PORT = Number(process.env.LAZYDEV_FALLBACK_PORT) || 4000;
+const FRONT_PORT = Number(process.env.XERB_PORT) || 80;
+const FALLBACK_PORT = Number(process.env.XERB_FALLBACK_PORT) || 4000;
 
-// Resolve ONE state directory: LAZYDEV_STATE_DIR wins, else the XDG state home
-// (preferXdg), else ~/.local/state/lazydev. Everything derives from it.
+// Resolve ONE state directory: XERB_STATE_DIR wins, else the XDG state home
+// (preferXdg), else ~/.local/state/xerb. Everything derives from it.
 const stateDir = resolveStateDir({
   env: process.env,
   home: os.homedir(),
@@ -76,16 +76,21 @@ const stateDir = resolveStateDir({
 const { configPath, logsDir, tokenPath } = resolveStatePaths({ env: process.env, stateDir });
 
 // Where the installed app copy lives: inside the state dir, so "everything
-// lazydev creates" stays one directory (plus the plist and the PATH symlink,
+// xerb creates" stays one directory (plus the plist and the PATH symlink,
 // which uninstall removes).
 const APP_DIR = path.join(stateDir, 'app');
 const PLIST_PATH = path.join(os.homedir(), 'Library', 'LaunchAgents', `${LAUNCHD_LABEL}.plist`);
-const CLI_LINK = path.join(os.homedir(), '.local', 'bin', 'lazydev');
+const CLI_LINK = path.join(os.homedir(), '.local', 'bin', 'xerb');
+
+// Where a pre-0.3.0 install (the lazydev name) left its three traces.
+const LEGACY_PLIST_PATH = path.join(os.homedir(), 'Library', 'LaunchAgents', `${LEGACY_LAUNCHD_LABEL}.plist`);
+const LEGACY_STATE_DIR = path.join(path.dirname(resolveStateDir({ env: { XDG_STATE_HOME: process.env.XDG_STATE_HOME }, home: os.homedir(), preferXdg: true })), LEGACY_NAME);
+const LEGACY_CLI_LINK = path.join(os.homedir(), '.local', 'bin', LEGACY_NAME);
 
 // The agent skill that teaches a coding agent to register what the scanner
 // can't prove. It ships in the package so the skill version always matches the
 // daemon it describes; the install copies it for Claude Code when ~/.claude
-// exists. Other agents get it with `npx skills add joudbitar/lazydev`.
+// exists. Other agents get it with `npx skills add joudbitar/xerb`.
 const SKILL_SRC = path.join(ROOT, '.claude', 'skills', 'add-project');
 const SKILL_DEST = path.join(os.homedir(), '.claude', 'skills', 'add-project');
 
@@ -96,25 +101,39 @@ function ensureStateDir() {
   fs.mkdirSync(logsDir, { recursive: true });
 }
 
-// A machine that ran the pre-ADR-0003 checkout install has its registry next
-// to the old checkout, full of hand-added entries a scan cannot rediscover.
-// The old plist's WorkingDirectory says where that was; copy the registry into
-// the state dir once, before the first scan, and the scan merge preserves
-// every entry. Only runs when the state dir has no registry yet — an existing
-// registry is never overwritten. Returns the legacy path when migrated.
+// A machine that ran xerb under its old name has a registry full of
+// hand-added entries a scan cannot rediscover. It sits in the lazydev state
+// dir, or (the pre-ADR-0003 checkout install) next to the old checkout, which
+// the old plist's WorkingDirectory names. Copy it into the state dir once,
+// before the first scan, and the scan merge preserves every entry. Only runs
+// when the state dir has no registry yet — an existing registry is never
+// overwritten. Returns the legacy path when migrated.
 function migrateLegacyRegistry() {
   if (fs.existsSync(configPath)) return null;
-  try {
-    const wd = extractWorkingDirectory(fs.readFileSync(PLIST_PATH, 'utf8'));
-    if (!wd || wd === stateDir) return null;
-    const legacy = path.join(wd, 'projects.json');
-    if (!fs.existsSync(legacy)) return null;
-    fs.mkdirSync(path.dirname(configPath), { recursive: true });
-    fs.copyFileSync(legacy, configPath);
-    return legacy;
-  } catch {
-    return null; // no old plist — nothing to migrate
+  let legacyPlistText = '';
+  try { legacyPlistText = fs.readFileSync(LEGACY_PLIST_PATH, 'utf8'); } catch { /* no old plist */ }
+  for (const legacy of legacyRegistryCandidates({ legacyStateDir: LEGACY_STATE_DIR, legacyPlistText, stateDir })) {
+    try {
+      if (!fs.existsSync(legacy)) continue;
+      fs.mkdirSync(path.dirname(configPath), { recursive: true });
+      fs.copyFileSync(legacy, configPath);
+      return legacy;
+    } catch { /* unreadable — try the next one */ }
   }
+  return null;
+}
+
+// Take a lazydev-era install down: its agent would fight this one for :80,
+// and its command would run a daemon that no longer exists. The old state dir
+// is left alone (logs and registry backups are the user's to delete).
+async function retireLegacyInstall() {
+  if (fs.existsSync(LEGACY_PLIST_PATH)) {
+    await launchctlAsync(['bootout', `gui/${process.getuid()}/${LEGACY_LAUNCHD_LABEL}`]);
+    fs.rmSync(LEGACY_PLIST_PATH, { force: true });
+  }
+  try {
+    if (fs.lstatSync(LEGACY_CLI_LINK).isSymbolicLink()) fs.rmSync(LEGACY_CLI_LINK, { force: true });
+  } catch { /* no old command */ }
 }
 
 // ---------------------------------------------------------------------------
@@ -144,16 +163,16 @@ function probeListen(port) {
 function childEnvFor(servePort, { scanAll = false } = {}) {
   return {
     ...process.env,
-    LAZYDEV_STATE_DIR: stateDir,
-    LAZYDEV_PORT: String(servePort),
-    LAZYDEV_FALLBACK_PORT: String(FALLBACK_PORT),
+    XERB_STATE_DIR: stateDir,
+    XERB_PORT: String(servePort),
+    XERB_FALLBACK_PORT: String(FALLBACK_PORT),
     // Keep the terminal clean: the scanner skips its report table and the
     // daemon logs to daemon.log only. The banner is the whole startup output.
-    LAZYDEV_SCAN_QUIET: '1',
-    LAZYDEV_QUIET: '1',
+    XERB_SCAN_QUIET: '1',
+    XERB_QUIET: '1',
     // `--yes` promised no prompts: the scan registers everything it finds
     // instead of raising the project picker.
-    ...(scanAll ? { LAZYDEV_SCAN_ALL: '1' } : {}),
+    ...(scanAll ? { XERB_SCAN_ALL: '1' } : {}),
   };
 }
 
@@ -199,7 +218,7 @@ async function scanWithStatus(env, interactive) {
         process.stdout.write(ui.dim('  cancelled; nothing was changed.\n'));
         return 'cancelled';
       }
-      process.stderr.write(`lazydev: scan failed (${err.message}); continuing with whatever registry exists.\n`);
+      process.stderr.write(`xerb: scan failed (${err.message}); continuing with whatever registry exists.\n`);
       return;
     }
     const n = readProjects().length;
@@ -212,7 +231,7 @@ async function scanWithStatus(env, interactive) {
     await runScan(env);
   } catch (err) {
     spin.fail();
-    process.stderr.write(`lazydev: scan failed (${err.message}); continuing with whatever registry exists.\n`);
+    process.stderr.write(`xerb: scan failed (${err.message}); continuing with whatever registry exists.\n`);
     return;
   }
   const n = readProjects().length;
@@ -242,7 +261,7 @@ async function askConsent({ willInstallSkill }) {
     out(`  add the add-project skill to ~/.claude/skills ${dim('· for projects the scan misses')}`);
   }
   out();
-  out(dim(`  everything is stored in ${tilde(stateDir)} · \`lazydev uninstall\` deletes all of it`));
+  out(dim(`  everything is stored in ${tilde(stateDir)} · \`xerb uninstall\` deletes all of it`));
   out();
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
   let answer;
@@ -312,7 +331,7 @@ function launchctlAsync(args) {
 
 // A git checkout is a dev install: the LaunchAgent runs the checkout directly
 // (no app copy — the repo is not a cache that vanishes) and the daemon watches
-// its own source, so an edit here is live at lazydev.localhost a moment later.
+// its own source, so an edit here is live at xerb.localhost a moment later.
 const IS_CHECKOUT = fs.existsSync(path.join(ROOT, '.git'));
 
 // A checkout install is "current" when the deployed plist already runs THIS
@@ -320,7 +339,7 @@ const IS_CHECKOUT = fs.existsSync(path.join(ROOT, '.git'));
 // live-reloads out from under it.
 function plistRunsCheckout() {
   try {
-    return fs.readFileSync(PLIST_PATH, 'utf8').includes(`<string>${path.join(ROOT, 'lazydev.mjs')}</string>`);
+    return fs.readFileSync(PLIST_PATH, 'utf8').includes(`<string>${path.join(ROOT, 'xerb.mjs')}</string>`);
   } catch {
     return false;
   }
@@ -335,7 +354,7 @@ async function copyApp() {
   if (fs.existsSync(APP_DIR) && fs.realpathSync(APP_DIR) === fs.realpathSync(ROOT)) return; // running from the installed copy
   await fs.promises.rm(APP_DIR, { recursive: true, force: true });
   await fs.promises.mkdir(APP_DIR, { recursive: true });
-  let files = ['bin', 'lib', 'lazydev.mjs', 'scan.mjs'];
+  let files = ['bin', 'lib', 'xerb.mjs', 'scan.mjs'];
   try {
     const pkg = JSON.parse(fs.readFileSync(path.join(ROOT, 'package.json'), 'utf8'));
     if (Array.isArray(pkg.files) && pkg.files.length) files = pkg.files.map((f) => f.replace(/\/+$/, ''));
@@ -360,9 +379,10 @@ function installedVersion() {
 async function installPersistent({ onStep = () => {} } = {}) {
   const domain = `gui/${process.getuid()}`;
 
-  // Stop any existing agent first (this label covers the old checkout install
-  // too, so an npx install cleanly supersedes it), then refresh the app copy.
-  // A checkout runs in place instead: no copy, and the daemon live-reloads.
+  // Stop any existing agent first (under this name or the old one), then
+  // refresh the app copy. A checkout runs in place instead: no copy, and the
+  // daemon live-reloads.
+  await retireLegacyInstall();
   await launchctlAsync(['bootout', `${domain}/${LAUNCHD_LABEL}`]);
   const appDir = IS_CHECKOUT ? ROOT : APP_DIR;
   if (!IS_CHECKOUT) await copyApp();
@@ -370,7 +390,7 @@ async function installPersistent({ onStep = () => {} } = {}) {
   const nodeBin = process.execPath;
   const plist = renderPlist({
     nodeBin,
-    daemonPath: path.join(appDir, 'lazydev.mjs'),
+    daemonPath: path.join(appDir, 'xerb.mjs'),
     workDir: appDir,
     stateDir,
     logsDir,
@@ -399,11 +419,11 @@ async function installPersistent({ onStep = () => {} } = {}) {
   await launchctlAsync(['enable', `${domain}/${LAUNCHD_LABEL}`]);
   await launchctlAsync(['kickstart', '-k', `${domain}/${LAUNCHD_LABEL}`]);
 
-  // Put `lazydev` on PATH: a symlink to this same entrypoint in the app copy
+  // Put `xerb` on PATH: a symlink to this same entrypoint in the app copy
   // (or the checkout, on a dev install).
   fs.mkdirSync(path.dirname(CLI_LINK), { recursive: true });
   try { fs.rmSync(CLI_LINK, { force: true }); } catch { /* fine */ }
-  fs.symlinkSync(path.join(appDir, 'bin', 'lazydev.mjs'), CLI_LINK);
+  fs.symlinkSync(path.join(appDir, 'bin', 'xerb.mjs'), CLI_LINK);
 
   // The add-project skill, for machines that run Claude Code (~/.claude
   // exists). Replaced wholesale on every install so it tracks the daemon.
@@ -432,25 +452,25 @@ function printInstalledBanner({ projects, port, startedAt, skillInstalled, verb 
   const out = (s = '') => process.stdout.write(s + '\n');
   const readyMs = Date.now() - startedAt;
   out();
-  out(`  ${cyan(bold('lazydev'))} ${dim(`v${VERSION}`)}  ${verb} ${dim(`in ${readyMs} ms`)}`);
+  out(`  ${cyan(bold('xerb'))} ${dim(`v${VERSION}`)}  ${verb} ${dim(`in ${readyMs} ms`)}`);
   out();
   if (!projects.length) {
     out(`  no projects found under ${tilde(os.homedir())}.`);
-    out(dim('  a project is anything the scan can prove how to run: package.json with a "dev" script, rails, django with a venv, a static folder; add one and run `lazydev` again.'));
+    out(dim('  a project is anything the scan can prove how to run: package.json with a "dev" script, rails, django with a venv, a static folder; add one and run `xerb` again.'));
   } else {
     const example = projects[0].host;
-    out(`  ${dim('dashboard')}  ${bold(formatProjectUrl('lazydev', port))}`);
+    out(`  ${dim('dashboard')}  ${bold(formatProjectUrl('xerb', port))}`);
     out(`  ${dim('projects')}   ${bold(formatProjectUrl('<name>', port))} ${dim(`for each of ${projects.length} projects, e.g. ${formatProjectUrl(example, port)}`)}`);
   }
   out();
   out(dim(`  runs in the background and survives reboots · registry: ${tilde(configPath)} · logs: ${tilde(logsDir)}`));
-  out(dim('  `lazydev` rescans for new projects · `lazydev uninstall` removes everything'));
+  out(dim('  `xerb` rescans for new projects · `xerb uninstall` removes everything'));
   if (skillInstalled) {
-    out(dim('  agent skill: add-project installed to ~/.claude/skills · other agents: npx skills add joudbitar/lazydev'));
+    out(dim('  agent skill: add-project installed to ~/.claude/skills · other agents: npx skills add joudbitar/xerb'));
   }
   const pathDirs = (process.env.PATH || '').split(':');
   if (!pathDirs.includes(path.dirname(CLI_LINK))) {
-    out(dim(`  note: add ${tilde(path.dirname(CLI_LINK))} to your PATH to get the \`lazydev\` command.`));
+    out(dim(`  note: add ${tilde(path.dirname(CLI_LINK))} to your PATH to get the \`xerb\` command.`));
   }
   out();
 }
@@ -467,13 +487,13 @@ async function uninstall({ assumeYes }) {
     out();
     out(`  this stops the background service and deletes ${bold(tilde(stateDir))}`);
     out('  (registry, logs, the installed app copy), the LaunchAgent plist, the');
-    out('  `lazydev` command, and the add-project skill. your projects are not');
+    out('  `xerb` command, and the add-project skill. your projects are not');
     out('  touched.');
     out();
     const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
     let answer;
     try {
-      answer = (await rl.question('  remove lazydev? [y/N] ')).trim().toLowerCase();
+      answer = (await rl.question('  remove xerb? [y/N] ')).trim().toLowerCase();
     } finally {
       rl.close();
     }
@@ -507,21 +527,21 @@ async function uninstall({ assumeYes }) {
   }
 
   // The PATH symlink, but only if it is ours: a symlink whose target mentions
-  // lazydev. A real file someone else put there is left alone.
+  // xerb. A real file someone else put there is left alone.
   try {
     const target = fs.readlinkSync(CLI_LINK);
-    if (target.includes('lazydev')) fs.rmSync(CLI_LINK, { force: true });
+    if (target.includes('xerb')) fs.rmSync(CLI_LINK, { force: true });
   } catch { /* not a symlink or absent — leave it */ }
 
   // The agent skill, but only if it is ours: its SKILL.md must mention
-  // lazydev. A same-named skill from somewhere else is left alone.
+  // xerb. A same-named skill from somewhere else is left alone.
   try {
-    if (fs.readFileSync(path.join(SKILL_DEST, 'SKILL.md'), 'utf8').includes('lazydev')) {
+    if (fs.readFileSync(path.join(SKILL_DEST, 'SKILL.md'), 'utf8').includes('xerb')) {
       fs.rmSync(SKILL_DEST, { recursive: true, force: true });
     }
   } catch { /* absent — nothing to remove */ }
 
-  // A machine installed the old Caddy way still has a lazydev block in its
+  // A machine installed the old Caddy way still has a xerb block in its
   // Caddyfile; strip it and reload so :80 is truly released. Best-effort — a
   // machine without brew or caddy skips all of this silently.
   const brewPrefix = spawnSync('brew', ['--prefix'], { encoding: 'utf8' }).stdout?.trim() || '/opt/homebrew';
@@ -530,18 +550,18 @@ async function uninstall({ assumeYes }) {
     const before = fs.readFileSync(caddyfile, 'utf8');
     const { text, changed } = stripCaddyBlock(before);
     if (changed) {
-      fs.copyFileSync(caddyfile, `${caddyfile}.bak.lazydev-uninstall`);
+      fs.copyFileSync(caddyfile, `${caddyfile}.bak.xerb-uninstall`);
       fs.writeFileSync(caddyfile, text);
       const caddy = which('caddy');
       if (caddy) spawnSync(caddy, ['reload', '--config', caddyfile], { stdio: 'ignore' });
-      out(dim(`  removed the lazydev block from ${caddyfile} (backup alongside).`));
+      out(dim(`  removed the xerb block from ${caddyfile} (backup alongside).`));
     }
   } catch { /* no Caddyfile — nothing to clean */ }
 
   fs.rmSync(stateDir, { recursive: true, force: true });
 
   out();
-  out('  lazydev is gone: service stopped, state removed. thanks for trying it.');
+  out('  xerb is gone: service stopped, state removed. thanks for trying it.');
   if (!daemonExited) {
     out(dim(`  the daemon was still running 5s after being stopped; if ${tilde(stateDir)} comes back, remove it once it has exited.`));
   }
@@ -644,7 +664,7 @@ function printToolWarnings(results) {
   for (const r of bad) {
     if (r.reason === 'mismatch') {
       out(`  ${red('⚠')} ${bold(r.tool)}: the service runs ${tilde(r.bin)}, your shell runs ${tilde(r.shellBin)}.`);
-      out(dim(`    two installs of one tool can behave differently — \`lazydev install\` rebakes the service PATH from this shell.`));
+      out(dim(`    two installs of one tool can behave differently — \`xerb install\` rebakes the service PATH from this shell.`));
     } else if (r.reason === 'broken') {
       out(`  ${red('⚠')} ${bold(r.tool)} resolves to ${tilde(r.bin || '?')} for the service, but \`${r.tool} --version\` fails there.`);
       out(dim(`    projects whose start command uses ${r.tool} will not come up until this is fixed.`));
@@ -679,7 +699,7 @@ function cmdLogs(args) {
   }
 
   const raw = rest.find((a) => !a.startsWith('-')) || '';
-  // Accept the URL form too: `lazydev logs tradepulse.localhost`.
+  // Accept the URL form too: `xerb logs tradepulse.localhost`.
   const host = raw.replace(/\.localhost$/, '');
 
   const available = () => {
@@ -702,14 +722,14 @@ function cmdLogs(args) {
 
   out();
   if (!host || host.includes('/') || host.includes('..')) {
-    out(`  usage: ${bold('lazydev logs <host>')} ${dim('[-n lines]')}`);
+    out(`  usage: ${bold('xerb logs <host>')} ${dim('[-n lines]')}`);
     out();
     listAvailable();
     out();
     return host ? 1 : 0;
   }
 
-  // `lazydev logs daemon` reads the daemon's own log; everything else is a
+  // `xerb logs daemon` reads the daemon's own log; everything else is a
   // per-project log written by that project's dev server.
   const file = path.join(logsDir, `${host}.log`);
   if (!fs.existsSync(file)) {
@@ -724,7 +744,7 @@ function cmdLogs(args) {
   try {
     content = fs.readFileSync(file, 'utf8');
   } catch (err) {
-    process.stderr.write(`lazydev: could not read ${file}: ${err.message}\n`);
+    process.stderr.write(`xerb: could not read ${file}: ${err.message}\n`);
     return 1;
   }
   const all = content.split('\n');
@@ -748,7 +768,7 @@ function cmdLogs(args) {
 // precisely because it is the user's own shell.
 // ---------------------------------------------------------------------------
 
-const NOT_RUNNING = 'lazydev is not running; run `lazydev` to start it';
+const NOT_RUNNING = 'xerb is not running; run `xerb` to start it';
 
 function controlToken() {
   try {
@@ -773,8 +793,8 @@ function controlRequest(port, method, pathname, body, { timeoutMs = 5000 } = {})
         path: pathname,
         headers: {
           // The daemon routes by Host; the control plane lives on its own host.
-          host: 'lazydev.localhost',
-          'x-lazydev-token': controlToken(),
+          host: 'xerb.localhost',
+          'x-xerb-token': controlToken(),
           ...(payload ? { 'content-type': 'application/json', 'content-length': payload.length } : {}),
         },
       },
@@ -797,13 +817,13 @@ function controlRequest(port, method, pathname, body, { timeoutMs = 5000 } = {})
 }
 
 // Which port is the daemon actually on: the front door, or the numbered
-// fallback it took when :80 was spoken for? GET /__lazydev/status is the probe
+// fallback it took when :80 was spoken for? GET /__xerb/status is the probe
 // rather than a bare TCP connect, because "something is listening" is not
-// "lazydev is listening". Returns { port, status } or null.
+// "xerb is listening". Returns { port, status } or null.
 async function findDaemon() {
   for (const port of new Set([FRONT_PORT, FALLBACK_PORT])) {
     try {
-      const r = await controlRequest(port, 'GET', '/__lazydev/status');
+      const r = await controlRequest(port, 'GET', '/__xerb/status');
       if (r.status === 200 && r.json && Array.isArray(r.json.projects)) return { port, status: r.json };
     } catch { /* nothing of ours there */ }
   }
@@ -811,12 +831,12 @@ async function findDaemon() {
 }
 
 function notRunning() {
-  process.stderr.write(`lazydev: ${NOT_RUNNING}\n`);
+  process.stderr.write(`xerb: ${NOT_RUNNING}\n`);
   return 3;
 }
 
 function needHost(cmd, usage) {
-  process.stderr.write(`lazydev: ${cmd} needs a project name. usage: ${usage}\n`);
+  process.stderr.write(`xerb: ${cmd} needs a project name. usage: ${usage}\n`);
   return 1;
 }
 
@@ -829,21 +849,21 @@ function helpText() {
   const { bold, dim } = ui;
   return [
     '',
-    `  ${bold('lazydev')} ${dim(`v${VERSION}`)}  ${dim('every project gets a URL that starts its dev server on request')}`,
+    `  ${bold('xerb')} ${dim(`v${VERSION}`)}  ${dim('every project gets a URL that starts its dev server on request')}`,
     '',
-    `  lazydev                     ${dim('first run: consent, scan, install. later: rescan')}`,
-    `  lazydev status              ${dim('every project, state, port, idle, one line each')}`,
-    `  lazydev add [dir] [--cmd "..."] [--port N] [--name host] [--parked]`,
-    `  lazydev remove <host>`,
-    `  lazydev enable <host> | disable <host>`,
-    `  lazydev port <host> <N>`,
-    `  lazydev rename <host> <new>`,
-    `  lazydev stop <host> | restart <host> | wake <host>`,
-    `  lazydev open <host>         ${dim('open http://<host>.localhost in the default browser')}`,
-    `  lazydev logs <host> [-n N] [-f]`,
-    `  lazydev attach <host>       ${dim("your terminal becomes the dev server's terminal")}`,
-    `  lazydev install             ${dim('force a reinstall (rebake the service PATH)')}`,
-    `  lazydev uninstall`,
+    `  xerb                     ${dim('first run: consent, scan, install. later: rescan')}`,
+    `  xerb status              ${dim('every project, state, port, idle, one line each')}`,
+    `  xerb add [dir] [--cmd "..."] [--port N] [--name host] [--parked]`,
+    `  xerb remove <host>`,
+    `  xerb enable <host> | disable <host>`,
+    `  xerb port <host> <N>`,
+    `  xerb rename <host> <new>`,
+    `  xerb stop <host> | restart <host> | wake <host>`,
+    `  xerb open <host>         ${dim('open http://<host>.localhost in the default browser')}`,
+    `  xerb logs <host> [-n N] [-f]`,
+    `  xerb attach <host>       ${dim("your terminal becomes the dev server's terminal")}`,
+    `  xerb install             ${dim('force a reinstall (rebake the service PATH)')}`,
+    `  xerb uninstall`,
     '',
     `  ${dim('-h, --help     this table')}`,
     `  ${dim('-v, --version  print the version')}`,
@@ -888,7 +908,7 @@ function parseArgv(argv) {
 
 function loadRegistry() {
   if (!fs.existsSync(configPath)) {
-    throw new RegistryError(`no registry yet at ${tilde(configPath)}; run \`lazydev\` once first.`);
+    throw new RegistryError(`no registry yet at ${tilde(configPath)}; run \`xerb\` once first.`);
   }
   return readRegistry(configPath);
 }
@@ -900,7 +920,7 @@ async function stopIfRunning(host) {
   const live = await findDaemon();
   if (!live) return;
   try {
-    await controlRequest(live.port, 'POST', `/__lazydev/stop/${encodeURIComponent(host)}`);
+    await controlRequest(live.port, 'POST', `/__xerb/stop/${encodeURIComponent(host)}`);
   } catch { /* it was not running */ }
 }
 
@@ -910,7 +930,7 @@ async function cmdAdd({ flags, rest }) {
 
   const dir = path.resolve(expandTilde(rest[0] || process.cwd()));
   if (!fs.existsSync(dir)) {
-    process.stderr.write(`lazydev: no such directory: ${dir}\n`);
+    process.stderr.write(`xerb: no such directory: ${dir}\n`);
     return 1;
   }
   const nameFlag = flags.get('--name');
@@ -932,7 +952,7 @@ async function cmdAdd({ flags, rest }) {
       for (const [name, evidence] of DETECTOR_EVIDENCE) out(`    ${name.padEnd(7)} ${dim(evidence)}`);
       out();
       out(`  say how it starts and it is registered either way:`);
-      out(`    ${bold(`lazydev add ${tilde(dir)} --cmd "npm run dev"`)}`);
+      out(`    ${bold(`xerb add ${tilde(dir)} --cmd "npm run dev"`)}`);
       out(dim('    the command runs with cwd set to that folder and PORT in the environment.'));
       out();
       return 1;
@@ -980,7 +1000,7 @@ async function cmdAdd({ flags, rest }) {
   out(`    ${dim('dir')}    ${tilde(entry.dir)}`);
   out(`    ${dim('start')}  ${entry.startCmd}`);
   if (entry.enabled === false) {
-    out(`    ${dim(`parked · \`lazydev enable ${entry.host}\` turns it on`)}`);
+    out(`    ${dim(`parked · \`xerb enable ${entry.host}\` turns it on`)}`);
   } else if (live) {
     out(`    ${dim('url')}    ${bold(formatProjectUrl(entry.host, live.port))}`);
   } else {
@@ -991,7 +1011,7 @@ async function cmdAdd({ flags, rest }) {
 }
 
 async function cmdRemove(host) {
-  if (!host) return needHost('remove', 'lazydev remove <host>');
+  if (!host) return needHost('remove', 'xerb remove <host>');
   const reg = loadRegistry();
   const entry = removeEntry(reg, host); // throws before anything is stopped
   await stopIfRunning(host);
@@ -1002,7 +1022,7 @@ async function cmdRemove(host) {
 
 async function cmdEnable(host, enabled) {
   const verb = enabled ? 'enable' : 'disable';
-  if (!host) return needHost(verb, `lazydev ${verb} <host>`);
+  if (!host) return needHost(verb, `xerb ${verb} <host>`);
   const reg = loadRegistry();
   setEnabled(reg, host, enabled);
   if (!enabled) await stopIfRunning(host);
@@ -1013,7 +1033,7 @@ async function cmdEnable(host, enabled) {
 
 async function cmdPort(host, value) {
   if (!host || value === undefined) {
-    process.stderr.write('lazydev: usage: lazydev port <host> <N>\n');
+    process.stderr.write('xerb: usage: xerb port <host> <N>\n');
     return 1;
   }
   // A running server is bound to the old port; changing the registry under it
@@ -1021,7 +1041,7 @@ async function cmdPort(host, value) {
   const live = await findDaemon();
   const row = live ? live.status.projects.find((p) => p.host === host) : null;
   if (row && row.state === 'running') {
-    process.stderr.write(`lazydev: ${host} is running on :${row.port}. stop it first: lazydev stop ${host}\n`);
+    process.stderr.write(`xerb: ${host} is running on :${row.port}. stop it first: xerb stop ${host}\n`);
     return 1;
   }
   const reg = loadRegistry();
@@ -1033,7 +1053,7 @@ async function cmdPort(host, value) {
 
 async function cmdRename(from, to) {
   if (!from || !to) {
-    process.stderr.write('lazydev: usage: lazydev rename <host> <new>\n');
+    process.stderr.write('xerb: usage: xerb rename <host> <new>\n');
     return 1;
   }
   const reg = loadRegistry();
@@ -1078,7 +1098,7 @@ async function cmdStatus() {
     out();
   }
   if (!rows.length) {
-    out(`  no projects registered. ${dim('`lazydev add [dir]` registers one, `lazydev` rescans.')}`);
+    out(`  no projects registered. ${dim('`xerb add [dir]` registers one, `xerb` rescans.')}`);
     out();
     return 0;
   }
@@ -1093,7 +1113,7 @@ async function cmdStatus() {
     out(`  ${mark} ${r.host.padEnd(w)}  ${state.padEnd(8)} ${dim(`:${r.port}`)}${notes.length ? dim(`  ${notes.join(' · ')}`) : ''}`);
   }
   out();
-  out(dim(`  dashboard ${formatProjectUrl('lazydev', live.port)} · sleeps after ${fmtIdle(live.status.idleTimeoutMs)} idle · \`lazydev logs <host>\``));
+  out(dim(`  dashboard ${formatProjectUrl('xerb', live.port)} · sleeps after ${fmtIdle(live.status.idleTimeoutMs)} idle · \`xerb logs <host>\``));
   out();
   return 0;
 }
@@ -1102,16 +1122,16 @@ async function cmdStatus() {
 // returns as soon as the SIGTERM is sent, and a dev server that holds its port
 // for even a moment after that (Next, Vite, Rails all do) is still listening
 // when the wake probes it, so the wake finds a listener in the project's own
-// folder and adopts the process we just killed. /__lazydev/restart waits for
+// folder and adopts the process we just killed. /__xerb/restart waits for
 // the port to go quiet in between, and writes one log separator for the start
 // that follows.
 async function cmdRuntime(action, host) {
-  if (!host) return needHost(action, `lazydev ${action} <host>`);
+  if (!host) return needHost(action, `xerb ${action} <host>`);
   const live = await findDaemon();
   if (!live) return notRunning();
   const row = live.status.projects.find((p) => p.host === host);
   if (!row) {
-    process.stderr.write(`lazydev: no project named "${host}". \`lazydev status\` lists them.\n`);
+    process.stderr.write(`xerb: no project named "${host}". \`xerb status\` lists them.\n`);
     return 1;
   }
   const post = (p, opts) => controlRequest(live.port, 'POST', p, undefined, opts);
@@ -1121,9 +1141,9 @@ async function cmdRuntime(action, host) {
   const bringUp = { timeoutMs: 15 * 60_000 };
 
   if (action === 'stop') {
-    const r = await post(`/__lazydev/stop/${encodeURIComponent(host)}`);
+    const r = await post(`/__xerb/stop/${encodeURIComponent(host)}`);
     if (r.status === 403) {
-      process.stderr.write('lazydev: the daemon refused the control token; run `lazydev` to reinstall it.\n');
+      process.stderr.write('xerb: the daemon refused the control token; run `xerb` to reinstall it.\n');
       return 1;
     }
     const ok = r.json && r.json.ok;
@@ -1133,12 +1153,12 @@ async function cmdRuntime(action, host) {
 
   const r = await post(
     action === 'restart'
-      ? `/__lazydev/restart/${encodeURIComponent(host)}`
-      : `/__lazydev/up/${encodeURIComponent(host)}`,
+      ? `/__xerb/restart/${encodeURIComponent(host)}`
+      : `/__xerb/up/${encodeURIComponent(host)}`,
     bringUp
   );
   if (r.status === 403) {
-    process.stderr.write('lazydev: the daemon refused the control token; run `lazydev` to reinstall it.\n');
+    process.stderr.write('xerb: the daemon refused the control token; run `xerb` to reinstall it.\n');
     return 1;
   }
   if (r.status === 200) {
@@ -1146,27 +1166,27 @@ async function cmdRuntime(action, host) {
     return 0;
   }
   if (r.status === 409) {
-    process.stderr.write(`lazydev: ${host} is disabled. \`lazydev enable ${host}\` first.\n`);
+    process.stderr.write(`xerb: ${host} is disabled. \`xerb enable ${host}\` first.\n`);
     return 1;
   }
-  process.stderr.write(`lazydev: ${host} did not come up (${(r.json && r.json.reason) || r.status}). \`lazydev logs ${host}\` has its output.\n`);
+  process.stderr.write(`xerb: ${host} did not come up (${(r.json && r.json.reason) || r.status}). \`xerb logs ${host}\` has its output.\n`);
   return 1;
 }
 
 // `open` uses macOS's own `open`, so the URL lands in whatever the user set as
 // their default browser. The port is the one the daemon actually answers on.
 async function cmdOpen(host) {
-  if (!host) return needHost('open', 'lazydev open <host>');
+  if (!host) return needHost('open', 'xerb open <host>');
   const live = await findDaemon();
   if (!live) return notRunning();
-  if (!live.status.projects.some((p) => p.host === host) && host !== 'lazydev') {
-    process.stderr.write(`lazydev: no project named "${host}". \`lazydev status\` lists them.\n`);
+  if (!live.status.projects.some((p) => p.host === host) && host !== 'xerb') {
+    process.stderr.write(`xerb: no project named "${host}". \`xerb status\` lists them.\n`);
     return 1;
   }
   const url = formatProjectUrl(host, live.port);
   const r = spawnSync('open', [url], { stdio: 'ignore' });
   if (r.status !== 0) {
-    process.stderr.write(`lazydev: could not open ${url}\n`);
+    process.stderr.write(`xerb: could not open ${url}\n`);
     return 1;
   }
   process.stdout.write(`  ${url}\n`);
@@ -1176,7 +1196,7 @@ async function cmdOpen(host) {
 // ---------------------------------------------------------------------------
 // attach / logs -f: the two CLI clients of the per-project terminal socket.
 //
-// Both open GET /__lazydev/term/<host>, a WebSocket upgrade the daemon serves
+// Both open GET /__xerb/term/<host>, a WebSocket upgrade the daemon serves
 // on its control plane (spec 0.3.0 section 6). The daemon's first frame is the
 // scrollback, then live pty bytes; the client speaks `i:<bytes>` for input and
 // `r:<rows>,<cols>` for a resize.
@@ -1186,18 +1206,18 @@ async function cmdOpen(host) {
 // the same socket with the escapes stripped and no raw mode, so it reads like
 // the log file it is following.
 //
-// Neither one owns the dev server: it is lazydev's child, started before this
+// Neither one owns the dev server: it is xerb's child, started before this
 // shell and outliving it. Detaching stops nothing.
 // ---------------------------------------------------------------------------
 
-const TERM_PATH = '/__lazydev/term/';
+const TERM_PATH = '/__xerb/term/';
 const DETACH_BYTE = 0x1d; // Ctrl-]
 // Signals worth cleaning up for. Ctrl-C is NOT one of them while attached: raw
 // mode turns it into a 0x03 byte for the dev server, which is the point.
 const LEAVE_SIGNALS = ['SIGINT', 'SIGTERM', 'SIGHUP'];
 
 // Complete escape sequences, the same four patterns the daemon runs before it
-// writes <host>.log, so a `logs -f` and a `lazydev logs` of one run read alike.
+// writes <host>.log, so a `logs -f` and a `xerb logs` of one run read alike.
 // ESC [ and ESC ] stay out of ESC2_RE so a CSI or OSC split across two frames
 // is carried rather than eaten one character at a time.
 const OSC_RE = /\u001b\][^\u0007\u001b]*(?:\u0007|\u001b\\)/g;
@@ -1239,7 +1259,7 @@ function frameBytes(data) {
 
 // Open the terminal socket, resolved once the handshake is up.
 //
-// 127.0.0.1 and not lazydev.localhost: the daemon routes on the Host header,
+// 127.0.0.1 and not xerb.localhost: the daemon routes on the Host header,
 // an IP literal names no project (which IS the control plane the terminal
 // socket demands), and it skips a DNS lookup that answers ::1 on a machine
 // whose daemon is bound to 127.0.0.1.
@@ -1249,7 +1269,7 @@ function frameBytes(data) {
 // both clients is one path to keep right.
 function openTermSocket(port, host) {
   const token = controlToken();
-  if (!token) throw new Error('no control token in the state dir; run `lazydev` to mint one');
+  if (!token) throw new Error('no control token in the state dir; run `xerb` to mint one');
   const ws = new WebSocket(`ws://127.0.0.1:${port}${TERM_PATH}${encodeURIComponent(host)}`, [token]);
   ws.binaryType = 'arraybuffer'; // raw pty bytes, not a Blob to await
   return new Promise((resolve, reject) => {
@@ -1260,7 +1280,7 @@ function openTermSocket(port, host) {
   });
 }
 
-// `lazydev attach <host>`: this terminal becomes the dev server's terminal.
+// `xerb attach <host>`: this terminal becomes the dev server's terminal.
 function attachTerm(ws, host) {
   const { bold, dim } = ui;
   const stdin = process.stdin;
@@ -1307,7 +1327,7 @@ function attachTerm(ws, host) {
           /* the socket is on its way out */
         }
       }
-      if (at !== -1) leave(0, `\r\n  detached. ${host} keeps running; \`lazydev stop ${host}\` stops it.\n`);
+      if (at !== -1) leave(0, `\r\n  detached. ${host} keeps running; \`xerb stop ${host}\` stops it.\n`);
     };
 
     const onWinch = () => sendSize();
@@ -1350,12 +1370,12 @@ function attachTerm(ws, host) {
     // Tell the pty how big this window is before anything draws into it.
     sendSize();
     process.stdout.write(
-      `  attached to ${bold(host)}. ${dim("ctrl-] detaches. the dev server is lazydev's, not this shell's, so it keeps running.")}\n`
+      `  attached to ${bold(host)}. ${dim("ctrl-] detaches. the dev server is xerb's, not this shell's, so it keeps running.")}\n`
     );
   });
 }
 
-// `lazydev logs -f <host>`: the same socket, one direction, escapes stripped.
+// `xerb logs -f <host>`: the same socket, one direction, escapes stripped.
 // Ctrl-C is the way out and reports 130, like every other follow.
 function followTerm(ws, host) {
   const strip = makeStripper();
@@ -1379,7 +1399,7 @@ function followTerm(ws, host) {
     });
     ws.addEventListener('close', () => leave(0));
     ws.addEventListener('error', () => {
-      process.stderr.write(`lazydev: ${host}: the terminal socket dropped.\n`);
+      process.stderr.write(`xerb: ${host}: the terminal socket dropped.\n`);
       leave(1);
     });
     for (const sig of LEAVE_SIGNALS) process.on(sig, onSignal);
@@ -1388,18 +1408,18 @@ function followTerm(ws, host) {
 
 async function cmdTerminal(host, { follow = false } = {}) {
   const what = follow ? 'logs -f' : 'attach';
-  if (!host) return needHost(what, follow ? 'lazydev logs <host> -f' : 'lazydev attach <host>');
+  if (!host) return needHost(what, follow ? 'xerb logs <host> -f' : 'xerb attach <host>');
   const live = await findDaemon();
   if (!live) return notRunning();
   if (!live.status.projects.some((p) => p.host === host)) {
-    process.stderr.write(`lazydev: no project named "${host}". \`lazydev status\` lists them.\n`);
+    process.stderr.write(`xerb: no project named "${host}". \`xerb status\` lists them.\n`);
     return 1;
   }
   let ws;
   try {
     ws = await openTermSocket(live.port, host);
   } catch (err) {
-    process.stderr.write(`lazydev: ${what} could not open ${host}'s terminal: ${err.message}\n`);
+    process.stderr.write(`xerb: ${what} could not open ${host}'s terminal: ${err.message}\n`);
     return 1;
   }
   return follow ? await followTerm(ws, host) : await attachTerm(ws, host);
@@ -1415,7 +1435,7 @@ async function main() {
   const cmd = rest[0] || '';
 
   // First, and before the state dir exists: these two answer questions ABOUT
-  // lazydev rather than doing anything with it, so `npx @jbitar/lazydev --help`
+  // xerb rather than doing anything with it, so `npx xerb --help`
   // on a fresh machine leaves that machine exactly as it was.
   if (cmd === 'help' || flags.has('-h') || flags.has('--help')) {
     process.stdout.write(helpText());
@@ -1428,10 +1448,10 @@ async function main() {
 
   // macOS only. The install IS a user LaunchAgent and the front door is :80
   // with a per-connection loopback guard; there is no half of that worth
-  // shipping elsewhere, and a foreground fallback taught people a lazydev that
+  // shipping elsewhere, and a foreground fallback taught people a xerb that
   // stops when the terminal closes.
   if (process.platform !== 'darwin') {
-    process.stderr.write('lazydev runs on macOS. Linux support is not planned.\n');
+    process.stderr.write('xerb runs on macOS. Linux support is not planned.\n');
     return 2;
   }
 
@@ -1464,13 +1484,13 @@ async function main() {
           ? await cmdTerminal(host, { follow: true })
           : cmdLogs(argv.slice(argv.indexOf('logs') + 1));
       default:
-        process.stderr.write(`lazydev: unknown command ${cmd}\n`);
+        process.stderr.write(`xerb: unknown command ${cmd}\n`);
         process.stderr.write(helpText());
         return 1;
     }
   } catch (err) {
     if (err instanceof RegistryError) {
-      process.stderr.write(`lazydev: ${err.message}\n`);
+      process.stderr.write(`xerb: ${err.message}\n`);
       return 1;
     }
     throw err;
@@ -1481,11 +1501,14 @@ async function main() {
 
   ensureStateDir();
   const startedAt = Date.now();
-  // Migration counts as prior consent: these users already installed lazydev
+  // Migration counts as prior consent: these users already installed xerb
   // once, so a migrated run skips the first-run prompt like any re-run.
   const migratedFrom = migrateLegacyRegistry();
   if (migratedFrom) {
     process.stdout.write(ui.dim(`  carried your registry over from ${tilde(migratedFrom)}.\n`));
+    if (migratedFrom.startsWith(LEGACY_STATE_DIR + path.sep)) {
+      process.stdout.write(ui.dim(`  xerb used to be lazydev. ${tilde(LEGACY_STATE_DIR)} is no longer read; delete it when you like.\n`));
+    }
   }
   const firstRun = !fs.existsSync(configPath);
 
@@ -1494,7 +1517,7 @@ async function main() {
   // installs. With a registry already there, consent is on record and a
   // non-interactive run just rescans, as it always did.
   if (firstRun && !interactive && !assumeYes) {
-    process.stderr.write('lazydev: first run needs a terminal (it asks before installing)\n');
+    process.stderr.write('xerb: first run needs a terminal (it asks before installing)\n');
     return 1;
   }
 
@@ -1519,7 +1542,7 @@ async function main() {
   // LaunchAgent here would only kill the dev servers it is holding. The
   // full install runs when nothing answers, the version changed (an npx of
   // a newer release supersedes the installed copy), or the user typed
-  // `lazydev install` — the explicit form is the sanctioned way to force a
+  // `xerb install` — the explicit form is the sanctioned way to force a
   // plist rewrite, e.g. after the preflight flags a stale service PATH.
   if (cmd !== 'install' && (IS_CHECKOUT ? plistRunsCheckout() : installedVersion() === VERSION)) {
     for (const port of [FRONT_PORT, FALLBACK_PORT]) {
@@ -1527,7 +1550,7 @@ async function main() {
         printInstalledBanner({ projects, port, startedAt, skillInstalled: false, verb: 'rescanned' });
         // Preflight against the DEPLOYED plist PATH — what the daemon is
         // actually resolving with right now. A tool that broke or diverged
-        // since install surfaces here, on the next casual `lazydev`, not at
+        // since install surfaces here, on the next casual `xerb`, not at
         // 3am via a start timeout.
         printToolWarnings(await preflightTools(toolsToVerify(projects), deployedPathEnv()));
         return 0;
@@ -1542,14 +1565,14 @@ async function main() {
     result = await installPersistent({ onStep: (t) => spin.update(t) });
   } catch (err) {
     spin.fail();
-    process.stderr.write(`lazydev: install failed: ${err.message}\n`);
+    process.stderr.write(`xerb: install failed: ${err.message}\n`);
     return 1;
   }
   if (!result.up) {
     spin.fail();
     process.stderr.write(
-      `lazydev: the service was installed but the daemon did not answer within 10s.\n` +
-      `check ${tilde(logsDir)}/daemon.err and daemon.log, then run \`lazydev\` again.\n`
+      `xerb: the service was installed but the daemon did not answer within 10s.\n` +
+      `check ${tilde(logsDir)}/daemon.err and daemon.log, then run \`xerb\` again.\n`
     );
     return 1;
   }

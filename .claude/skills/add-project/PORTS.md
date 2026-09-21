@@ -11,7 +11,7 @@ automatically.
 - Next.js: `npm run dev` / `pnpm dev`
 - Create React App: `npm run dev`
 - Express-style Node servers that read `process.env.PORT`
-- lazydev's own `serve_static.py` (static folders)
+- xerb's own `serve_static.py` (static folders)
 
 ## needs the port written into the command
 
@@ -24,8 +24,8 @@ automatically.
 - Rails: `bin/rails server -p <port>`
 - php built-in: `php -S 127.0.0.1:<port>`
 - static folder: `python3 <serve_static.py>` (reads PORT, serves cwd with
-  clean URLs). The script ships with lazydev: an installed machine has it at
-  `~/.local/state/lazydev/app/serve_static.py`, a checkout at its root. Use
+  clean URLs). The script ships with xerb: an installed machine has it at
+  `~/.local/state/xerb/app/serve_static.py`, a checkout at its root. Use
   the absolute path that exists.
 
 ## interpreters and environments
