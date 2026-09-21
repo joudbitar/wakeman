@@ -256,10 +256,11 @@ test('dir-missing: a moved folder fails instantly and the copy carries both fixe
 
 test('install-failed: the page quotes the install command and its code, and a reload does not reinstall', async (t) => {
   const port = await freePort();
-  // A project with a package.json and NO node_modules, so ensureUp installs.
+  // A project with a dependency to fetch and NO node_modules, so ensureUp
+  // installs. (With nothing to install there is no install to fail.)
   const dir = path.join(tmpDir, 'needsdeps');
   fs.mkdirSync(dir, { recursive: true });
-  fs.writeFileSync(path.join(dir, 'package.json'), JSON.stringify({ name: 'needsdeps', scripts: { dev: 'true' } }));
+  fs.writeFileSync(path.join(dir, 'package.json'), JSON.stringify({ name: 'needsdeps', scripts: { dev: 'true' }, dependencies: { 'left-pad': '1.3.0' } }));
 
   // A fake `npm` earlier on PATH than the real one: it fails the way a 404 or a
   // dead network does (no node_modules left behind) and records every call, so

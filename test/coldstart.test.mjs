@@ -514,6 +514,110 @@ test('child exiting before the port opens fails the start, even with a foreign l
   assert.equal(typeof r.lastError.elapsedMs, 'number', 'how long the child lived, for "after 0.1s"');
 });
 
+// --- the install gate: nothing to install means no install -------------------
+
+// A listener that reads PORT, as a dev script. No framework, no dependencies.
+const DEV_SERVER = `node -e "require('http').createServer((q,s)=>s.end('ok')).listen(process.env.PORT,'127.0.0.1')"`;
+
+function freePort() {
+  return new Promise((resolve, reject) => {
+    const s = net.createServer();
+    s.once('error', reject);
+    s.listen(0, '127.0.0.1', () => {
+      const { port } = s.address();
+      s.close(() => resolve(port));
+    });
+  });
+}
+
+// Everything xerb's own log() printed while fn ran.
+async function daemonLogDuring(fn) {
+  let text = '';
+  const orig = process.stdout.write;
+  process.stdout.write = function (chunk, ...rest) {
+    text += String(chunk);
+    return orig.call(this, chunk, ...rest);
+  };
+  try {
+    await fn();
+  } finally {
+    process.stdout.write = orig;
+  }
+  return text;
+}
+
+test('a package.json with no dependencies starts without an install', async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'xerb-nodeps-'));
+  fs.writeFileSync(path.join(dir, 'package.json'), JSON.stringify({ scripts: { dev: 'node server.js' } }));
+  const port = await freePort();
+  const project = { host: 'nodeps', dir, port, startCmd: DEV_SERVER, enabled: true };
+  writeConfig({ port: 0, startTimeoutMs: 15000, projects: [project] });
+  loadConfig('test');
+  t.after(async () => {
+    await cleanup('nodeps');
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  const seen = [];
+  const watch = setInterval(() => seen.push(getRuntime('nodeps').state), 5);
+  t.after(() => clearInterval(watch));
+  const logged = await daemonLogDuring(() => ensureUp(project));
+  clearInterval(watch);
+
+  assert.equal(getRuntime('nodeps').state, 'running');
+  assert.ok(!seen.includes('installing'), 'the wake page never says "installing"');
+  assert.doesNotMatch(logged, /install:/, 'no install line in the daemon log');
+  assert.equal(fs.existsSync(path.join(dir, 'node_modules')), false, 'the gate would still be open on the next wake');
+});
+
+test('one dependency and no node_modules still installs', async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'xerb-onedep-'));
+  // A file: dependency, so the install is real and never touches the network.
+  const dep = path.join(dir, 'dep');
+  fs.mkdirSync(dep);
+  fs.writeFileSync(path.join(dep, 'package.json'), JSON.stringify({ name: 'dep', version: '1.0.0' }));
+  fs.writeFileSync(path.join(dir, 'package.json'), JSON.stringify({ name: 'onedep', version: '1.0.0', dependencies: { dep: 'file:./dep' } }));
+  const port = await freePort();
+  const project = { host: 'onedep', dir, port, startCmd: DEV_SERVER, enabled: true };
+  writeConfig({ port: 0, startTimeoutMs: 15000, installTimeoutMs: 60000, projects: [project] });
+  loadConfig('test');
+  t.after(async () => {
+    await cleanup('onedep');
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  const logged = await daemonLogDuring(() => ensureUp(project));
+  assert.match(logged, /install:/, 'the install ran');
+  assert.equal(getRuntime('onedep').state, 'running');
+});
+
+test('a workspace root installs, and a package.json that will not parse does not', async (t) => {
+  const ws = fs.mkdtempSync(path.join(os.tmpdir(), 'xerb-ws-'));
+  fs.mkdirSync(path.join(ws, 'packages'));
+  fs.writeFileSync(path.join(ws, 'package.json'), JSON.stringify({ name: 'root', private: true, workspaces: ['packages/*'] }));
+  const bad = fs.mkdtempSync(path.join(os.tmpdir(), 'xerb-badjson-'));
+  fs.writeFileSync(path.join(bad, 'package.json'), '{ not json');
+  const wsProject = { host: 'wsroot', dir: ws, port: await freePort(), startCmd: DEV_SERVER, enabled: true };
+  const badProject = { host: 'badjson', dir: bad, port: await freePort(), startCmd: DEV_SERVER, enabled: true };
+  writeConfig({
+    port: 0,
+    startTimeoutMs: 15000,
+    installTimeoutMs: 60000,
+    projects: [wsProject, badProject],
+  });
+  loadConfig('test');
+  t.after(async () => {
+    await cleanup('wsroot');
+    await cleanup('badjson');
+    fs.rmSync(ws, { recursive: true, force: true });
+    fs.rmSync(bad, { recursive: true, force: true });
+  });
+
+  assert.match(await daemonLogDuring(() => ensureUp(wsProject)), /install:/);
+  assert.doesNotMatch(await daemonLogDuring(() => ensureUp(badProject)), /install:/);
+  assert.equal(getRuntime('badjson').state, 'running', 'the start command gets to speak for itself');
+});
+
 // --- cleanup ----------------------------------------------------------------
 
 test('cleanup temp registry and pooled sockets', () => {

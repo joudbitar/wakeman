@@ -924,6 +924,30 @@ async function stopIfRunning(host) {
   } catch { /* it was not running */ }
 }
 
+// The example command under "nothing provable". A hint for a human to edit,
+// not a detector: first marker wins, and likelihood is good enough here where
+// it is not in lib/detect.mjs.
+function startHint(dir) {
+  const has = (f) => fs.existsSync(path.join(dir, f));
+  const read = (f) => {
+    try { return fs.readFileSync(path.join(dir, f), 'utf8').toLowerCase(); } catch { return ''; }
+  };
+  const reqs = read('requirements.txt');
+  const pyDeps = reqs + read('pyproject.toml');
+  const readsPort = 'the app has to read PORT from the environment.';
+  if (has('manage.py')) return { cmd: 'python manage.py runserver <port>' };
+  if (has('app.py') || has('wsgi.py') || reqs.includes('flask')) return { cmd: 'flask run --port <port>' };
+  if (has('main.py') && /fastapi|uvicorn/.test(pyDeps)) return { cmd: 'uvicorn main:app --port <port>' };
+  if (has('go.mod')) return { cmd: 'go run .', note: readsPort };
+  if (has('Cargo.toml')) return { cmd: 'cargo run', note: readsPort };
+  if (has('docker-compose.yml') || has('compose.yaml')) {
+    return { cmd: 'docker compose up', port: true, note: 'set --port to the port the compose file publishes.' };
+  }
+  if (has('Gemfile')) return { cmd: 'bundle exec rackup -p <port>' };
+  if (has('package.json')) return { cmd: 'npm start' };
+  return { cmd: 'your-start-command --port <port>' };
+}
+
 async function cmdAdd({ flags, rest }) {
   const { bold, dim } = ui;
   const out = (s = '') => process.stdout.write(s + '\n');
@@ -952,8 +976,11 @@ async function cmdAdd({ flags, rest }) {
       for (const [name, evidence] of DETECTOR_EVIDENCE) out(`    ${name.padEnd(7)} ${dim(evidence)}`);
       out();
       out(`  say how it starts and it is registered either way:`);
-      out(`    ${bold(`xerb add ${tilde(dir)} --cmd "npm run dev"`)}`);
+      const hint = startHint(dir);
+      out(`    ${bold(`xerb add ${tilde(dir)} --cmd "${hint.cmd}"${hint.port ? ' --port <published port>' : ''}`)}`);
+      if (hint.note) out(dim(`    ${hint.note}`));
       out(dim('    the command runs with cwd set to that folder and PORT in the environment.'));
+      out(dim('    `<port>` is replaced with the port xerb assigns.'));
       out();
       return 1;
     }
@@ -1081,6 +1108,26 @@ function fmtIdle(ms) {
   return `${h}h ${m % 60}m`;
 }
 
+// A failed row's note: the kind in words, then the log's error line when the
+// daemon found one.
+function failureNote(r) {
+  const le = r.lastError;
+  const line = le.errorLine ? ` · ${le.errorLine}` : '';
+  switch (le.kind) {
+    case 'exited':
+      if (le.exitCode != null) return `exited with code ${le.exitCode}${line}`;
+      return `${le.signal ? `exited on ${le.signal}` : 'exited'}${line}`;
+    case 'timeout':
+      return `nothing on :${r.port} after ${Math.round((le.timeoutMs ?? 120_000) / 1000)}s`;
+    case 'dir-missing':
+      return 'folder is gone';
+    case 'install-failed':
+      return `${le.installCmd || 'npm install'} failed${line}`;
+    default:
+      return `${le.kind || 'failed'}${line}`;
+  }
+}
+
 async function cmdStatus() {
   const { bold, dim, green, red } = ui;
   const out = (s = '') => process.stdout.write(s + '\n');
@@ -1103,15 +1150,32 @@ async function cmdStatus() {
     return 0;
   }
   const w = Math.max(...rows.map((r) => r.host.length));
+  // Cut to the terminal, so a long error line never wraps the table. A pipe
+  // has no width and gets the whole line.
+  const cols = process.stdout.isTTY ? process.stdout.columns : 0;
+  let anyFailed = false;
   for (const r of rows) {
-    const state = !r.enabled ? 'disabled' : r.conflict ? 'conflict' : r.state;
-    const mark = state === 'running' ? green('*') : state === 'conflict' ? red('!') : dim('.');
+    const state = !r.enabled ? 'disabled'
+      : r.conflict ? 'conflict'
+        : r.state === 'stopped' && r.lastError ? 'failed'
+          : r.state;
+    const mark = state === 'running' ? green('*')
+      : state === 'conflict' ? red('!')
+        : state === 'failed' ? red('x')
+          : dim('.');
     const notes = [];
+    if (state === 'failed') {
+      anyFailed = true;
+      const used = 4 + w + 2 + 9 + `:${r.port}`.length + 2;
+      const note = failureNote(r);
+      notes.push(cols && used + note.length > cols ? `${note.slice(0, Math.max(0, cols - used - 1))}…` : note);
+    }
     if (state === 'running' && !r.owned) notes.push('external');
     if (state === 'running' && r.idleForMs != null) notes.push(`idle ${fmtIdle(r.idleForMs)}`);
     if (state === 'conflict' && r.conflictDir) notes.push(`port held by ${tilde(r.conflictDir)}`);
     out(`  ${mark} ${r.host.padEnd(w)}  ${state.padEnd(8)} ${dim(`:${r.port}`)}${notes.length ? dim(`  ${notes.join(' · ')}`) : ''}`);
   }
+  if (anyFailed) out(dim('  `xerb logs <host>` shows why · `xerb restart <host>` tries again'));
   out();
   out(dim(`  dashboard ${formatProjectUrl('xerb', live.port)} · sleeps after ${fmtIdle(live.status.idleTimeoutMs)} idle · \`xerb logs <host>\``));
   out();
@@ -1499,7 +1563,6 @@ async function main() {
   // ---- the bare run: consent, scan, install (or rescan) --------------------
   const interactive = process.stdin.isTTY && process.stdout.isTTY;
 
-  ensureStateDir();
   const startedAt = Date.now();
   // Migration counts as prior consent: these users already installed xerb
   // once, so a migrated run skips the first-run prompt like any re-run.
@@ -1531,6 +1594,10 @@ async function main() {
     }
     process.stdout.write('\n');
   }
+
+  // Only now: a refused or declined first run leaves nothing on disk, the same
+  // promise `--help` makes.
+  ensureStateDir();
 
   const outcome = await scanWithStatus(childEnvFor(FRONT_PORT, { scanAll: assumeYes }), interactive);
   if (outcome === 'declined') return 0; // picker q/Esc, which printed its own line

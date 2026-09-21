@@ -1042,8 +1042,10 @@ const CTRL_RE = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g;
 // is the tty, not the file, and it writes SYNCHRONOUSLY so that a failure page
 // rendered the instant a child dies finds the last thing it said already there.
 function makeTermSink(host, logFd) {
-  // A sequence or a CR can straddle a chunk boundary. Whatever might still be
-  // the start of one is held back here until the next chunk completes it.
+  // The log is written a finished line at a time: a redraw is only known to be
+  // over once its newline arrives. Whatever follows the last newline waits
+  // here for the next chunk, which also covers an escape sequence or a CR cut
+  // in half by a chunk boundary.
   let carry = '';
   const toLog = (text) => {
     if (typeof logFd !== 'number' || !text) return;
@@ -1053,35 +1055,30 @@ function makeTermSink(host, logFd) {
       /* a log we cannot write is never a reason to lose the terminal */
     }
   };
-  const strip = (text) =>
-    // A pty ends lines with CRLF, and a progress line redraws itself with a
-    // bare CR. Both become newlines: one keeps the file free of ^M, the other
-    // turns a spinner into lines you can grep rather than one unreadable one.
-    text.replace(/\r\n/g, '\n').replace(/\r/g, '\n').replace(CTRL_RE, '');
   return {
     write(buf) {
       appendTermRing(host, buf);
       broadcastTerm(host, buf);
-      let text = carry + buf.toString('utf8');
-      carry = '';
-      text = text.replace(OSC_RE, '').replace(CSI_RE, '').replace(ESC2_RE, '');
-      // A leftover ESC is an incomplete sequence: hold it and what follows.
-      // Capped, so one stray ESC byte cannot stall the log forever.
-      const esc = text.lastIndexOf('\u001b');
-      if (esc >= 0 && text.length - esc <= 64) {
-        carry = text.slice(esc);
-        text = text.slice(0, esc);
+      carry += buf.toString('utf8');
+      const nl = carry.lastIndexOf('\n');
+      if (nl < 0) {
+        // A progress bar that never ends its line cannot grow without bound:
+        // only what follows the last CR can still be on screen.
+        if (carry.length > LOG_CARRY_MAX) carry = carry.slice(carry.lastIndexOf('\r', carry.length - 2) + 1);
+        if (carry.length > LOG_CARRY_MAX) {
+          toLog(logLines(carry + '\n'));
+          carry = '';
+        }
+        return;
       }
-      if (text.endsWith('\r')) {
-        carry = '\r' + carry;
-        text = text.slice(0, -1);
-      }
-      toLog(strip(text));
+      const done = carry.slice(0, nl + 1);
+      carry = carry.slice(nl + 1);
+      toLog(logLines(done));
     },
     end() {
       const rest = carry;
       carry = '';
-      toLog(strip(rest.replace(/\u001b/g, '')));
+      toLog(logLines(rest));
       if (typeof logFd === 'number') {
         try {
           fs.closeSync(logFd);
@@ -1091,6 +1088,36 @@ function makeTermSink(host, logFd) {
       }
     },
   };
+}
+
+const LOG_CARRY_MAX = 64 * 1024;
+// Braille patterns, U+2800 to U+28FF: every frame of npm's, pnpm's and ora's
+// spinners.
+const SPINNER_ONLY_RE = /^[\u2800-\u28ff\s]*$/;
+
+// Terminal output to log text. The scrollback and the panels get the bytes as
+// they came; the text file gets what a terminal would be SHOWING. A pty ends
+// lines with CRLF, and a progress line redraws itself in place with a bare CR,
+// so each line keeps only what follows its last CR: a bar that redrew forty
+// times is its final state, not forty lines. A line that was nothing but
+// redraws or spinner frames is dropped. A line that was blank to begin with is
+// spacing the program asked for, and stays.
+function logLines(text) {
+  if (!text) return '';
+  const clean = text.replace(OSC_RE, '').replace(CSI_RE, '').replace(ESC2_RE, '').replace(/\u001b/g, '');
+  const open = !clean.endsWith('\n');
+  const lines = clean.split('\n');
+  const last = lines.pop(); // '' after a final newline, else the unfinished line
+  if (open) lines.push(last);
+  const out = [];
+  for (const raw of lines) {
+    const body = raw.endsWith('\r') ? raw.slice(0, -1) : raw;
+    const line = body.slice(body.lastIndexOf('\r') + 1).replace(CTRL_RE, '');
+    if (body !== '' && SPINNER_ONLY_RE.test(line)) continue;
+    out.push(line);
+  }
+  if (!out.length) return '';
+  return out.join('\n') + (open ? '' : '\n');
 }
 
 // GET /__xerb/term/<host>, a WebSocket upgrade on the dashboard's own host.
@@ -1262,6 +1289,26 @@ function inferInstallCmd(startCmd) {
     default:
       return 'npm install';
   }
+}
+
+// Is there anything for an install to fetch? A package.json with no
+// dependencies never grows a node_modules, so "node_modules is missing" stays
+// true forever and every wake paid for an install that does nothing. A
+// workspace root still installs: its dependencies live in the member packages.
+// An unreadable or invalid file skips too, and the start command gets to
+// produce the real error.
+function hasDepsToInstall(packageJson) {
+  let pkg;
+  try {
+    pkg = JSON.parse(fs.readFileSync(packageJson, 'utf8'));
+  } catch {
+    return false;
+  }
+  if (!pkg || typeof pkg !== 'object') return false;
+  if (pkg.workspaces) return true;
+  return ['dependencies', 'devDependencies', 'optionalDependencies'].some(
+    (k) => pkg[k] && typeof pkg[k] === 'object' && Object.keys(pkg[k]).length > 0
+  );
 }
 
 // Run the install step for a project whose node_modules is missing. Streams to
@@ -1484,7 +1531,7 @@ async function ensureUp(project) {
     // Deps arrived (the install worked, or the user ran it by hand): forget any
     // remembered failure so a later one can install again.
     if (haveModules) r.installFailed = null;
-    if (!haveModules && fs.existsSync(packageJson)) {
+    if (!haveModules && fs.existsSync(packageJson) && hasDepsToInstall(packageJson)) {
       // An install that already failed on this record is not retried by a plain
       // reload: node_modules is still missing, so the condition above is still
       // true, and without this memo every refresh paid installTimeoutMs again
@@ -2376,6 +2423,11 @@ function liveState(host, project, authorized = false) {
           code: r.lastError.code || null,
           message: authorized ? r.lastError.message || null : null,
           at: r.lastError.at || null,
+          // What `xerb status` quotes in a failed row.
+          exitCode: r.lastError.exitCode ?? null,
+          signal: r.lastError.signal || null,
+          timeoutMs: r.lastError.timeoutMs ?? null,
+          installCmd: r.lastError.installCmd || null,
           errorLine: authorized ? errorLine : null,
         }
       : null,
@@ -2434,6 +2486,17 @@ function hostFromPath(pathname, prefix) {
 // path is not one of them. Every caller is already past handleControl's token
 // guard. Grouped in one function so a RegistryError from any of them turns
 // into the same inline JSON the form and the edit panel render.
+// A field the route does not know is a 400 that names it. A typo that falls on
+// the floor looks like success and changes nothing, which is worse than an
+// error. Answers true when it refused (the response is already sent).
+function rejectUnknown(res, body, allowed) {
+  const unknown = Object.keys(body).filter((k) => !allowed.includes(k));
+  if (!unknown.length) return false;
+  const named = unknown.map((k) => `"${k}"`).join(', ');
+  sendJson(res, 400, { ok: false, reason: `unknown field${unknown.length > 1 ? 's' : ''} ${named}; known: ${allowed.join(', ')}` });
+  return true;
+}
+
 async function handleEditControl(req, res, url) {
   const pathname = url.pathname;
   try {
@@ -2442,6 +2505,7 @@ async function handleEditControl(req, res, url) {
     // directory and hands back what the form should show.
     if (pathname === '/__xerb/detect') {
       const body = (await readJsonBody(req)) || {};
+      if (rejectUnknown(res, body, ['dir'])) return true;
       const raw = typeof body.dir === 'string' ? body.dir.trim() : '';
       if (!raw) {
         sendJson(res, 400, { ok: false, reason: 'a folder path is required' });
@@ -2484,6 +2548,14 @@ async function handleEditControl(req, res, url) {
 
     if (pathname === '/__xerb/add') {
       const body = (await readJsonBody(req)) || {};
+      if (rejectUnknown(res, body, ['dir', 'name', 'host', 'startCmd', 'port', 'framework', 'parked'])) return true;
+      // The registry key is `host`, the CLI flag is `--name`, the form field is
+      // `name`. Both spellings mean the same thing here.
+      if (body.name != null && body.host != null && String(body.name).trim() !== String(body.host).trim()) {
+        sendJson(res, 400, { ok: false, reason: 'send "name" or "host", not both' });
+        return true;
+      }
+      const rawName = body.name ?? body.host;
       const dir = expandTilde(String(body.dir || '').trim()).replace(/(.)\/+$/, '$1');
       if (!dir) {
         sendJson(res, 400, { ok: false, reason: 'a folder path is required' });
@@ -2493,7 +2565,7 @@ async function handleEditControl(req, res, url) {
         sendJson(res, 400, { ok: false, reason: 'the folder path must be absolute (~ is allowed)' });
         return true;
       }
-      const host = sanitizeHost(String(body.name || '').trim() || path.basename(dir));
+      const host = sanitizeHost(String(rawName || '').trim() || path.basename(dir));
       const wantPort = body.port === undefined || body.port === null || body.port === ''
         ? null
         : Number(body.port);
@@ -2579,6 +2651,7 @@ async function handleEditControl(req, res, url) {
         return true;
       }
       const body = (await readJsonBody(req)) || {};
+      if (rejectUnknown(res, body, ['port', 'startCmd'])) return true;
       const wantsPort = body.port !== undefined && body.port !== null && body.port !== '';
       const wantsCmd = typeof body.startCmd === 'string' && body.startCmd.trim() !== '';
       if (!wantsPort && !wantsCmd) {
@@ -4527,6 +4600,7 @@ export {
   upstreamAgent,
   reapIdle,
   __setRuntimeForTest,
+  makeTermSink,
   __addConnForTest,
   __setLastAccessForTest,
   __liveConnInfo,

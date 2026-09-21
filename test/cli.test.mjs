@@ -122,6 +122,13 @@ test('unknown command: says which, reprints the table, exit 1, no state dir', ()
   assert.equal(r.madeState, false);
 });
 
+test('a refused first run (no terminal, no --yes) exits 1 and leaves no state dir', () => {
+  const r = runClean([]);
+  assert.equal(r.code, 1);
+  assert.match(r.stderr, /first run needs a terminal/);
+  assert.equal(r.madeState, false, 'not even an empty logs folder');
+});
+
 test('every runtime subcommand with no daemon: the same line, exit 3', () => {
   for (const args of [['status'], ['stop', 'x'], ['restart', 'x'], ['wake', 'x'], ['open', 'x'], ['attach', 'x'], ['logs', 'x', '-f']]) {
     const r = runClean(args);
@@ -308,6 +315,7 @@ after(async () => {
 test('status: one line per project, with the disabled one marked', () => {
   const r = cli(['status']);
   assert.equal(r.code, 0);
+  assert.doesNotMatch(r.stdout, /tries again/, 'nothing failed, so no hint line');
   assert.match(r.stdout, new RegExp(`demo\\s+\\S+\\s+:${demoPort}`));
   assert.match(r.stdout, /parked\s+disabled/);
   assert.match(r.stdout, /dashboard http:\/\/xerb\.localhost:/);
@@ -393,6 +401,34 @@ test('restart waits for the old server to let go of the port', { timeout: 60000 
 
   cli(['stop', 'lingerer']);
   cli(['remove', 'lingerer']);
+});
+
+test('status shows a failed start as failed, with the reason, and still exits 0', async () => {
+  const dir = path.join(homeDir, 'crash-app');
+  fs.mkdirSync(dir, { recursive: true });
+  const port = await freePort();
+  const crash = `node -e "console.error('Error: Cannot find module left-pad'); process.exit(1)"`;
+  assert.equal(cli(['add', dir, '--cmd', crash, '--port', String(port)]).code, 0);
+
+  // The daemon picks the new entry up from its file watch, a moment later.
+  assert.ok(await poll(async () => (await statusJson()).projects.some((p) => p.host === 'crash-app'), 5000));
+  const woke = cli(['wake', 'crash-app']);
+  assert.notEqual(woke.code, 0, `the wake itself reports the failure: ${woke.stdout}${woke.stderr}`);
+  const failed = await poll(async () => {
+    const row = (await statusJson()).projects.find((p) => p.host === 'crash-app');
+    return row && row.state === 'stopped' && row.lastError ? row : null;
+  }, 20000);
+  assert.ok(failed, 'the daemon recorded the failure');
+  assert.equal(failed.lastError.kind, 'exited');
+
+  const r = cli(['status']);
+  assert.equal(r.code, 0, 'a failed project is a fact about the project, not the command');
+  assert.match(r.stdout, /x crash-app\s+failed\s+:\d+\s+exited with code 1 · Error: Cannot find module left-pad/);
+  assert.match(r.stdout, /`xerb logs <host>` shows why · `xerb restart <host>` tries again/);
+
+  assert.equal(cli(['remove', 'crash-app']).code, 0);
+  assert.ok(await poll(async () => !(await statusJson()).projects.some((p) => p.host === 'crash-app'), 5000));
+  assert.doesNotMatch(cli(['status']).stdout, /tries again/, 'the hint goes with the failure');
 });
 
 test('wake refuses a disabled project, and names the fix', () => {
@@ -521,8 +557,29 @@ test('add on an unprovable directory prints what it looked for and exits 1', () 
   assert.match(r.stdout, /nothing provable/);
   assert.match(r.stdout, /rails\s+Gemfile/);
   assert.match(r.stdout, /django\s+manage\.py/);
-  assert.match(r.stdout, /--cmd "npm run dev"/, 'the fix is the --cmd form');
+  assert.match(r.stdout, /--cmd "flask run --port <port>"/, 'the fix is the --cmd form, for what is in the folder');
+  assert.match(r.stdout, /`<port>` is replaced with the port xerb assigns\./);
+  assert.doesNotMatch(r.stdout, /npm run dev/, 'app.py is the one thing `npm run dev` cannot start');
   assert.ok(!registry().projects.some((p) => p.dir === dir), 'nothing was written');
+});
+
+test('the unprovable hint is picked from the folder, and an empty one gets the generic line', () => {
+  const hintFor = (name, files) => {
+    const dir = path.join(homeDir, name);
+    fs.mkdirSync(dir, { recursive: true });
+    for (const [f, body] of Object.entries(files)) fs.writeFileSync(path.join(dir, f), body);
+    const r = cli(['add', dir]);
+    assert.equal(r.code, 1, name);
+    assert.doesNotMatch(r.stdout, /npm run dev/, name);
+    return r.stdout;
+  };
+  assert.match(hintFor('hint-empty', {}), /--cmd "your-start-command --port <port>"/);
+  assert.match(hintFor('hint-fastapi', { 'main.py': '', 'requirements.txt': 'fastapi\nuvicorn\n' }), /--cmd "uvicorn main:app --port <port>"/);
+  const go = hintFor('hint-go', { 'go.mod': 'module x\n' });
+  assert.match(go, /--cmd "go run \."/);
+  assert.match(go, /has to read PORT/);
+  assert.match(hintFor('hint-compose', { 'compose.yaml': 'services: {}\n' }), /--cmd "docker compose up" --port <published port>/);
+  assert.match(hintFor('hint-node', { 'package.json': '{"scripts":{"start":"node ."}}' }), /--cmd "npm start"/);
 });
 
 test('add --cmd registers the unprovable one, --name and --parked apply', async () => {

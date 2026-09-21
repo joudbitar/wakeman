@@ -144,6 +144,7 @@ const {
   statusPayload,
   __setLastAccessForTest,
   __liveConnInfo,
+  makeTermSink,
   NO_PTY_NOTE,
   termRingBytes,
   upstreamAgent,
@@ -471,6 +472,51 @@ test('an open terminal counts as an active connection, so the project does not s
   __setLastAccessForTest('watched', Date.now() - IDLE_MS * 3);
   reapIdle();
   assert.equal(getRuntime('watched').state, 'stopped', 'with nothing watching, it sleeps');
+});
+
+// --- the log writer: redraws and spinner frames ------------------------------
+
+// What <host>.log holds after these chunks went through a spawn's sink. The
+// ring gets the same chunks byte for byte, which the ring test below covers.
+function logAfter(chunks) {
+  const file = path.join(TMP, `sink-${crypto.randomBytes(4).toString('hex')}.log`);
+  const sink = makeTermSink('sink-unit', fs.openSync(file, 'a'));
+  for (const c of chunks) sink.write(Buffer.from(c, 'utf8'));
+  sink.end();
+  return fs.readFileSync(file, 'utf8');
+}
+
+test('a spinner that ends in a real line logs only the line', () => {
+  assert.equal(logAfter(['⠋\r⠙\r⠹\rdone\n']), 'done\n');
+});
+
+test('a progress bar that redraws in place logs its final state', () => {
+  assert.equal(logAfter(['10%\r50%\r100%\n']), '100%\n');
+});
+
+test('CRLF lines survive untouched, and so does a blank line between them', () => {
+  assert.equal(logAfter(['line one\r\nline two\r\n']), 'line one\nline two\n');
+  assert.equal(logAfter(['banner\r\n\r\nready\r\n']), 'banner\n\nready\n');
+});
+
+test('a redraw cut in half by a chunk boundary still logs its final state', () => {
+  assert.equal(logAfter(['⠋\r⠙', '\rok\n']), 'ok\n');
+});
+
+test('a spinner frame left on screen when the process dies is not the last line of the log', () => {
+  assert.equal(logAfter(['Error: boom\r\n', '⠙']), 'Error: boom\n');
+  assert.equal(logAfter(['⠋\r⠙\r⠹\n']), '', 'a line that was only frames is dropped');
+});
+
+test('the ring stays byte-exact while the log collapses the redraws', () => {
+  const raw = '⠋\r⠙\rdone\r\n';
+  const before = termRingBytes('sink-ring').length;
+  const file = path.join(TMP, 'sink-ring.log');
+  const sink = makeTermSink('sink-ring', fs.openSync(file, 'a'));
+  sink.write(Buffer.from(raw, 'utf8'));
+  sink.end();
+  assert.equal(termRingBytes('sink-ring').subarray(before).toString('utf8'), raw);
+  assert.equal(fs.readFileSync(file, 'utf8'), 'done\n');
 });
 
 // --- the ring buffer --------------------------------------------------------

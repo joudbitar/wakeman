@@ -335,6 +335,41 @@ test('add errors land inline: missing folder, taken name, port already in use', 
   assert.equal(entryFor('busy'), null);
 });
 
+test('add takes "host" as another spelling of "name", and refuses the two disagreeing', async () => {
+  const aliased = await post('/__xerb/add', { body: { dir: NODE_DIR, host: 'added', startCmd: 'npm run dev' } });
+  assert.equal(aliased.status, 200, JSON.stringify(aliased.json));
+  assert.equal(aliased.json.host, 'added', 'the name came from "host", not the folder');
+
+  const both = await post('/__xerb/add', { body: { dir: NODE_DIR, name: 'added', host: 'other', startCmd: 'npm run dev' } });
+  assert.equal(both.status, 400);
+  assert.equal(both.json.reason, 'send "name" or "host", not both');
+
+  // The sandbox request: a folder that is already registered, sent with a
+  // `host` that belongs to a different folder. It used to answer ok/updated
+  // under the folder's own name.
+  const stolen = await post('/__xerb/add', { body: { dir: NODE_DIR, host: 'alpha', startCmd: 'npm run dev' } });
+  assert.equal(stolen.status, 409);
+  assert.match(stolen.json.reason, /"alpha" is already registered for /);
+  assert.equal(entryFor('alpha').dir, ALPHA_DIR, 'alpha still points at its own folder');
+});
+
+test('add, set and detect name a field they do not know instead of dropping it', async () => {
+  const before = JSON.stringify(readReg());
+  const add = await post('/__xerb/add', { body: { dir: SPARE_DIR, hots: 'spare', startCmd: 'true' } });
+  assert.equal(add.status, 400);
+  assert.equal(add.json.reason, 'unknown field "hots"; known: dir, name, host, startCmd, port, framework, parked');
+
+  const set = await post('/__xerb/set/alpha', { body: { cmd: 'true' } });
+  assert.equal(set.status, 400);
+  assert.equal(set.json.reason, 'unknown field "cmd"; known: port, startCmd');
+
+  const detect = await post('/__xerb/detect', { body: { dir: NODE_DIR, path: NODE_DIR } });
+  assert.equal(detect.status, 400);
+  assert.equal(detect.json.reason, 'unknown field "path"; known: dir');
+
+  assert.equal(JSON.stringify(readReg()), before, 'none of the three wrote anything');
+});
+
 test('add parks a project when the checkbox is ticked', async () => {
   const res = await post('/__xerb/add', {
     body: { dir: STATIC_DIR, name: 'site', startCmd: '$XERB_STATIC', parked: true },
