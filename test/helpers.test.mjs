@@ -5,6 +5,7 @@
 // not "fix" it here. Pure node:test + node:assert, no real projects, no network,
 // only ephemeral ports.
 
+import './isolate-logs.mjs';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import net from 'node:net';

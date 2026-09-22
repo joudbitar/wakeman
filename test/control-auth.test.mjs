@@ -13,6 +13,7 @@
 // registry AND the token file at throwaway temp files, leaving the real repo's
 // projects.json / control-token / logs untouched. Pure node:test + node:assert.
 
+import './isolate-logs.mjs';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';

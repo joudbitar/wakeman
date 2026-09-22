@@ -368,7 +368,9 @@ test('every start writes the separator line to <host>.log', async (t) => {
   // A second attempt gets its own separator, which is what stopped two
   // `compiling...` runs reading as one.
   await httpGet(daemonPort, 'sepcheck.localhost', '/?retry=1', NAV);
-  await waitFor(() => fs.readFileSync(file, 'utf8').split('\n').filter((l) => l.startsWith('── ')).length === 2, 8000);
+  // Wait for the run's output, not only its separator: the daemon writes the
+  // separator before the spawn, so under a loaded suite it lands well ahead.
+  await waitFor(() => fs.readFileSync(file, 'utf8').split('\n').filter((l) => l === 'first-run').length === 2, 8000);
   const after = fs.readFileSync(file, 'utf8').split('\n');
   assert.equal(after.filter((l) => l.startsWith('── ')).length, 2, 'the retry wrote its own separator');
   assert.equal(after.filter((l) => l === 'first-run').length, 2, 'both runs are still in the file');

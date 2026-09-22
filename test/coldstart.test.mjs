@@ -11,6 +11,7 @@
 // then call the exported loadConfig() explicitly (the daemon only auto-loads
 // under RUN_AS_MAIN, which a test import deliberately skips).
 
+import './isolate-logs.mjs';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
@@ -385,7 +386,7 @@ test('N concurrent cold hits spawn exactly one child', async (t) => {
   // And no second listener collided on the port (EADDRINUSE would appear if a
   // second child had raced the first).
   const logTail = (() => {
-    try { return fs.readFileSync(path.join(path.dirname(new URL('../xerb.mjs', import.meta.url).pathname), 'logs', 'spawn.log'), 'utf8'); } catch { return ''; }
+    try { return fs.readFileSync(path.join(process.env.XERB_LOGS_DIR, 'spawn.log'), 'utf8'); } catch { return ''; }
   })();
   assert.doesNotMatch(logTail, /EADDRINUSE/, 'no port collision in the child log');
 });

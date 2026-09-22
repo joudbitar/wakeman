@@ -15,6 +15,7 @@
 // UNIQUE host and rewrites the registry to contain ONLY its own project, so
 // reapIdle never touches another test's host and connection counts never bleed.
 
+import './isolate-logs.mjs';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';

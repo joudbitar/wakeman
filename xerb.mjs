@@ -471,7 +471,7 @@ function startSourceWatch() {
     // keeps a pathological loop from thrashing launchd.
     t = setTimeout(() => {
       log(`source: ${file || 'a file'} changed; exiting so launchd restarts with the new code`);
-      process.exit(0);
+      shutdown('source change');
     }, 300);
   };
   for (const target of [path.join(here, 'xerb.mjs'), path.join(here, 'lib')]) {
@@ -916,6 +916,8 @@ const TERM_RING_BYTES = 256 * 1024;
 // The one line a read-only panel opens with, and the one `xerb status`
 // prints when there is no python3. ASCII: it is drawn in a terminal.
 const NO_PTY_NOTE = 'no python3, so terminals are read-only: output shows, nothing you type reaches the dev server';
+// What a panel says about a dev server somebody else started. ASCII, as above.
+const EXTERNAL_TERM_NOTE = 'this dev server was started outside xerb, so its output is in the terminal that started it. Stop it there and xerb starts its own, with a terminal here';
 
 // undefined = never looked, null = looked and there is none.
 let ptyPython;
@@ -1211,7 +1213,12 @@ function attachTermSocket(conn, project) {
   // starting until someone answers a question, and waiting for the bring-up
   // would mean the panel could not show the question.
   if (project.enabled !== false) {
-    ensureUp(project).catch(() => {
+    ensureUp(project).then((r) => {
+      // A server xerb did not start has no terminal here to show. Say so, to
+      // this panel only, instead of leaving an empty box under a green badge.
+      if (r.state !== 'running' || r.owned || !socks.has(entry)) return;
+      conn.send(Buffer.from(`\r\n\x1b[2m[xerb] ${EXTERNAL_TERM_NOTE}\x1b[0m\r\n`, 'utf8'));
+    }).catch(() => {
       /* the failure is on the page and in the log; the socket stays open */
     });
   }

@@ -15,6 +15,7 @@
 // two seconds. Both swap __setResolveListenerPid, which is also why every adopt
 // test below pins a pid: the adopt path resolves one now.
 
+import './isolate-logs.mjs';
 import { test, before, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';

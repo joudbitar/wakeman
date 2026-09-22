@@ -4,6 +4,7 @@
 // host, collisions, unknown hosts, and callers without the capability token.
 // Real daemon server, temp registry, no fixed ports.
 
+import './isolate-logs.mjs';
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';

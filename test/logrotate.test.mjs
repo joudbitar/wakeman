@@ -9,6 +9,7 @@
 // fully deterministic. rotateIfNeeded takes an explicit `file` arg, so tests
 // touch only their throwaway dir and never the real LOGS_DIR.
 
+import './isolate-logs.mjs';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';

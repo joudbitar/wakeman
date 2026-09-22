@@ -6,6 +6,7 @@
 // 403 instead of reaching the control plane. Pure node:test + node:assert, no
 // real projects or fixed ports.
 
+import './isolate-logs.mjs';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
