@@ -1,6 +1,6 @@
 # ADR 0003: one way in
 
-Status: accepted (2026-07-22). Supersedes the try/install split in ADR 0001.
+Status: accepted (2026-07-22). Supersedes the try/install split in ADR 0001. Its Linux paragraph is replaced by ADR 0004.
 
 ## Context
 

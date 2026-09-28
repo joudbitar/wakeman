@@ -56,7 +56,7 @@ const SKIP = new Set([
   '.vscode', '.next', 'dist', 'build', '.turbo', 'vendor', '.venv', 'venv',
   '__pycache__', 'Applications', '.local', '.config', '.rustup', '.cargo',
   'go', '.docker', '.ollama', '.android', '.gradle', '.m2', 'Music', 'Movies',
-  'Pictures', 'Photos Library.photoslibrary',
+  'Pictures', 'Photos Library.photoslibrary', 'snap',
 ]);
 
 // Host name we must never emit (the daemon owns it).

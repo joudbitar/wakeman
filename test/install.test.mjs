@@ -3,7 +3,11 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { LAUNCHD_LABEL, assembleLaunchdPath, renderPlist, stripCaddyBlock, extractWorkingDirectory, legacyRegistryCandidates, LEGACY_LAUNCHD_LABEL, toolsToVerify, parseLaunchdPid, waitForExit } from '../lib/install.mjs';
+import {
+  LAUNCHD_LABEL, SYSTEMD_UNIT, assembleLaunchdPath, assembleServicePath, renderPlist, renderUnit, quoteUnitWord, splitUnitWords,
+  unitEnvironment, unitRunsDaemon, parseSystemdMainPid, pathHintRc, stripCaddyBlock, extractWorkingDirectory,
+  legacyRegistryCandidates, LEGACY_LAUNCHD_LABEL, toolsToVerify, parseLaunchdPid, waitForExit,
+} from '../lib/install.mjs';
 
 test('assembleLaunchdPath preserves the user shell PATH order verbatim', () => {
   // The bug this guards against: the machine has a broken pnpm in
@@ -67,6 +71,131 @@ test('assembleLaunchdPath still covers the basics when the install PATH is minim
   for (const d of ['/Users/x/Library/pnpm', '/Users/x/.local/bin', '/opt/homebrew/bin', '/usr/local/bin', '/usr/bin', '/bin']) {
     assert.ok(dirs.includes(d), `${d} present`);
   }
+});
+
+test('assembleServicePath: the Linux net is Linux dirs, and the macOS net is untouched', () => {
+  const linux = assembleServicePath({ userPath: '/home/x/.cargo/bin:/usr/bin', nodeDir: '/opt/node/bin', home: '/home/x', platform: 'linux' }).split(':');
+  assert.deepEqual(linux.slice(0, 3), ['/home/x/.cargo/bin', '/usr/bin', '/opt/node/bin'], 'inherited PATH first, verbatim, then node');
+  for (const d of ['/home/x/.local/share/pnpm', '/home/x/.local/bin', '/home/linuxbrew/.linuxbrew/bin', '/usr/local/bin', '/bin', '/snap/bin', '/usr/sbin', '/sbin']) {
+    assert.ok(linux.includes(d), `${d} present`);
+  }
+  assert.ok(!linux.includes('/opt/homebrew/bin') && !linux.includes('/home/x/Library/pnpm'), 'no macOS dirs on Linux');
+  assert.equal(new Set(linux).size, linux.length, 'no duplicates');
+
+  const args = { userPath: '/Users/x/.cargo/bin:/usr/bin', nodeDir: '/opt/node/bin', home: '/Users/x' };
+  assert.equal(assembleServicePath({ ...args, platform: 'darwin' }), assembleLaunchdPath(args), 'assembleLaunchdPath is the darwin case');
+  assert.ok(!assembleLaunchdPath(args).includes('/snap/bin'), 'and it has no Linux dirs');
+});
+
+test('renderUnit mirrors the plist: node, daemon, state dir, ports, PATH, logs, restart, login start', () => {
+  const unit = renderUnit({
+    nodeBin: '/home/x/.local/state/wakeman/bin/node',
+    daemonPath: '/home/x/.local/state/wakeman/app/wakeman.mjs',
+    workDir: '/home/x/.local/state/wakeman/app',
+    stateDir: '/home/x/.local/state/wakeman',
+    logsDir: '/home/x/.local/state/wakeman/logs',
+    home: '/home/x',
+    pathEnv: '/opt/node/bin:/usr/bin:/bin',
+  });
+  const lines = unit.split('\n');
+  assert.ok(lines.includes('ExecStart="/home/x/.local/state/wakeman/bin/node" "/home/x/.local/state/wakeman/app/wakeman.mjs"'));
+  assert.ok(lines.includes('WorkingDirectory=/home/x/.local/state/wakeman/app'));
+  assert.ok(lines.includes('Environment="HOME=/home/x"'));
+  assert.ok(lines.includes('Environment="PATH=/opt/node/bin:/usr/bin:/bin"'));
+  assert.ok(lines.includes('Environment="WAKEMAN_STATE_DIR=/home/x/.local/state/wakeman"'));
+  assert.ok(lines.includes('Environment="WAKEMAN_PORT=80"'));
+  assert.ok(lines.includes('Environment="WAKEMAN_FALLBACK_PORT=4000"'));
+  assert.ok(!unit.includes('WAKEMAN_WATCH_SOURCE'), 'no source watch on a package install');
+  assert.ok(lines.includes('Restart=always'));
+  assert.ok(lines.includes('RestartSec=2'));
+  assert.ok(lines.includes('StartLimitIntervalSec=0'), 'never gives up, like KeepAlive');
+  assert.ok(lines.includes('StandardOutput=append:/home/x/.local/state/wakeman/logs/daemon.out'));
+  assert.ok(lines.includes('StandardError=append:/home/x/.local/state/wakeman/logs/daemon.err'));
+  assert.ok(lines.includes('WantedBy=default.target'), 'starts with the login session');
+  assert.equal(SYSTEMD_UNIT, 'wakeman.service');
+});
+
+test('renderUnit on a checkout watches the source and restarts in a second', () => {
+  const unit = renderUnit({
+    nodeBin: '/n', daemonPath: '/d/wakeman.mjs', workDir: '/d', stateDir: '/s', logsDir: '/l', home: '/h', pathEnv: '/a', devWatch: true,
+  });
+  assert.ok(unit.includes('Environment="WAKEMAN_WATCH_SOURCE=1"'));
+  assert.ok(unit.includes('\nRestartSec=1\n'));
+});
+
+test('renderUnit escapes what systemd would otherwise read as syntax', () => {
+  // A space splits ExecStart words; % starts a specifier; a quote or backslash
+  // ends or escapes a quoted word; $ expands in ExecStart but not in
+  // Environment=.
+  const unit = renderUnit({
+    nodeBin: '/odd dir/100% "node"\\bin/node',
+    daemonPath: '/d/$HOME/wakeman.mjs',
+    workDir: '/odd dir/100%',
+    stateDir: '/s 50%',
+    logsDir: '/l 50%',
+    home: '/odd dir',
+    pathEnv: '/a b:/c "d":/e$f',
+  });
+  const lines = unit.split('\n');
+  assert.ok(lines.includes('ExecStart="/odd dir/100%% \\"node\\"\\\\bin/node" "/d/$$HOME/wakeman.mjs"'));
+  assert.ok(lines.includes('WorkingDirectory=/odd dir/100%%'));
+  assert.ok(lines.includes('Environment="WAKEMAN_STATE_DIR=/s 50%%"'));
+  assert.ok(lines.includes('Environment="PATH=/a b:/c \\"d\\":/e$f"'), 'no $$ in Environment=');
+  assert.ok(lines.includes('StandardOutput=append:/l 50%%/daemon.out'));
+  // And it reads back to what went in.
+  const env = unitEnvironment(unit);
+  assert.equal(env.get('WAKEMAN_STATE_DIR'), '/s 50%');
+  assert.equal(env.get('PATH'), '/a b:/c "d":/e$f');
+  assert.equal(env.get('HOME'), '/odd dir');
+});
+
+test('quoteUnitWord and splitUnitWords round-trip, and split reads hand-written units too', () => {
+  for (const w of ['/plain', '/with space', 'a"b', 'a\\b', '50%', 'x=$y']) {
+    assert.deepEqual(splitUnitWords(quoteUnitWord(w)), [w], JSON.stringify(w));
+  }
+  assert.deepEqual(splitUnitWords(`/usr/bin/node  '/single quoted/x' bare "two words"`), ['/usr/bin/node', '/single quoted/x', 'bare', 'two words']);
+  assert.deepEqual(splitUnitWords(''), []);
+  assert.equal(quoteUnitWord('$x', { exec: true }), '"$$x"');
+  assert.equal(quoteUnitWord('$x'), '"$x"');
+});
+
+test('unitEnvironment: later lines win, several per line work, non-Environment lines are ignored', () => {
+  const env = unitEnvironment([
+    '[Service]',
+    'Environment="A=1" B=2',
+    'Environment=A=3',
+    'ExecStart=/x "C=notenv"',
+    '# Environment=D=comment',
+  ].join('\n'));
+  assert.deepEqual([...env], [['A', '3'], ['B', '2']]);
+  assert.equal(unitEnvironment('').size, 0);
+});
+
+test('unitRunsDaemon answers whether the unit starts THIS checkout', () => {
+  const unit = renderUnit({
+    nodeBin: '/n', daemonPath: '/home/x/wakeman checkout/wakeman.mjs', workDir: '/d', stateDir: '/s', logsDir: '/l', home: '/h', pathEnv: '/a',
+  });
+  assert.equal(unitRunsDaemon(unit, '/home/x/wakeman checkout/wakeman.mjs'), true);
+  assert.equal(unitRunsDaemon(unit, '/home/x/other/wakeman.mjs'), false);
+  assert.equal(unitRunsDaemon('Environment="X=/home/x/wakeman checkout/wakeman.mjs"', '/home/x/wakeman checkout/wakeman.mjs'), false, 'only ExecStart counts');
+  assert.equal(unitRunsDaemon('', '/x'), false);
+});
+
+test('parseSystemdMainPid reads the bare --value form and the key=value form, 0 is not running', () => {
+  assert.equal(parseSystemdMainPid('54321\n'), 54321);
+  assert.equal(parseSystemdMainPid('MainPID=54321\n'), 54321);
+  assert.equal(parseSystemdMainPid('0\n'), null, 'loaded, no process');
+  assert.equal(parseSystemdMainPid(''), null);
+  assert.equal(parseSystemdMainPid(undefined), null);
+  assert.equal(parseSystemdMainPid('Unit wakeman.service could not be found.\n'), null);
+});
+
+test('pathHintRc: bash reads .bash_profile on a Mac and .bashrc on Linux, zsh reads .zshrc on both', () => {
+  assert.equal(pathHintRc({ shell: '/bin/bash', platform: 'darwin' }), '~/.bash_profile');
+  assert.equal(pathHintRc({ shell: '/usr/bin/bash', platform: 'linux' }), '~/.bashrc');
+  assert.equal(pathHintRc({ shell: '/bin/zsh', platform: 'darwin' }), '~/.zshrc');
+  assert.equal(pathHintRc({ shell: '/usr/bin/zsh', platform: 'linux' }), '~/.zshrc');
+  assert.equal(pathHintRc({ shell: '', platform: 'linux' }), '~/.zshrc');
 });
 
 test('renderPlist pins the state dir, the front door, and the daemon path', () => {

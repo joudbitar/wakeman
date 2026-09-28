@@ -19,16 +19,18 @@ The daemon is its own front door: it binds the wildcard address on :80 and
 destroys any connection that is not from loopback before a byte is read
 (ADR 0002). When :80 is unavailable (a leftover Caddy from the pre-0003 install
 still holding the port, or anything else already bound there) it falls back
-to :4000 and URLs carry the port. macOS only: on any other platform the
+to :4000 and URLs carry the port. On Linux :80 also needs the capability
+from ADR 0004. macOS and Linux with systemd only: on any other platform the
 entrypoint prints one line and exits 2. The daemon is the brain: it maps hostnames to
 projects, starts and stops dev servers on demand, proxies traffic, and reaps
 idle projects. Each dev server runs on its own fixed port. Zero npm
 dependencies, Node built-ins only.
 
-The persistent install is a user LaunchAgent written and loaded by
-`bin/wakeman.mjs` (ADR 0003): the package is copied to
-`~/.local/state/wakeman/app`, the plist points launchd at that copy, and
-`wakeman uninstall` reverses all of it.
+The persistent install is a user LaunchAgent on macOS and a systemd user
+unit on Linux, written and loaded by `bin/wakeman.mjs` (ADR 0003, ADR 0004):
+the package is copied to `~/.local/state/wakeman/app`, the plist or unit
+points the service manager at that copy, and `wakeman uninstall` reverses all
+of it.
 
 ## files
 
@@ -37,8 +39,10 @@ The persistent install is a user LaunchAgent written and loaded by
 | `wakeman.mjs` | the proxy + lifecycle daemon (Node ESM, zero deps) |
 | `scan.mjs` | scans `scanRoots` (default `~`) for projects, writes and merges `projects.json` |
 | `projects.json` | the registry (gitignored; see `projects.example.json`) |
-| `bin/wakeman.mjs` | the entrypoint: consent prompt, scan, launchd install, uninstall |
-| `lib/install.mjs` | pure install helpers: plist rendering, launchd PATH, Caddyfile cleanup |
+| `bin/wakeman.mjs` | the entrypoint: consent prompt, scan, launchd or systemd install, uninstall |
+| `lib/install.mjs` | pure install helpers: plist and unit rendering, service PATH, Caddyfile cleanup |
+| `lib/procnet.mjs` | who listens on a port, from `/proc`, for Linux without lsof |
+| `lib/linux.mjs` | Linux install helpers: unit path, systemd checks, the port-80 capability, the node pin |
 | `lib/picker.mjs` | the scan picker: choose which newly found projects register |
 | `lib/registry-cli.mjs` | the one module that creates, changes or deletes a registry entry; the CLI, the dashboard routes and the add-project skill all write through it |
 | `lib/ws.mjs` | a minimal RFC 6455 server, for the per-project terminal socket |
