@@ -50,7 +50,7 @@ $ npx wakeman
   agent skill: add-project installed to ~/.claude/skills · other agents: npx skills add joudbitar/wakeman
 ```
 
-That's the whole install. Answering `n` exits with nothing read and nothing written. It needs macOS and node 22 or newer; an older node gets one line saying so.
+That's the whole install. Answering `n` exits with nothing read and nothing written. It needs macOS, or Linux with systemd, and node 22 or newer; an older node gets one line saying so.
 
 <!-- gif: record `npx wakeman` in a terminal (consent prompt, y, installed banner), then visit a sleeping project in the browser. the tab spins a few seconds while the server boots, then the app appears. ~12s with QuickTime or Kap, crop to terminal + browser. -->
 
@@ -96,6 +96,8 @@ Anything registered from a folder under `~/viewables` (or `WAKEMAN_VIEWABLES_DIR
 
 Projects under `~/Desktop`, `~/Documents`, `~/Downloads`, iCloud Drive or an external disk are behind macOS privacy prompts. The scan asks for your terminal, and the service asks for `node` right after the install. If either gets Don't Allow, the scan says which folder it skipped, and a project there fails with a page that names the setting to flip (System Settings › Privacy & Security › Files and Folders) instead of claiming the folder is gone.
 
+On Linux the service is a systemd user unit, `~/.config/systemd/user/wakeman.service`, and it starts when you log in. Linux won't let a normal user bind :80, so the install asks once to run `sudo setcap cap_net_bind_service=+ep` on wakeman's own copy of node in `~/.local/state/wakeman/bin`. Say no and everything works on :4000, with the command printed for later. Your own node never gets the capability. Why this and not something else is in [docs/adr/0004-linux.md](docs/adr/0004-linux.md).
+
 Logs are plain files: `~/.local/state/wakeman/logs/daemon.log` for the proxy, `<host>.log` per project. The registry at `~/.local/state/wakeman/projects.json` is yours to edit: rename a project, change its port, park it, or add `scanRoots` and `scanExclude` to steer the scanner. A rescan merges; it never clobbers what you fixed by hand.
 
 ## How it's built
@@ -105,11 +107,11 @@ The daemon is one Node file with no npm dependencies: router, reverse proxy, pro
 - Everything is loopback-only and fails closed: a connection from off the machine is dropped at accept, and a request that somehow gets further is refused with a 403. The control plane requires a token the daemon mints at boot. How :80 gets bound is in [docs/adr/0002-wildcard-bind-loopback-guard.md](docs/adr/0002-wildcard-bind-loopback-guard.md).
 - Health probes try `127.0.0.1` and `::1` separately, because plenty of dev servers listen on one family only.
 - `scan` merges instead of overwriting, so a rescan never clobbers the port or start command you fixed by hand.
-- The pty is `lib/pty.py`, run by the `python3` that comes with the Xcode command line tools, because macOS `script(1)` refuses a stdin that is not a tty. No python3 on PATH and the terminal falls back to pipes, read-only.
+- The pty is `lib/pty.py`, because macOS `script(1)` refuses a stdin that is not a tty. On a Mac its `python3` comes with the Xcode command line tools, and Linux distros ship one. No python3 on PATH and the terminal falls back to pipes, read-only.
 
 ## What it doesn't do
 
-- Any OS but macOS. The install is a user LaunchAgent holding :80; on anything else wakeman prints one line and exits.
+- Windows, or Linux without systemd. The install is a background service holding :80 (a LaunchAgent on macOS, a systemd user unit on Linux); anywhere else wakeman prints one line and exits.
 - https, yet.
 - Anything except dev servers. Databases, Docker, queues, and tunnels are out of scope, and stopping idle servers is the opposite of what a production process manager wants.
 
