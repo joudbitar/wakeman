@@ -8,8 +8,8 @@ install.sh path) is superseded by ADR 0003: one command does both.
 
 ## Context
 
-Trying xerb used to cost a git clone, a Caddy install, and a bash script that
-edits system files. The goal is `npx xerb`: one command on a machine with
+Trying wakeman used to cost a git clone, a Caddy install, and a bash script that
+edits system files. The goal is `npx wakeman`: one command on a machine with
 nothing but Node. The daemon already reverse-proxies HTTP and WebSocket and
 routes by Host, so it can serve as its own front door with no second proxy.
 
@@ -30,8 +30,8 @@ defeat the loopback-only model from ADR-less issue #2.
 
 The front door depends on the path and the platform.
 
-`npx xerb` serves directly, in the foreground, from one named state directory
-(`$XERB_STATE_DIR`, else `$XDG_STATE_HOME/xerb`, else `~/.local/state/xerb`).
+`npx wakeman` serves directly, in the foreground, from one named state directory
+(`$WAKEMAN_STATE_DIR`, else `$XDG_STATE_HOME/wakeman`, else `~/.local/state/wakeman`).
 It tries to bind the front-door port on loopback and, when it can't (macOS on
 :80, or the port is taken), falls back to a numbered port and prints URLs with
 the port: `http://name.localhost:7420`. It never binds `0.0.0.0`, so it stays
@@ -60,6 +60,6 @@ The persistent install is separate and platform-specific:
   The earlier plan to drop Caddy everywhere does not hold on macOS, because the
   daemon cannot bind loopback:80 there without root, and running the daemon as
   root would mean spawning every dev server as root.
-- Publishing to npm as a real `npx xerb` is a separate maintainer step. The
+- Publishing to npm as a real `npx wakeman` is a separate maintainer step. The
   `bin` entry in package.json makes the command exist and run from a local
-  checkout (`node bin/xerb.mjs`) today.
+  checkout (`node bin/wakeman.mjs`) today.

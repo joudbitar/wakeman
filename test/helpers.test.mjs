@@ -10,7 +10,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import net from 'node:net';
 
-import { resolveHostKey, inferInstallCmd, probePort } from '../xerb.mjs';
+import { resolveHostKey, inferInstallCmd, probePort } from '../wakeman.mjs';
 
 test('resolveHostKey documented cases', () => {
   // Project subdomain, tenant subdomain, bare localhost.
@@ -29,8 +29,8 @@ test('resolveHostKey documented cases', () => {
   assert.equal(resolveHostKey('[::1]:4000'), null);
   assert.equal(resolveHostKey('[::1]'), null);
   // Reserved host passes through; lowercasing applies.
-  assert.equal(resolveHostKey('xerb.localhost'), 'xerb');
-  assert.equal(resolveHostKey('XERB.LOCALHOST'), 'xerb');
+  assert.equal(resolveHostKey('wakeman.localhost'), 'wakeman');
+  assert.equal(resolveHostKey('WAKEMAN.LOCALHOST'), 'wakeman');
 });
 
 test('inferInstallCmd for each package manager + fallbacks', () => {

@@ -16,12 +16,12 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
-import { rotateIfNeeded } from '../xerb.mjs';
+import { rotateIfNeeded } from '../wakeman.mjs';
 
 // Fresh temp dir per test, removed in t.after. Returns { dir, file } where
 // `file` is the log path inside it (not yet created).
 function tmpLog(t) {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'xerb-log-'));
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'wakeman-log-'));
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
   return { dir, file: path.join(dir, 'x.log') };
 }

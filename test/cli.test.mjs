@@ -3,8 +3,8 @@
 //
 // Two groups. The first runs the entrypoint with NO daemon and NO state dir
 // and asserts the answer AND that the machine was left alone. `npx
-// xerb --help` that creates ~/.local/state/xerb has already
-// failed, whatever it printed. The second boots xerb.mjs against a throwaway
+// wakeman --help` that creates ~/.local/state/wakeman has already
+// failed, whatever it printed. The second boots wakeman.mjs against a throwaway
 // state dir on an OS-assigned port and drives the subcommands through it, so
 // the registry edits and the control-API calls are the real ones.
 //
@@ -26,8 +26,8 @@ import { spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const BIN = path.join(ROOT, 'bin', 'xerb.mjs');
-const DAEMON = path.join(ROOT, 'xerb.mjs');
+const BIN = path.join(ROOT, 'bin', 'wakeman.mjs');
+const DAEMON = path.join(ROOT, 'wakeman.mjs');
 const VERSION = JSON.parse(fs.readFileSync(path.join(ROOT, 'package.json'), 'utf8')).version;
 
 function freePort() {
@@ -46,13 +46,13 @@ function freePort() {
 // ---------------------------------------------------------------------------
 
 // A port nothing is listening on, so the "daemon not running" assertions below
-// cannot accidentally find the developer's OWN xerb on :80.
+// cannot accidentally find the developer's OWN wakeman on :80.
 const DEAD_PORT = await freePort();
 
-// Each of these runs with XERB_STATE_DIR pointed at a path that does NOT
+// Each of these runs with WAKEMAN_STATE_DIR pointed at a path that does NOT
 // exist, so "did the run create it?" is a one-line assertion.
 function runClean(args, { platform } = {}) {
-  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'xerb-clean-'));
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'wakeman-clean-'));
   const stateDir = path.join(tmp, 'state');
   const extra = [];
   if (platform) {
@@ -66,9 +66,9 @@ function runClean(args, { platform } = {}) {
   const r = spawnSync(process.execPath, [...extra, BIN, ...args], {
     env: {
       ...process.env,
-      XERB_STATE_DIR: stateDir,
-      XERB_PORT: String(DEAD_PORT),
-      XERB_FALLBACK_PORT: String(DEAD_PORT),
+      WAKEMAN_STATE_DIR: stateDir,
+      WAKEMAN_PORT: String(DEAD_PORT),
+      WAKEMAN_FALLBACK_PORT: String(DEAD_PORT),
       NO_COLOR: '1',
       HOME: tmp,
     },
@@ -84,9 +84,9 @@ test('--help / -h / help print the table, exit 0, and touch no state dir', () =>
   for (const args of [['--help'], ['-h'], ['help']]) {
     const r = runClean(args);
     assert.equal(r.code, 0, `${args[0]} exits 0`);
-    assert.match(r.stdout, /xerb status\s+every project/, `${args[0]} prints the table`);
-    assert.match(r.stdout, /xerb attach <host>/);
-    assert.match(r.stdout, /xerb uninstall/);
+    assert.match(r.stdout, /wakeman status\s+every project/, `${args[0]} prints the table`);
+    assert.match(r.stdout, /wakeman attach <host>/);
+    assert.match(r.stdout, /wakeman uninstall/);
     assert.equal(r.madeState, false, `${args[0]} left no state dir behind`);
   }
 });
@@ -103,7 +103,7 @@ test('--version / -v print the version and touch no state dir', () => {
 test('non-darwin: one line, exit 2, nothing else', () => {
   const r = runClean([], { platform: 'linux' });
   assert.equal(r.code, 2);
-  assert.equal(r.stderr, 'xerb runs on macOS. Linux support is not planned.\n');
+  assert.equal(r.stderr, 'wakeman runs on macOS. Linux support is not planned.\n');
   assert.equal(r.stdout, '', 'nothing else runs');
   assert.equal(r.madeState, false);
 });
@@ -111,14 +111,14 @@ test('non-darwin: one line, exit 2, nothing else', () => {
 test('non-darwin gate does not swallow --help', () => {
   const r = runClean(['--help'], { platform: 'linux' });
   assert.equal(r.code, 0);
-  assert.match(r.stdout, /xerb status/);
+  assert.match(r.stdout, /wakeman status/);
 });
 
 test('unknown command: says which, reprints the table, exit 1, no state dir', () => {
   const r = runClean(['frobnicate']);
   assert.equal(r.code, 1);
   assert.match(r.stderr, /unknown command frobnicate/);
-  assert.match(r.stderr, /xerb status\s+every project/, 'the table is the fix for a typo');
+  assert.match(r.stderr, /wakeman status\s+every project/, 'the table is the fix for a typo');
   assert.equal(r.madeState, false);
 });
 
@@ -133,7 +133,7 @@ test('every runtime subcommand with no daemon: the same line, exit 3', () => {
   for (const args of [['status'], ['stop', 'x'], ['restart', 'x'], ['wake', 'x'], ['open', 'x'], ['attach', 'x'], ['logs', 'x', '-f']]) {
     const r = runClean(args);
     assert.equal(r.code, 3, `${args.join(' ')} exits 3`);
-    assert.match(r.stderr, /xerb is not running; run `xerb` to start it/, args.join(' '));
+    assert.match(r.stderr, /wakeman is not running; run `wakeman` to start it/, args.join(' '));
   }
 });
 
@@ -162,9 +162,9 @@ function cli(args) {
     env: {
       ...process.env,
       HOME: homeDir,
-      XERB_STATE_DIR: stateDir,
-      XERB_PORT: String(frontPort),
-      XERB_FALLBACK_PORT: String(frontPort),
+      WAKEMAN_STATE_DIR: stateDir,
+      WAKEMAN_PORT: String(frontPort),
+      WAKEMAN_FALLBACK_PORT: String(frontPort),
       NO_COLOR: '1',
     },
     encoding: 'utf8',
@@ -181,9 +181,9 @@ function cliLive(args) {
     env: {
       ...process.env,
       HOME: homeDir,
-      XERB_STATE_DIR: stateDir,
-      XERB_PORT: String(frontPort),
-      XERB_FALLBACK_PORT: String(frontPort),
+      WAKEMAN_STATE_DIR: stateDir,
+      WAKEMAN_PORT: String(frontPort),
+      WAKEMAN_FALLBACK_PORT: String(frontPort),
       NO_COLOR: '1',
     },
     stdio: ['pipe', 'pipe', 'pipe'],
@@ -208,7 +208,7 @@ function cliLive(args) {
 function statusJson() {
   return new Promise((resolve, reject) => {
     const req = http.request(
-      { host: '127.0.0.1', port: frontPort, path: '/__xerb/status', headers: { host: 'xerb.localhost' } },
+      { host: '127.0.0.1', port: frontPort, path: '/__wakeman/status', headers: { host: 'wakeman.localhost' } },
       (res) => {
         let b = '';
         res.setEncoding('utf8');
@@ -263,8 +263,8 @@ function plantNodeProject(dir, body) {
 }
 
 before(async () => {
-  stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'xerb-cli-state-'));
-  homeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'xerb-cli-home-'));
+  stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'wakeman-cli-state-'));
+  homeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'wakeman-cli-home-'));
   frontPort = await freePort();
   demoPort = await freePort();
 
@@ -290,11 +290,11 @@ before(async () => {
     env: {
       ...process.env,
       HOME: homeDir,
-      XERB_STATE_DIR: stateDir,
-      XERB_PORT: String(frontPort),
-      XERB_FALLBACK_PORT: String(frontPort),
-      XERB_REAP_INTERVAL_MS: '60000',
-      XERB_QUIET: '1',
+      WAKEMAN_STATE_DIR: stateDir,
+      WAKEMAN_PORT: String(frontPort),
+      WAKEMAN_FALLBACK_PORT: String(frontPort),
+      WAKEMAN_REAP_INTERVAL_MS: '60000',
+      WAKEMAN_QUIET: '1',
     },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
@@ -318,7 +318,7 @@ test('status: one line per project, with the disabled one marked', () => {
   assert.doesNotMatch(r.stdout, /tries again/, 'nothing failed, so no hint line');
   assert.match(r.stdout, new RegExp(`demo\\s+\\S+\\s+:${demoPort}`));
   assert.match(r.stdout, /parked\s+disabled/);
-  assert.match(r.stdout, /dashboard http:\/\/xerb\.localhost:/);
+  assert.match(r.stdout, /dashboard http:\/\/wakeman\.localhost:/);
 });
 
 test('wake starts the dev server, status sees it running, stop stops it', async () => {
@@ -355,7 +355,7 @@ test('restart brings it back up', async () => {
 // from the CLI raced that: the wake probed a port the dying server still held,
 // matched its cwd, and ADOPTED the process it had just killed — "restarted"
 // printed over a project that was never restarted, and owned flipped to false.
-// The daemon's own /__xerb/restart waits for the port, which is why the CLI
+// The daemon's own /__wakeman/restart waits for the port, which is why the CLI
 // has to call it.
 test('restart waits for the old server to let go of the port', { timeout: 60000 }, async () => {
   const dir = path.join(homeDir, 'lingerer');
@@ -388,7 +388,7 @@ test('restart waits for the old server to let go of the port', { timeout: 60000 
     const row = (await statusJson()).projects.find((p) => p.host === 'lingerer');
     return row && row.state === 'running' && row.owned ? row : null;
   }, 20000);
-  assert.ok(first, 'lingerer came up owned by xerb');
+  assert.ok(first, 'lingerer came up owned by wakeman');
   assert.equal(separators(), 1, 'one start so far');
 
   const r = cli(['restart', 'lingerer']);
@@ -396,7 +396,7 @@ test('restart waits for the old server to let go of the port', { timeout: 60000 
   assert.match(r.stdout, /restarted lingerer/);
   const row = (await statusJson()).projects.find((p) => p.host === 'lingerer');
   assert.equal(row.state, 'running');
-  assert.equal(row.owned, true, 'the restart spawned a server xerb owns, it did not adopt the dying one');
+  assert.equal(row.owned, true, 'the restart spawned a server wakeman owns, it did not adopt the dying one');
   assert.equal(separators(), 2, 'the restart wrote a second start separator');
 
   cli(['stop', 'lingerer']);
@@ -424,7 +424,7 @@ test('status shows a failed start as failed, with the reason, and still exits 0'
   const r = cli(['status']);
   assert.equal(r.code, 0, 'a failed project is a fact about the project, not the command');
   assert.match(r.stdout, /x crash-app\s+failed\s+:\d+\s+exited with code 1 · Error: Cannot find module left-pad/);
-  assert.match(r.stdout, /`xerb logs <host>` shows why · `xerb restart <host>` tries again/);
+  assert.match(r.stdout, /`wakeman logs <host>` shows why · `wakeman restart <host>` tries again/);
 
   assert.equal(cli(['remove', 'crash-app']).code, 0);
   assert.ok(await poll(async () => !(await statusJson()).projects.some((p) => p.host === 'crash-app'), 5000));
@@ -435,7 +435,7 @@ test('wake refuses a disabled project, and names the fix', () => {
   const r = cli(['wake', 'parked']);
   assert.equal(r.code, 1);
   assert.match(r.stderr, /parked is disabled/);
-  assert.match(r.stderr, /xerb enable parked/);
+  assert.match(r.stderr, /wakeman enable parked/);
 });
 
 test('runtime commands on an unknown host: exit 1, not 3', () => {
@@ -455,7 +455,7 @@ test('runtime commands on an unknown host: exit 1, not 3', () => {
 // is handed is the whole contract, and a real `open` would put a browser window
 // on the developer's screen mid-test.
 test('open hands the project URL to the system opener', () => {
-  const bin = fs.mkdtempSync(path.join(os.tmpdir(), 'xerb-openbin-'));
+  const bin = fs.mkdtempSync(path.join(os.tmpdir(), 'wakeman-openbin-'));
   const record = path.join(bin, 'opened');
   fs.writeFileSync(path.join(bin, 'open'), `#!/bin/sh\nprintf '%s' "$1" > ${JSON.stringify(record)}\n`);
   fs.chmodSync(path.join(bin, 'open'), 0o755);
@@ -465,9 +465,9 @@ test('open hands the project URL to the system opener', () => {
       ...process.env,
       PATH: `${bin}:${process.env.PATH}`,
       HOME: homeDir,
-      XERB_STATE_DIR: stateDir,
-      XERB_PORT: String(frontPort),
-      XERB_FALLBACK_PORT: String(frontPort),
+      WAKEMAN_STATE_DIR: stateDir,
+      WAKEMAN_PORT: String(frontPort),
+      WAKEMAN_FALLBACK_PORT: String(frontPort),
       NO_COLOR: '1',
     },
     encoding: 'utf8',
@@ -558,7 +558,7 @@ test('add on an unprovable directory prints what it looked for and exits 1', () 
   assert.match(r.stdout, /rails\s+Gemfile/);
   assert.match(r.stdout, /django\s+manage\.py/);
   assert.match(r.stdout, /--cmd "flask run --port <port>"/, 'the fix is the --cmd form, for what is in the folder');
-  assert.match(r.stdout, /`<port>` is replaced with the port xerb assigns\./);
+  assert.match(r.stdout, /`<port>` is replaced with the port wakeman assigns\./);
   assert.doesNotMatch(r.stdout, /npm run dev/, 'app.py is the one thing `npm run dev` cannot start');
   assert.ok(!registry().projects.some((p) => p.dir === dir), 'nothing was written');
 });
@@ -608,7 +608,7 @@ test('add on an already-registered folder updates instead of failing', () => {
 
 // `add` on a folder already registered updates the entry in place, which means
 // it is also the fourth way to change a running project's port or host. The
-// other three (`xerb port`, the dashboard's set route, the dashboard's add
+// other three (`wakeman port`, the dashboard's set route, the dashboard's add
 // route) all deal with the running server first; this one used to write and
 // return, leaving a dev server on a port nothing routes to, or under a host
 // that is no longer in the registry (so `stop` cannot find it and the reaper
@@ -664,8 +664,8 @@ test('add on a static folder registers the placeholder, not a path into the npx 
   const entry = registry().projects.find((p) => p.host === 'site');
   assert.ok(entry, 'the static folder registered');
   assert.equal(entry.framework, 'static');
-  assert.equal(entry.startCmd, '$XERB_STATIC');
-  assert.match(r.stdout, /\$XERB_STATIC/, 'and that is what it printed too');
+  assert.equal(entry.startCmd, '$WAKEMAN_STATIC');
+  assert.match(r.stdout, /\$WAKEMAN_STATIC/, 'and that is what it printed too');
   cli(['remove', 'site']);
 });
 
@@ -695,7 +695,7 @@ test('port refuses while the project is running, and names the fix', async () =>
   const p = await freePort();
   const r = cli(['port', 'demo', String(p)]);
   assert.equal(r.code, 1);
-  assert.match(r.stderr, /stop it first: xerb stop demo/);
+  assert.match(r.stderr, /stop it first: wakeman stop demo/);
   cli(['stop', 'demo']);
 });
 
@@ -707,7 +707,7 @@ test('rename moves the host and refuses a taken one', () => {
   const taken = cli(['rename', 'flask', 'demo']);
   assert.equal(taken.code, 1);
   assert.match(taken.stderr, /"demo" is taken/);
-  const reserved = cli(['rename', 'flask', 'xerb']);
+  const reserved = cli(['rename', 'flask', 'wakeman']);
   assert.equal(reserved.code, 1);
   assert.match(reserved.stderr, /reserved/);
 });
@@ -715,7 +715,7 @@ test('rename moves the host and refuses a taken one', () => {
 // The add-project skill's script is a re-export of the same module, so its
 // `remove` writes the same registry — but it used to write it and walk away,
 // telling the user to go find the orphaned server with lsof. Nothing else can
-// reach that child afterwards: `xerb stop` looks the host up in the registry
+// reach that child afterwards: `wakeman stop` looks the host up in the registry
 // it was just dropped from, and the reaper iterates the registry too.
 test('the skill script stops a running project before dropping its entry', { timeout: 60000 }, async () => {
   const script = path.join(ROOT, '.claude', 'skills', 'add-project', 'scripts', 'registry.mjs');
@@ -737,9 +737,9 @@ test('the skill script stops a running project before dropping its entry', { tim
     env: {
       ...process.env,
       HOME: homeDir,
-      XERB_STATE_DIR: stateDir,
-      XERB_PORT: String(frontPort),
-      XERB_FALLBACK_PORT: String(frontPort),
+      WAKEMAN_STATE_DIR: stateDir,
+      WAKEMAN_PORT: String(frontPort),
+      WAKEMAN_FALLBACK_PORT: String(frontPort),
       NO_COLOR: '1',
     },
     encoding: 'utf8',

@@ -1,6 +1,6 @@
 // Port-ownership verification tests for the adopt-or-conflict decision.
 //
-// Before adopting a listener xerb did not spawn, the daemon resolves the
+// Before adopting a listener wakeman did not spawn, the daemon resolves the
 // listening PID's cwd and compares it to project.dir. Match -> adopt (external);
 // mismatch -> a visible `conflict` state that is NEVER proxied; unresolved cwd
 // (e.g. lsof missing) -> degrade to the legacy adopt. These tests prove all
@@ -23,14 +23,14 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
-// XERB_CONFIG is read at module load, so the temp registry must exist and the
-// env var must point at it BEFORE importing xerb.mjs. node --test runs the
+// WAKEMAN_CONFIG is read at module load, so the temp registry must exist and the
+// env var must point at it BEFORE importing wakeman.mjs. node --test runs the
 // whole file in one process, so we set both at top-level here.
-const TMP_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), 'xerb-adopt-'));
+const TMP_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), 'wakeman-adopt-'));
 const CONFIG_PATH = path.join(TMP_ROOT, 'projects.json');
 // A real directory to use as the matching project.dir (so realpath in sameDir
 // has something to resolve). The mismatching case uses a bogus path on purpose.
-const PROJECT_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'xerb-projdir-'));
+const PROJECT_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'wakeman-projdir-'));
 
 // The registry port is rewritten per-test to the fake server's OS-assigned port.
 function writeRegistry(port, dir) {
@@ -45,10 +45,10 @@ function writeRegistry(port, dir) {
 
 // Seed a placeholder so the import-time load doesn't warn; real values per-test.
 writeRegistry(0, PROJECT_DIR);
-process.env.XERB_CONFIG = CONFIG_PATH;
+process.env.WAKEMAN_CONFIG = CONFIG_PATH;
 // Point the control-token at a temp file so minting one here never touches the
 // real repo's control-token (issue-5 gates mutating control POSTs on this token).
-process.env.XERB_CONTROL_TOKEN_PATH = path.join(TMP_ROOT, 'control-token');
+process.env.WAKEMAN_CONTROL_TOKEN_PATH = path.join(TMP_ROOT, 'control-token');
 
 const {
   createDaemonServer,
@@ -59,7 +59,7 @@ const {
   ensureControlToken,
   __setRuntimeForTest,
   ADOPT_VERIFY_TTL_MS,
-} = await import('../xerb.mjs');
+} = await import('../wakeman.mjs');
 
 // Listen on an OS-assigned loopback port; resolve the actual port.
 function listen(server) {
@@ -90,8 +90,8 @@ function httpGet(port, hostHeader, reqPath = '/') {
 function httpPost(port, hostHeader, reqPath, token) {
   const headers = { host: hostHeader };
   // issue-5 gates mutating control POSTs on the capability token; send it when
-  // provided so /__xerb/up reaches its handler instead of a 403.
-  if (token) headers['x-xerb-token'] = token;
+  // provided so /__wakeman/up reaches its handler instead of a 403.
+  if (token) headers['x-wakeman-token'] = token;
   return new Promise((resolve, reject) => {
     const req = http.request(
       { host: '127.0.0.1', port, method: 'POST', path: reqPath, headers },
@@ -125,7 +125,7 @@ function fakeDevServer(bodyText) {
 }
 
 function statusFor(port, host) {
-  return httpGet(port, 'xerb.localhost', '/__xerb/status').then((r) => {
+  return httpGet(port, 'wakeman.localhost', '/__wakeman/status').then((r) => {
     const parsed = JSON.parse(r.body);
     return parsed.projects.find((p) => p.host === host);
   });
@@ -227,7 +227,7 @@ test('C: external listener with mismatching cwd is a conflict, never proxied', a
 
   // The `up` control endpoint reports the conflict reason. It mutates state, so
   // issue-5 requires the capability token — send it so we reach the handler.
-  const up = await httpPost(daemonPort, 'xerb.localhost', '/__xerb/up/proj', ensureControlToken());
+  const up = await httpPost(daemonPort, 'wakeman.localhost', '/__wakeman/up/proj', ensureControlToken());
   const upBody = JSON.parse(up.body);
   assert.equal(upBody.ok, false, 'up should fail on conflict');
   assert.equal(upBody.reason, 'PORT_CONFLICT', 'up reports PORT_CONFLICT');
@@ -307,7 +307,7 @@ test('E: adopted upstream that dies is healed, and re-adopted when it returns', 
 });
 
 test('F: a stranger that takes the port after adoption gets a conflict, not a proxy', async (t) => {
-  // The spec-5 hole, end to end. xerb adopts a dev server you started by hand
+  // The spec-5 hole, end to end. wakeman adopts a dev server you started by hand
   // from the project folder. That server dies. Something else — a python
   // one-liner in /tmp, a rebased container, anything — binds the same port.
   // Pre-fix the record still said "running (external)" and the daemon happily

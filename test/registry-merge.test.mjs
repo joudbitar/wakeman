@@ -41,7 +41,7 @@ test('preserves hand-edited port, startCmd, and enabled for a known host', () =>
   const projects = mergeRegistry({
     existing,
     candidates,
-    reservedHost: 'xerb',
+    reservedHost: 'wakeman',
     poolStart: 3010,
     poolStep: 10,
     startCmdFor,
@@ -71,7 +71,7 @@ test('assigns fresh pool ports only to new hosts, never colliding with existing'
   const projects = mergeRegistry({
     existing,
     candidates,
-    reservedHost: 'xerb',
+    reservedHost: 'wakeman',
     poolStart: 3010,
     poolStep: 10,
     startCmdFor,
@@ -93,13 +93,13 @@ test('assigns fresh pool ports only to new hosts, never colliding with existing'
   assert.equal(newapp.enabled, true);
 });
 
-test('never emits the reserved host (candidate literally named xerb is remapped)', () => {
-  const candidates = [{ dir: '/tmp/x/xerb', name: 'xerb', framework: 'node', pm: 'npm' }];
+test('never emits the reserved host (candidate literally named wakeman is remapped)', () => {
+  const candidates = [{ dir: '/tmp/x/wakeman', name: 'wakeman', framework: 'node', pm: 'npm' }];
 
   const projects = mergeRegistry({
     existing: null,
     candidates,
-    reservedHost: 'xerb',
+    reservedHost: 'wakeman',
     poolStart: 3010,
     poolStep: 10,
     startCmdFor,
@@ -107,11 +107,11 @@ test('never emits the reserved host (candidate literally named xerb is remapped)
     dirExists,
   });
 
-  // The candidate named 'xerb' is remapped to 'xerb-2'...
-  assert.ok(byHost(projects, 'xerb-2'), 'xerb candidate should be remapped to xerb-2');
+  // The candidate named 'wakeman' is remapped to 'wakeman-2'...
+  assert.ok(byHost(projects, 'wakeman-2'), 'wakeman candidate should be remapped to wakeman-2');
   // ...and no result entry ever uses the bare reserved host.
-  assert.equal(byHost(projects, 'xerb'), undefined, 'no entry may use the reserved host');
-  assert.equal(projects.filter((p) => p.host === 'xerb').length, 0);
+  assert.equal(byHost(projects, 'wakeman'), undefined, 'no entry may use the reserved host');
+  assert.equal(projects.filter((p) => p.host === 'wakeman').length, 0);
 });
 
 test('candidate enabled: false registers parked, and a hand-flip survives the next rescan', () => {
@@ -120,7 +120,7 @@ test('candidate enabled: false registers parked, and a hand-flip survives the ne
   const first = mergeRegistry({
     existing: null,
     candidates,
-    reservedHost: 'xerb',
+    reservedHost: 'wakeman',
     poolStart: 3010,
     poolStep: 10,
     startCmdFor,
@@ -135,7 +135,7 @@ test('candidate enabled: false registers parked, and a hand-flip survives the ne
   const second = mergeRegistry({
     existing,
     candidates,
-    reservedHost: 'xerb',
+    reservedHost: 'wakeman',
     poolStart: 3010,
     poolStep: 10,
     startCmdFor,
@@ -160,7 +160,7 @@ test('carries over hand-added entries whose dir exists and drops those whose dir
   const projects = mergeRegistry({
     existing,
     candidates,
-    reservedHost: 'xerb',
+    reservedHost: 'wakeman',
     poolStart: 3010,
     poolStep: 10,
     startCmdFor,
@@ -194,7 +194,7 @@ test('a new host with fixedPort registers on it, and pool assignment steers arou
   const projects = mergeRegistry({
     existing: null,
     candidates,
-    reservedHost: 'xerb',
+    reservedHost: 'wakeman',
     poolStart: 3010,
     poolStep: 10,
     startCmdFor,
@@ -220,7 +220,7 @@ test('a known host whose script pins a port is corrected away from a stale pool 
   const projects = mergeRegistry({
     existing,
     candidates,
-    reservedHost: 'xerb',
+    reservedHost: 'wakeman',
     poolStart: 3010,
     poolStep: 10,
     startCmdFor,
@@ -244,7 +244,7 @@ test('a hand-set startCmd keeps its hand-set port even when the package.json scr
   const projects = mergeRegistry({
     existing,
     candidates,
-    reservedHost: 'xerb',
+    reservedHost: 'wakeman',
     poolStart: 3010,
     poolStep: 10,
     startCmdFor,

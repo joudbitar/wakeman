@@ -4,8 +4,8 @@
 // The pure half (lib/viewables.mjs, the registry edits, the merge) is tested
 // directly; the daemon half against a real daemon on an OS-assigned port with
 // a throwaway state dir, the same way dashboard-routes.test.mjs does it.
-// XERB_CONFIG and XERB_VIEWABLES_DIR are read at module load, so both are set
-// before the dynamic import of ../xerb.mjs.
+// WAKEMAN_CONFIG and WAKEMAN_VIEWABLES_DIR are read at module load, so both are set
+// before the dynamic import of ../wakeman.mjs.
 
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
@@ -90,9 +90,9 @@ test('archive parks the entry; restore brings it back enabled', () => {
 
 test('a rescan keeps kind and archived on entries it rediscovers', () => {
   const projects = mergeRegistry({
-    existing: { projects: [{ host: 'site', dir: '/v/site', port: 3010, startCmd: '$XERB_STATIC', framework: 'static', enabled: false, kind: 'viewable', archived: 7 }] },
+    existing: { projects: [{ host: 'site', dir: '/v/site', port: 3010, startCmd: '$WAKEMAN_STATIC', framework: 'static', enabled: false, kind: 'viewable', archived: 7 }] },
     candidates: [{ dir: '/v/site', name: 'site', framework: 'static' }],
-    startCmdFor: () => '$XERB_STATIC',
+    startCmdFor: () => '$WAKEMAN_STATIC',
     sanitizeHost: (n) => n,
     dirExists: () => true,
   });
@@ -101,7 +101,7 @@ test('a rescan keeps kind and archived on entries it rediscovers', () => {
 });
 
 test('trashFolder refuses anything outside the root, including via a symlink', () => {
-  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'xerb-trash-'));
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'wakeman-trash-'));
   const root = path.join(tmp, 'viewables');
   const outside = path.join(tmp, 'precious');
   fs.mkdirSync(root);
@@ -114,7 +114,7 @@ test('trashFolder refuses anything outside the root, including via a symlink', (
 });
 
 test('trashFolder moves into ~/.Trash when there is one', () => {
-  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'xerb-trash-'));
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'wakeman-trash-'));
   const root = path.join(tmp, 'viewables');
   fs.mkdirSync(path.join(root, 'page'), { recursive: true });
   fs.mkdirSync(path.join(tmp, '.Trash'));
@@ -126,7 +126,7 @@ test('trashFolder moves into ~/.Trash when there is one', () => {
 
 // --- daemon -------------------------------------------------------------------
 
-const TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'xerb-view-'));
+const TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'wakeman-view-'));
 const CONFIG_PATH = path.join(TMP, 'projects.json');
 const VROOT = path.join(TMP, 'viewables');
 const page = (name, ageDays) => {
@@ -145,17 +145,17 @@ fs.writeFileSync(CONFIG_PATH, JSON.stringify({
   port: 0,
   projects: [
     { host: 'proj', dir: PROJECT_DIR, port: 39101, startCmd: 'true', framework: 'node', enabled: true },
-    { host: 'fresh', dir: page('fresh', 1), port: 39102, startCmd: '$XERB_STATIC', framework: 'node', enabled: true },
-    { host: 'old', dir: page('old', 20), port: 39103, startCmd: '$XERB_STATIC', framework: 'node', enabled: true },
+    { host: 'fresh', dir: page('fresh', 1), port: 39102, startCmd: '$WAKEMAN_STATIC', framework: 'node', enabled: true },
+    { host: 'old', dir: page('old', 20), port: 39103, startCmd: '$WAKEMAN_STATIC', framework: 'node', enabled: true },
   ],
 }, null, 2));
 
-process.env.XERB_CONFIG = CONFIG_PATH;
-process.env.XERB_CONTROL_TOKEN_PATH = path.join(TMP, 'control-token');
-process.env.XERB_LOGS_DIR = path.join(TMP, 'logs');
-process.env.XERB_VIEWABLES_DIR = VROOT;
+process.env.WAKEMAN_CONFIG = CONFIG_PATH;
+process.env.WAKEMAN_CONTROL_TOKEN_PATH = path.join(TMP, 'control-token');
+process.env.WAKEMAN_LOGS_DIR = path.join(TMP, 'logs');
+process.env.WAKEMAN_VIEWABLES_DIR = VROOT;
 
-const { createDaemonServer, loadConfig, ensureControlToken, sweepViewables, dashboardHtml, upstreamAgent } = await import('../xerb.mjs');
+const { createDaemonServer, loadConfig, ensureControlToken, sweepViewables, dashboardHtml, upstreamAgent } = await import('../wakeman.mjs');
 
 let daemon;
 let daemonPort;
@@ -163,9 +163,9 @@ let token;
 const readReg = () => JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'));
 const entryFor = (host) => readReg().projects.find((p) => p.host === host) || null;
 
-function req(pathname, { method = 'POST', host = 'xerb.localhost', auth = true } = {}) {
+function req(pathname, { method = 'POST', host = 'wakeman.localhost', auth = true } = {}) {
   const headers = { host };
-  if (auth) headers['x-xerb-token'] = token;
+  if (auth) headers['x-wakeman-token'] = token;
   return new Promise((resolve, reject) => {
     const r = http.request({ host: '127.0.0.1', port: daemonPort, method, path: pathname, headers }, (res) => {
       let text = '';
@@ -220,13 +220,13 @@ test('the dashboard shelves viewables and archived entries apart from projects',
 });
 
 test('delete refuses a live viewable and a project', async () => {
-  assert.equal((await req('/__xerb/delete/fresh')).status, 409);
-  assert.equal((await req('/__xerb/delete/proj')).status, 409);
-  assert.equal((await req('/__xerb/delete/old', { auth: false })).status, 403);
+  assert.equal((await req('/__wakeman/delete/fresh')).status, 409);
+  assert.equal((await req('/__wakeman/delete/proj')).status, 409);
+  assert.equal((await req('/__wakeman/delete/old', { auth: false })).status, 403);
 });
 
 test('restore brings it back and resets its clock so the next sweep leaves it', async () => {
-  const res = await req('/__xerb/restore/old');
+  const res = await req('/__wakeman/restore/old');
   assert.equal(res.status, 200);
   assert.equal(entryFor('old').archived, undefined);
   assert.equal(entryFor('old').enabled, true);
@@ -236,8 +236,8 @@ test('restore brings it back and resets its clock so the next sweep leaves it', 
 });
 
 test('archive by hand, then delete moves the folder out and drops the entry', async () => {
-  assert.equal((await req('/__xerb/archive/old')).status, 200);
-  const res = await req('/__xerb/delete/old');
+  assert.equal((await req('/__wakeman/archive/old')).status, 200);
+  const res = await req('/__wakeman/delete/old');
   assert.equal(res.status, 200, res.body);
   assert.equal(entryFor('old'), null);
   assert.ok(!fs.existsSync(path.join(VROOT, 'old')));

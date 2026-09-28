@@ -18,7 +18,7 @@ import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
 import os from 'node:os';
 
-const ROOT = mkdtempSync(join(os.tmpdir(), 'xerb-scanwalk-'));
+const ROOT = mkdtempSync(join(os.tmpdir(), 'wakeman-scanwalk-'));
 after(() => rmSync(ROOT, { recursive: true, force: true }));
 
 const SCANNER = join(dirname(fileURLToPath(import.meta.url)), '..', 'scan.mjs');
@@ -53,7 +53,7 @@ test('the walk descends past a stub package.json and honors scanDeclined', () =>
   }));
 
   const r = spawnSync(process.execPath, [SCANNER], {
-    env: { ...process.env, XERB_STATE_DIR: stateDir, XERB_SCAN_QUIET: '1' },
+    env: { ...process.env, WAKEMAN_STATE_DIR: stateDir, WAKEMAN_SCAN_QUIET: '1' },
     encoding: 'utf8',
   });
   assert.equal(r.status, 0, r.stderr);

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-r"""Give one dev server a real terminal, for xerb.
+r"""Give one dev server a real terminal, for wakeman.
 
 macOS script(1) refuses a non-tty stdin, so a daemon that spawns with pipes
 cannot use it. pty.fork() does the same job: the dev server gets a controlling

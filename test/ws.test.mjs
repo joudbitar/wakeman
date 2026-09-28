@@ -158,9 +158,9 @@ test('a non-websocket upgrade gets 400 and a closed socket', async () => {
 
 test('a requested subprotocol is echoed back', async () => {
   const server = await startServer(() => {});
-  const ws = new WebSocket(server.url, ['xerb-token-abc']);
+  const ws = new WebSocket(server.url, ['wakeman-token-abc']);
   await nextWsEvent(ws, 'open');
-  assert.equal(ws.protocol, 'xerb-token-abc');
+  assert.equal(ws.protocol, 'wakeman-token-abc');
   ws.close();
   await server.stop();
 });

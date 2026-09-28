@@ -4,9 +4,9 @@ Status: accepted (2026-07-22). Supersedes the try/install split in ADR 0001.
 
 ## Context
 
-By July 2026 there were three documented ways to get xerb: `npx
-xerb` (a throwaway foreground run), `git clone` + `install.sh` (the
-persistent daemon behind Caddy), and `brew install joudbitar/tap/xerb` (an
+By July 2026 there were three documented ways to get wakeman: `npx
+wakeman` (a throwaway foreground run), `git clone` + `install.sh` (the
+persistent daemon behind Caddy), and `brew install joudbitar/tap/wakeman` (an
 alias for the npx command). Three paths for a tool whose whole pitch is "stop
 babysitting your dev servers" is a joke at the tool's own expense, and each
 path existed for a reason that has since expired:
@@ -25,7 +25,7 @@ with its terminal. That is not a feature; it is a missing launchd plist.
 
 One command, one flow, one place everything lands.
 
-`npx xerb` (and the installed `xerb` command, which is the same
+`npx wakeman` (and the installed `wakeman` command, which is the same
 entrypoint) does the whole thing:
 
 1. On the first run it asks before touching anything: what it will scan (any
@@ -34,22 +34,22 @@ entrypoint) does the whole thing:
    reachable from the network, nothing sent anywhere), and what it will
    install (a user LaunchAgent, no sudo). Declining exits with nothing read
    and nothing written.
-2. It scans, copies the package into `~/.local/state/xerb/app` (the npm
-   cache can be pruned, so the LaunchAgent points at a copy xerb owns),
-   writes the plist, loads it, and symlinks `xerb` into `~/.local/bin`.
+2. It scans, copies the package into `~/.local/state/wakeman/app` (the npm
+   cache can be pruned, so the LaunchAgent points at a copy wakeman owns),
+   writes the plist, loads it, and symlinks `wakeman` into `~/.local/bin`.
 3. When `~/.claude` exists, it copies the bundled add-project skill into
    `~/.claude/skills`, so the user's coding agent can register anything the
    scanner cannot prove. The skill ships inside the npm package (not pulled
    from a repo at install time) so its instructions always match the daemon
    version they describe; users of other agents install the same skill with
-   `npx skills add joudbitar/xerb`.
+   `npx skills add joudbitar/wakeman`.
 4. It prints the URLs that answer and exits. The daemon keeps running through
    reboots.
 
-`xerb` re-runs are the maintenance surface: rescan, refresh the install.
-`xerb uninstall` reverses all of it: boots out the agent, deletes the
-plist, the symlink, the skill (only when its SKILL.md mentions xerb), and
-the state dir, and strips the xerb block from a Caddyfile left by the old
+`wakeman` re-runs are the maintenance surface: rescan, refresh the install.
+`wakeman uninstall` reverses all of it: boots out the agent, deletes the
+plist, the symlink, the skill (only when its SKILL.md mentions wakeman), and
+the state dir, and strips the wakeman block from a Caddyfile left by the old
 installer.
 
 Non-interactive runs (CI, pipes) and Linux serve in the foreground instead,
@@ -59,7 +59,7 @@ and launchd does not exist on Linux. Same command, same scan, same state dir.
 Retired: `install.sh`, `uninstall.sh`, the Caddy topology, the Homebrew tap as
 a documented path, and the README section explaining which install to pick.
 
-The plist keeps the label `com.xerb.proxy`, so installing over an old
+The plist keeps the label `com.wakeman.proxy`, so installing over an old
 checkout install replaces the agent instead of fighting it. A machine that
 keeps its old Caddy on :80 still works: the daemon loses the :80 bind, lands
 on :4000, and Caddy keeps forwarding `*.localhost` there.
@@ -67,11 +67,11 @@ on :4000, and Caddy keeps forwarding `*.localhost` there.
 ## Consequences
 
 - Publishing to npm stops being optional. The one command is the npm package;
-  until `xerb` is published, the README describes something that
+  until `wakeman` is published, the README describes something that
   does not exist.
-- The bash CLI (`xerb` in the repo root) is deleted. Its daily-use surface
-  moved to the dashboard (status, sleep) and to the entrypoint (`xerb`
-  rescans, `xerb uninstall` removes); it assumed the old checkout layout
+- The bash CLI (`wakeman` in the repo root) is deleted. Its daily-use surface
+  moved to the dashboard (status, sleep) and to the entrypoint (`wakeman`
+  rescans, `wakeman uninstall` removes); it assumed the old checkout layout
   and a daemon fixed on :4000, both gone.
 - Linux persistence is still the systemd unit from issue #10. Until then the
   foreground run is the Linux story, stated plainly in the consent prompt.

@@ -4,11 +4,11 @@ Six small things the 2026-09-21 sandbox run turned up after the main spec was bu
 
 Each section: what the sandbox showed, the change, the test.
 
-## 1. `xerb status` hides failures
+## 1. `wakeman status` hides failures
 
 Seen: crash-app (exits with code 1) and hang-app (never binds) both printed as `. crash-app  stopped  :4620`. The status JSON already carries `lastError: { kind, errorLine }`, and the dashboard shows a red failed badge from it. The CLI drops it.
 
-Where: `cmdStatus` in [bin/xerb.mjs:1064](../bin/xerb.mjs). The state is computed as `disabled`, `conflict`, or `r.state`, and the mark is `*`, `!`, or `.`.
+Where: `cmdStatus` in [bin/wakeman.mjs:1064](../bin/wakeman.mjs). The state is computed as `disabled`, `conflict`, or `r.state`, and the mark is `*`, `!`, or `.`.
 
 Change:
 
@@ -18,16 +18,16 @@ Change:
   - timeout: `nothing on :4630 after 120s`
   - dir-missing: `folder is gone`
   - install-failed: `npm install failed · <errorLine>`
-- Last line of the table, only when something failed: `` `xerb logs <host>` shows why · `xerb restart <host>` tries again ``.
+- Last line of the table, only when something failed: `` `wakeman logs <host>` shows why · `wakeman restart <host>` tries again ``.
 - Exit code stays 0. A failed project is a fact about the project, not about the command.
 
 Test, in `test/cli.test.mjs`: seed a runtime record with `lastError.kind = 'exited'` through `__setRuntimeForTest`, run `status`, assert the row contains `failed` and the error line, and that a clean registry prints no hint line.
 
 ## 2. A refused first run leaves a folder behind
 
-Seen: `xerb </dev/null` on a fresh state dir prints "first run needs a terminal" and exits 1, which is right, but `<state>/logs/` now exists. The spec for `--help` promised no state dir side effects, and a refusal should keep the same promise.
+Seen: `wakeman </dev/null` on a fresh state dir prints "first run needs a terminal" and exits 1, which is right, but `<state>/logs/` now exists. The spec for `--help` promised no state dir side effects, and a refusal should keep the same promise.
 
-Where: `main()` calls `ensureStateDir()` at [bin/xerb.mjs:1482](../bin/xerb.mjs), sixteen lines before the non-interactive check.
+Where: `main()` calls `ensureStateDir()` at [bin/wakeman.mjs:1482](../bin/wakeman.mjs), sixteen lines before the non-interactive check.
 
 Change: move `ensureStateDir()` below the `firstRun && !interactive && !assumeYes` return, and below the consent prompt's "no" branch too, so declining consent also writes nothing. `migrateLegacyRegistry()` creates the directory it needs on its own (`fs.mkdirSync(path.dirname(configPath), { recursive: true })`), so it can stay where it is. `firstRun` only reads.
 
@@ -35,7 +35,7 @@ Test, in `test/cli.test.mjs`: run the entrypoint with stdin closed against a sta
 
 ## 3. `npm install` on every wake for projects with nothing to install
 
-Seen: plain-app has a `package.json` with a `dev` script and no dependencies. `npm install` creates no `node_modules` for it, so the gate at [xerb.mjs:1479](../xerb.mjs) (`!haveModules && package.json exists`) is true forever. Every wake runs the install first: about a second each time, an "installing" phase on the wake page that is a lie, and an `install:` separator in the log per start.
+Seen: plain-app has a `package.json` with a `dev` script and no dependencies. `npm install` creates no `node_modules` for it, so the gate at [wakeman.mjs:1479](../wakeman.mjs) (`!haveModules && package.json exists`) is true forever. Every wake runs the install first: about a second each time, an "installing" phase on the wake page that is a lie, and an `install:` separator in the log per start.
 
 Change: before installing, read `package.json` and count the keys of `dependencies`, `devDependencies`, and `optionalDependencies`. Zero across all three: skip the install, go straight to start. Unreadable or invalid JSON: skip too, and let the start command produce the real error. `workspaces` present: install as today, since a workspace root can have no direct dependencies and still need one.
 
@@ -43,28 +43,28 @@ Test, in `test/coldstart.test.mjs`: a fixture project with `{"scripts":{"dev":"n
 
 ## 4. The add route ignores fields it does not know
 
-Seen: `POST /__xerb/add` with `{"dir": ".../hang-app", "host": "plain-app", "startCmd": "..."}` answered `{"ok":true,"host":"hang-app","updated":true}`. The route reads the name from `body.name` ([xerb.mjs, the `/__xerb/add` handler](../xerb.mjs)); `host` fell on the floor and the folder name was used. The registry key is `host`, the CLI flag is `--name`, the form field is `name`. Anyone scripting against the route guesses wrong half the time, and a wrong guess silently renames nothing.
+Seen: `POST /__wakeman/add` with `{"dir": ".../hang-app", "host": "plain-app", "startCmd": "..."}` answered `{"ok":true,"host":"hang-app","updated":true}`. The route reads the name from `body.name` ([wakeman.mjs, the `/__wakeman/add` handler](../wakeman.mjs)); `host` fell on the floor and the folder name was used. The registry key is `host`, the CLI flag is `--name`, the form field is `name`. Anyone scripting against the route guesses wrong half the time, and a wrong guess silently renames nothing.
 
 Change:
 
 - Accept both: `const rawName = body.name ?? body.host`. Both present and different: 400, `send "name" or "host", not both`.
-- Unknown keys are a 400 that names them: `unknown field "hots"; known: dir, name, host, startCmd, port, framework, parked`. Same rule on `/__xerb/set/<host>` (`port`, `startCmd`) and `/__xerb/detect` (`dir`). One helper, `rejectUnknown(body, allowed)`, used by all three.
+- Unknown keys are a 400 that names them: `unknown field "hots"; known: dir, name, host, startCmd, port, framework, parked`. Same rule on `/__wakeman/set/<host>` (`port`, `startCmd`) and `/__wakeman/detect` (`dir`). One helper, `rejectUnknown(body, allowed)`, used by all three.
 - The existing collision rule in `addEntry` then does its job: a name that belongs to a different folder is refused with the message it already has.
 
 Test, in `test/dashboard-routes.test.mjs`: `host` works as an alias, `name` plus a different `host` is a 400, an unknown key is a 400 naming the key, and the sandbox request above now gets the "already registered for" refusal instead of a silent update.
 
 ## 5. The unprovable-folder hint suggests the wrong command
 
-Seen: `xerb add ~/code/flask-app` lists what the detectors looked for, then says:
+Seen: `wakeman add ~/code/flask-app` lists what the detectors looked for, then says:
 
 ```
 say how it starts and it is registered either way:
-  xerb add ~/code/flask-app --cmd "npm run dev"
+  wakeman add ~/code/flask-app --cmd "npm run dev"
 ```
 
 The folder has `app.py` and `requirements.txt`. The one command it cannot be is `npm run dev`.
 
-Where: [bin/xerb.mjs:935](../bin/xerb.mjs).
+Where: [bin/wakeman.mjs:935](../bin/wakeman.mjs).
 
 Change: pick the example from what is in the folder, first match wins. This is a hint for a human to edit, not a detector, so likelihood is fine here where it is not in `lib/detect.mjs`.
 
@@ -80,13 +80,13 @@ Change: pick the example from what is in the folder, first match wins. This is a
 | `package.json` without a provable `dev` script | `npm start` |
 | nothing matched | `your-start-command --port <port>` |
 
-Add one line under it: `` `<port>` is replaced with the port xerb assigns. `` That substitution already exists in `addEntry` and nothing in the CLI output mentions it.
+Add one line under it: `` `<port>` is replaced with the port wakeman assigns. `` That substitution already exists in `addEntry` and nothing in the CLI output mentions it.
 
 Test, in `test/cli.test.mjs`: a temp folder with `app.py` gets the flask line, an empty folder gets the generic line, and neither output contains `npm run dev`.
 
 ## 6. A spinner frame at the end of the log tail
 
-Seen: the tail for crash-app ended with `⠙`. Under a pty npm draws its progress spinner, a braille glyph rewritten in place with `\r`. The log writer at [xerb.mjs:1060](../xerb.mjs) strips escape sequences and holds a trailing `\r`, but a `\r` in the middle of a chunk passes through, so every frame the spinner drew is in `<host>.log` and the last one sits at the end of the tail. The xterm ring buffer is right to keep them. The plain-text log is not.
+Seen: the tail for crash-app ended with `⠙`. Under a pty npm draws its progress spinner, a braille glyph rewritten in place with `\r`. The log writer at [wakeman.mjs:1060](../wakeman.mjs) strips escape sequences and holds a trailing `\r`, but a `\r` in the middle of a chunk passes through, so every frame the spinner drew is in `<host>.log` and the last one sits at the end of the tail. The xterm ring buffer is right to keep them. The plain-text log is not.
 
 Change, in the log writer only (the ring buffer and the socket stay byte-exact):
 

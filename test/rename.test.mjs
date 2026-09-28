@@ -1,4 +1,4 @@
-// Rename control endpoint tests: POST /__xerb/rename/<host> { to } must
+// Rename control endpoint tests: POST /__wakeman/rename/<host> { to } must
 // rewrite the registry file (the single source of truth — see the handler
 // comment) and refuse everything else: bad names, the reserved dashboard
 // host, collisions, unknown hosts, and callers without the capability token.
@@ -12,11 +12,11 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
-// XERB_CONFIG is read at module load, so the temp registry must exist and
-// the env var must point at it BEFORE importing xerb.mjs.
-const TMP_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), 'xerb-rename-'));
+// WAKEMAN_CONFIG is read at module load, so the temp registry must exist and
+// the env var must point at it BEFORE importing wakeman.mjs.
+const TMP_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), 'wakeman-rename-'));
 const CONFIG_PATH = path.join(TMP_ROOT, 'projects.json');
-const PROJECT_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'xerb-renamedir-'));
+const PROJECT_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'wakeman-renamedir-'));
 
 function writeRegistry() {
   const registry = {
@@ -30,10 +30,10 @@ function writeRegistry() {
 }
 
 writeRegistry();
-process.env.XERB_CONFIG = CONFIG_PATH;
-process.env.XERB_CONTROL_TOKEN_PATH = path.join(TMP_ROOT, 'control-token');
+process.env.WAKEMAN_CONFIG = CONFIG_PATH;
+process.env.WAKEMAN_CONTROL_TOKEN_PATH = path.join(TMP_ROOT, 'control-token');
 
-const { createDaemonServer, loadConfig, ensureControlToken } = await import('../xerb.mjs');
+const { createDaemonServer, loadConfig, ensureControlToken } = await import('../wakeman.mjs');
 
 function listen(server) {
   return new Promise((resolve, reject) => {
@@ -44,8 +44,8 @@ function listen(server) {
 
 function postJson(port, reqPath, { token, body } = {}) {
   const payload = body === undefined ? '' : JSON.stringify(body);
-  const headers = { host: 'xerb.localhost', 'content-type': 'application/json' };
-  if (token) headers['x-xerb-token'] = token;
+  const headers = { host: 'wakeman.localhost', 'content-type': 'application/json' };
+  if (token) headers['x-wakeman-token'] = token;
   return new Promise((resolve, reject) => {
     const req = http.request(
       { host: '127.0.0.1', port, method: 'POST', path: reqPath, headers },
@@ -83,18 +83,18 @@ after(() => {
 });
 
 test('rejects a rename without the capability token', async () => {
-  const res = await postJson(daemonPort, '/__xerb/rename/proj', { body: { to: 'stolen' } });
+  const res = await postJson(daemonPort, '/__wakeman/rename/proj', { body: { to: 'stolen' } });
   assert.equal(res.status, 403);
 });
 
 test('rejects an unknown host, a bad name, the dashboard host, and a taken name', async () => {
   const cases = [
-    ['/__xerb/rename/ghost', { to: 'anything' }, 404],
-    ['/__xerb/rename/proj', { to: 'Has Spaces' }, 400],
-    ['/__xerb/rename/proj', { to: '-leading-hyphen' }, 400],
-    ['/__xerb/rename/proj', { to: 'xerb' }, 400],
-    ['/__xerb/rename/proj', { to: 'other' }, 409],
-    ['/__xerb/rename/proj', undefined, 400],
+    ['/__wakeman/rename/ghost', { to: 'anything' }, 404],
+    ['/__wakeman/rename/proj', { to: 'Has Spaces' }, 400],
+    ['/__wakeman/rename/proj', { to: '-leading-hyphen' }, 400],
+    ['/__wakeman/rename/proj', { to: 'wakeman' }, 400],
+    ['/__wakeman/rename/proj', { to: 'other' }, 409],
+    ['/__wakeman/rename/proj', undefined, 400],
   ];
   for (const [reqPath, body, expected] of cases) {
     const res = await postJson(daemonPort, reqPath, { token, body });
@@ -107,7 +107,7 @@ test('rejects an unknown host, a bad name, the dashboard host, and a taken name'
 });
 
 test('renames in the registry file and the live config', async () => {
-  const res = await postJson(daemonPort, '/__xerb/rename/proj', { token, body: { to: 'renamed' } });
+  const res = await postJson(daemonPort, '/__wakeman/rename/proj', { token, body: { to: 'renamed' } });
   assert.equal(res.status, 200);
   assert.deepEqual(res.json, { ok: true, host: 'renamed' });
 
@@ -121,7 +121,7 @@ test('renames in the registry file and the live config', async () => {
   // The daemon reloaded: the old host is gone from live status, the new is in.
   const status = await new Promise((resolve, reject) => {
     http.get(
-      { host: '127.0.0.1', port: daemonPort, path: '/__xerb/status', headers: { host: 'xerb.localhost' } },
+      { host: '127.0.0.1', port: daemonPort, path: '/__wakeman/status', headers: { host: 'wakeman.localhost' } },
       (r) => {
         let text = '';
         r.setEncoding('utf8');
@@ -146,7 +146,7 @@ test('a control route that throws after an await answers 500 instead of hanging'
   fs.chmodSync(CONFIG_PATH, 0o444);
   t.after(() => fs.chmodSync(CONFIG_PATH, mode));
 
-  const res = await postJson(daemonPort, '/__xerb/rename/other', { token, body: { to: 'newname' } });
+  const res = await postJson(daemonPort, '/__wakeman/rename/other', { token, body: { to: 'newname' } });
   assert.equal(res.status, 500, 'the request is answered, not abandoned');
   assert.match(res.body, /Internal error/, 'and it says what happened');
 });

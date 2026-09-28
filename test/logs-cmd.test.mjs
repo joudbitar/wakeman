@@ -1,4 +1,4 @@
-// `xerb logs <host>` — the command every redacted status page points at.
+// `wakeman logs <host>` — the command every redacted status page points at.
 // The daemon hides log tails from unauthorized browsers, so this CLI read is
 // the sanctioned way to see WHY a start failed; it must work with the daemon
 // wedged, dead, or never installed. These tests spawn the real entrypoint
@@ -14,8 +14,8 @@ import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
 const ROOT = path.resolve(fileURLToPath(import.meta.url), '../..');
-const BIN = path.join(ROOT, 'bin', 'xerb.mjs');
-const STATE = fs.mkdtempSync(path.join(os.tmpdir(), 'xerb-logs-'));
+const BIN = path.join(ROOT, 'bin', 'wakeman.mjs');
+const STATE = fs.mkdtempSync(path.join(os.tmpdir(), 'wakeman-logs-'));
 const LOGS = path.join(STATE, 'logs');
 after(() => fs.rmSync(STATE, { recursive: true, force: true }));
 
@@ -23,7 +23,7 @@ function run(args) {
   const r = spawnSync(process.execPath, [BIN, 'logs', ...args], {
     env: {
       ...process.env,
-      XERB_STATE_DIR: STATE,
+      WAKEMAN_STATE_DIR: STATE,
       NO_COLOR: '1', // plain output — assertions read exact text
     },
     encoding: 'utf8',
@@ -35,7 +35,7 @@ function run(args) {
 test('no host: prints usage, exits 0 (asking how is not an error)', () => {
   const r = run([]);
   assert.equal(r.code, 0);
-  assert.match(r.stdout, /usage: xerb logs <host>/);
+  assert.match(r.stdout, /usage: wakeman logs <host>/);
 });
 
 test('unknown host: says so, lists what exists, exits 1', () => {
@@ -69,7 +69,7 @@ test('accepts the URL form: host.localhost maps to the same log', () => {
 test('path traversal in the host is rejected as usage, exit 1', () => {
   const r = run(['../secrets']);
   assert.equal(r.code, 1);
-  assert.match(r.stdout, /usage: xerb logs <host>/);
+  assert.match(r.stdout, /usage: wakeman logs <host>/);
 });
 
 // `-f` is a different command with the same name: it needs the live daemon,
@@ -80,7 +80,7 @@ test('-f needs the daemon and says so, while the file read still works', async (
   fs.writeFileSync(path.join(LOGS, 'proj.log'), 'line-1\nline-2\n');
 
   // A port nothing answers on, so this cannot reach the developer's own
-  // xerb on :80 and pass for the wrong reason.
+  // wakeman on :80 and pass for the wrong reason.
   const dead = await new Promise((resolve, reject) => {
     const s = net.createServer();
     s.once('error', reject);
@@ -91,12 +91,12 @@ test('-f needs the daemon and says so, while the file read still works', async (
   });
 
   const follow = spawnSync(process.execPath, [BIN, 'logs', 'proj', '-f'], {
-    env: { ...process.env, XERB_STATE_DIR: STATE, XERB_PORT: dead, XERB_FALLBACK_PORT: dead, NO_COLOR: '1' },
+    env: { ...process.env, WAKEMAN_STATE_DIR: STATE, WAKEMAN_PORT: dead, WAKEMAN_FALLBACK_PORT: dead, NO_COLOR: '1' },
     encoding: 'utf8',
     timeout: 10000,
   });
   assert.equal(follow.status, 3);
-  assert.match(follow.stderr, /xerb is not running; run `xerb` to start it/);
+  assert.match(follow.stderr, /wakeman is not running; run `wakeman` to start it/);
 
   const plain = run(['proj']);
   assert.equal(plain.code, 0, 'the file read never asks the daemon');

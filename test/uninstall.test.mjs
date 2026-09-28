@@ -1,6 +1,6 @@
 // Uninstall leaves no trace — the daemon's half of it.
 //
-// `xerb uninstall` stops the launchd job and deletes the state dir. The
+// `wakeman uninstall` stops the launchd job and deletes the state dir. The
 // entrypoint now waits for the daemon process to exit first (lib/install.mjs
 // waitForExit, covered in install.test.mjs), but a daemon that outlives that
 // wait must still not resurrect what was just deleted: on a real machine the
@@ -9,7 +9,7 @@
 // the dying daemon's config watch firing on the vanishing registry, and log()
 // recreating the whole tree to record it.
 //
-// XERB_LOGS_DIR is set BEFORE importing the daemon (LOGS_DIR is resolved at
+// WAKEMAN_LOGS_DIR is set BEFORE importing the daemon (LOGS_DIR is resolved at
 // load), so this touches only a throwaway temp tree.
 
 import fs from 'node:fs';
@@ -18,12 +18,12 @@ import path from 'node:path';
 import { test, after } from 'node:test';
 import assert from 'node:assert/strict';
 
-const STATE_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'xerb-uninstall-'));
+const STATE_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'wakeman-uninstall-'));
 const LOGS_DIR = path.join(STATE_DIR, 'logs');
-process.env.XERB_LOGS_DIR = LOGS_DIR;
+process.env.WAKEMAN_LOGS_DIR = LOGS_DIR;
 after(() => fs.rmSync(STATE_DIR, { recursive: true, force: true }));
 
-const { log } = await import('../xerb.mjs');
+const { log } = await import('../wakeman.mjs');
 
 test('log() creates a missing logs dir while the state dir is still there', () => {
   assert.equal(fs.existsSync(LOGS_DIR), false, 'logs/ starts absent — this is the first-boot shape');

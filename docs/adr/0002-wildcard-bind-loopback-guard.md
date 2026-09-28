@@ -45,7 +45,7 @@ separate `::1` listener.
 
 ## Consequences
 
-- `npx xerb` on macOS serves portless URLs: `http://portfolio.localhost`
+- `npx wakeman` on macOS serves portless URLs: `http://portfolio.localhost`
   works with nothing installed, first try, no retries. Linux without the
   capability lands on `:4000`, and the banner says so.
 - A LAN port scan sees the port open. A connection there is closed at accept

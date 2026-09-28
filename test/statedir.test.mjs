@@ -15,72 +15,72 @@ import { decideBindFallback, includePortForUrl, formatProjectUrl } from '../lib/
 
 // --- state dir resolution ---------------------------------------------------
 
-test('resolveStateDir: explicit XERB_STATE_DIR wins over everything', () => {
+test('resolveStateDir: explicit WAKEMAN_STATE_DIR wins over everything', () => {
   const dir = resolveStateDir({
-    env: { XERB_STATE_DIR: '/tmp/custom-state', XDG_STATE_HOME: '/tmp/xdg' },
+    env: { WAKEMAN_STATE_DIR: '/tmp/custom-state', XDG_STATE_HOME: '/tmp/xdg' },
     home: '/home/j',
-    scriptDir: '/opt/xerb',
+    scriptDir: '/opt/wakeman',
     preferXdg: true,
   });
   assert.equal(dir, path.resolve('/tmp/custom-state'));
 });
 
-test('resolveStateDir: preferXdg uses XDG_STATE_HOME/xerb when set', () => {
+test('resolveStateDir: preferXdg uses XDG_STATE_HOME/wakeman when set', () => {
   const dir = resolveStateDir({
     env: { XDG_STATE_HOME: '/tmp/xdg' },
     home: '/home/j',
-    scriptDir: '/opt/xerb',
+    scriptDir: '/opt/wakeman',
     preferXdg: true,
   });
-  assert.equal(dir, path.resolve('/tmp/xdg', 'xerb'));
+  assert.equal(dir, path.resolve('/tmp/xdg', 'wakeman'));
 });
 
-test('resolveStateDir: preferXdg with no XDG_STATE_HOME defaults to ~/.local/state/xerb', () => {
-  const dir = resolveStateDir({ env: {}, home: '/home/j', scriptDir: '/opt/xerb', preferXdg: true });
-  assert.equal(dir, path.resolve('/home/j', '.local', 'state', 'xerb'));
+test('resolveStateDir: preferXdg with no XDG_STATE_HOME defaults to ~/.local/state/wakeman', () => {
+  const dir = resolveStateDir({ env: {}, home: '/home/j', scriptDir: '/opt/wakeman', preferXdg: true });
+  assert.equal(dir, path.resolve('/home/j', '.local', 'state', 'wakeman'));
 });
 
 test('resolveStateDir: preferXdg false keeps the next-to-script default (unchanged install)', () => {
-  // No XERB_STATE_DIR + preferXdg false => scriptDir, so an installed daemon
+  // No WAKEMAN_STATE_DIR + preferXdg false => scriptDir, so an installed daemon
   // and every existing self-test resolve exactly as before.
-  const dir = resolveStateDir({ env: { XDG_STATE_HOME: '/tmp/xdg' }, home: '/home/j', scriptDir: '/opt/xerb', preferXdg: false });
-  assert.equal(dir, '/opt/xerb');
+  const dir = resolveStateDir({ env: { XDG_STATE_HOME: '/tmp/xdg' }, home: '/home/j', scriptDir: '/opt/wakeman', preferXdg: false });
+  assert.equal(dir, '/opt/wakeman');
 });
 
-test('resolveStateDir: an empty/whitespace XERB_STATE_DIR is ignored', () => {
-  const dir = resolveStateDir({ env: { XERB_STATE_DIR: '   ' }, home: '/home/j', scriptDir: '/opt/xerb', preferXdg: false });
-  assert.equal(dir, '/opt/xerb');
+test('resolveStateDir: an empty/whitespace WAKEMAN_STATE_DIR is ignored', () => {
+  const dir = resolveStateDir({ env: { WAKEMAN_STATE_DIR: '   ' }, home: '/home/j', scriptDir: '/opt/wakeman', preferXdg: false });
+  assert.equal(dir, '/opt/wakeman');
 });
 
 // --- registry / logs / token derive from the state dir ----------------------
 
 test('resolveStatePaths: registry, logs, and token all derive from the state dir', () => {
-  const p = resolveStatePaths({ env: {}, stateDir: '/state/xerb' });
-  assert.equal(p.stateDir, '/state/xerb');
-  assert.equal(p.configPath, path.join('/state/xerb', 'projects.json'));
-  assert.equal(p.logsDir, path.join('/state/xerb', 'logs'));
+  const p = resolveStatePaths({ env: {}, stateDir: '/state/wakeman' });
+  assert.equal(p.stateDir, '/state/wakeman');
+  assert.equal(p.configPath, path.join('/state/wakeman', 'projects.json'));
+  assert.equal(p.logsDir, path.join('/state/wakeman', 'logs'));
   // token defaults next to the registry (its directory == the state dir here).
-  assert.equal(p.tokenPath, path.join('/state/xerb', 'control-token'));
+  assert.equal(p.tokenPath, path.join('/state/wakeman', 'control-token'));
 });
 
 test('resolveStatePaths: each per-path override still wins over the state-dir default', () => {
-  // Every existing self-test hook (XERB_CONFIG / XERB_LOGS_DIR /
-  // XERB_CONTROL_TOKEN_PATH) must keep pointing its own file at a temp dir.
+  // Every existing self-test hook (WAKEMAN_CONFIG / WAKEMAN_LOGS_DIR /
+  // WAKEMAN_CONTROL_TOKEN_PATH) must keep pointing its own file at a temp dir.
   const env = {
-    XERB_CONFIG: '/tmp/t/reg.json',
-    XERB_LOGS_DIR: '/tmp/t/logs',
-    XERB_CONTROL_TOKEN_PATH: '/tmp/t/tok',
+    WAKEMAN_CONFIG: '/tmp/t/reg.json',
+    WAKEMAN_LOGS_DIR: '/tmp/t/logs',
+    WAKEMAN_CONTROL_TOKEN_PATH: '/tmp/t/tok',
   };
-  const p = resolveStatePaths({ env, stateDir: '/state/xerb' });
+  const p = resolveStatePaths({ env, stateDir: '/state/wakeman' });
   assert.equal(p.configPath, path.resolve('/tmp/t/reg.json'));
   assert.equal(p.logsDir, path.resolve('/tmp/t/logs'));
   assert.equal(p.tokenPath, path.resolve('/tmp/t/tok'));
 });
 
-test('resolveStatePaths: token follows XERB_CONFIG when only the config is overridden', () => {
-  // A test that points only XERB_CONFIG at a temp file gets an isolated token
+test('resolveStatePaths: token follows WAKEMAN_CONFIG when only the config is overridden', () => {
+  // A test that points only WAKEMAN_CONFIG at a temp file gets an isolated token
   // beside it — the pre-state-dir behavior, preserved.
-  const p = resolveStatePaths({ env: { XERB_CONFIG: '/tmp/iso/projects.json' }, stateDir: '/state/xerb' });
+  const p = resolveStatePaths({ env: { WAKEMAN_CONFIG: '/tmp/iso/projects.json' }, stateDir: '/state/wakeman' });
   assert.equal(p.configPath, path.resolve('/tmp/iso/projects.json'));
   assert.equal(p.tokenPath, path.join(path.resolve('/tmp/iso'), 'control-token'));
 });
@@ -125,5 +125,5 @@ test('includePortForUrl: only :80 is suffix-free', () => {
 test('formatProjectUrl: front-door port omits the suffix, others include it', () => {
   assert.equal(formatProjectUrl('webapp', 80), 'http://webapp.localhost');
   assert.equal(formatProjectUrl('webapp', 7420), 'http://webapp.localhost:7420');
-  assert.equal(formatProjectUrl('xerb', 4000), 'http://xerb.localhost:4000');
+  assert.equal(formatProjectUrl('wakeman', 4000), 'http://wakeman.localhost:4000');
 });

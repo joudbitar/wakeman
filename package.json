@@ -1,10 +1,10 @@
 {
-  "name": "xerb",
-  "version": "0.3.1",
+  "name": "wakeman",
+  "version": "0.3.2",
   "description": "On-demand local dev-server proxy: every project gets a permanent .localhost URL that wakes its dev server on request and sleeps it when idle.",
   "type": "module",
   "bin": {
-    "xerb": "bin/xerb.mjs"
+    "wakeman": "bin/wakeman.mjs"
   },
   "files": [
     "bin/",
@@ -12,7 +12,7 @@
     "lib/pty.py",
     "lib/vendor/",
     "!lib/__pycache__",
-    "xerb.mjs",
+    "wakeman.mjs",
     "scan.mjs",
     "serve_static.py",
     ".claude/skills/"
@@ -25,11 +25,11 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/joudbitar/xerb.git"
+    "url": "git+https://github.com/joudbitar/wakeman.git"
   },
-  "homepage": "https://github.com/joudbitar/xerb#readme",
+  "homepage": "https://github.com/joudbitar/wakeman#readme",
   "bugs": {
-    "url": "https://github.com/joudbitar/xerb/issues"
+    "url": "https://github.com/joudbitar/wakeman/issues"
   },
   "keywords": [
     "dev-server",

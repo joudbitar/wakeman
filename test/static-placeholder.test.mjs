@@ -4,14 +4,14 @@
 // The scanner used to write `python3 "/abs/path/serve_static.py"` into the
 // registry. Under npx that path is ~/.npm/_npx/<hash>/..., npm prunes it, and
 // the static site dies with an ENOENT nobody reads. Now the registry holds the
-// literal `$XERB_STATIC` and the daemon resolves it against the xerb.mjs
+// literal `$WAKEMAN_STATIC` and the daemon resolves it against the wakeman.mjs
 // that is running. These tests pin both halves: the expansion at spawn time
 // (a real python3 serving a real file through the front door) and the one-time
 // rewrite of a legacy entry on config load.
 //
-// ISOLATION: XERB_CONFIG / XERB_LOGS_DIR are read at module load, so they
-// are assigned BEFORE the dynamic import of ../xerb.mjs. Everything lands in
-// a temp dir: no real state dir, no LaunchAgent, no `xerb` binary.
+// ISOLATION: WAKEMAN_CONFIG / WAKEMAN_LOGS_DIR are read at module load, so they
+// are assigned BEFORE the dynamic import of ../wakeman.mjs. Everything lands in
+// a temp dir: no real state dir, no LaunchAgent, no `wakeman` binary.
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -23,7 +23,7 @@ import path from 'node:path';
 
 const REPO_ROOT = path.resolve(import.meta.dirname, '..');
 
-const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'xerb-static-'));
+const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'wakeman-static-'));
 const CONFIG_FILE = path.join(tmpDir, 'projects.json');
 const LOGS = path.join(tmpDir, 'logs');
 fs.mkdirSync(LOGS, { recursive: true });
@@ -36,8 +36,8 @@ const INDEX_BODY = '<h1>served by the placeholder</h1>\n';
 fs.writeFileSync(path.join(SITE_DIR, 'index.html'), INDEX_BODY);
 
 fs.writeFileSync(CONFIG_FILE, JSON.stringify({ port: 0, projects: [] }));
-process.env.XERB_CONFIG = CONFIG_FILE;
-process.env.XERB_LOGS_DIR = LOGS;
+process.env.WAKEMAN_CONFIG = CONFIG_FILE;
+process.env.WAKEMAN_LOGS_DIR = LOGS;
 
 const {
   createDaemonServer,
@@ -49,7 +49,7 @@ const {
   STATIC_PLACEHOLDER,
   expandStartCmd,
   rewriteStaticStartCmds,
-} = await import('../xerb.mjs');
+} = await import('../wakeman.mjs');
 
 // --- helpers ----------------------------------------------------------------
 
@@ -120,10 +120,10 @@ function closeServer(server) {
 
 // --- expansion --------------------------------------------------------------
 
-test('the placeholder expands to serve_static.py next to the running xerb.mjs', () => {
+test('the placeholder expands to serve_static.py next to the running wakeman.mjs', () => {
   const expected = `python3 "${path.join(REPO_ROOT, 'serve_static.py')}"`;
   assert.equal(expandStartCmd(STATIC_PLACEHOLDER), expected);
-  assert.equal(STATIC_PLACEHOLDER, '$XERB_STATIC', 'the placeholder string is the one the registry stores');
+  assert.equal(STATIC_PLACEHOLDER, '$WAKEMAN_STATIC', 'the placeholder string is the one the registry stores');
   assert.ok(fs.existsSync(path.join(REPO_ROOT, 'serve_static.py')), 'the file it expands to ships in the package');
   // Surrounding whitespace is a hand-edited registry, not a different command.
   assert.equal(expandStartCmd(`  ${STATIC_PLACEHOLDER}\n`), expected);
@@ -135,7 +135,7 @@ test('every other startCmd passes through untouched', () => {
   }
   // A command that merely MENTIONS the placeholder is left alone: sh would
   // expand it to the empty string, and a half-expansion is worse than none.
-  assert.equal(expandStartCmd('python3 $XERB_STATIC --port 3000'), 'python3 $XERB_STATIC --port 3000');
+  assert.equal(expandStartCmd('python3 $WAKEMAN_STATIC --port 3000'), 'python3 $WAKEMAN_STATIC --port 3000');
 });
 
 test('a placeholder project starts and serves its folder through the front door', async (t) => {

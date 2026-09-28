@@ -42,7 +42,7 @@ test('isToolStub is only the known /usr/bin stubs, only without developer tools'
 });
 
 test('whichOn resolves on the given PATH, not the process one', () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'xerb-which-'));
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'wakeman-which-'));
   const bin = path.join(dir, 'tool');
   fs.writeFileSync(bin, '#!/bin/sh\n', { mode: 0o755 });
   assert.equal(whichOn('tool', `/nope:${dir}`), bin);
@@ -51,7 +51,7 @@ test('whichOn resolves on the given PATH, not the process one', () => {
 });
 
 test('pinNode leaves a runnable copy that outlives the original', () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'xerb-pin-'));
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'wakeman-pin-'));
   const src = path.join(dir, 'versions', '22', 'node');
   fs.mkdirSync(path.dirname(src), { recursive: true });
   fs.writeFileSync(src, '#!/bin/sh\necho v1\n', { mode: 0o755 });
@@ -68,7 +68,7 @@ test('pinNode leaves a runnable copy that outlives the original', () => {
 });
 
 test('stableNode picks the Homebrew opt link over the versioned Cellar path', () => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'xerb-brew-'));
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'wakeman-brew-'));
   const cellar = path.join(root, 'Cellar', 'node@24', '24.16.0', 'bin', 'node');
   const opt = path.join(root, 'opt', 'node@24', 'bin', 'node');
   for (const f of [cellar, opt]) {
@@ -82,7 +82,7 @@ test('stableNode picks the Homebrew opt link over the versioned Cellar path', ()
 });
 
 test('stableNode copies a self-contained node, and keeps the original if the copy will not run', () => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'xerb-nvm-'));
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'wakeman-nvm-'));
   const src = path.join(root, '.nvm', 'versions', 'node', 'v22.1.0', 'bin', 'node');
   fs.mkdirSync(path.dirname(src), { recursive: true });
   fs.writeFileSync(src, '#!/bin/sh\nexit 0\n', { mode: 0o755 });

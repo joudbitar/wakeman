@@ -6,8 +6,8 @@
 // a start that never opens the port surfaces its failure, and N concurrent hits
 // still spawn exactly one child. Pure node:test + node:assert, zero deps.
 //
-// XERB_CONFIG is read at module load (CONFIG_PATH, captured once), so we set
-// it and write the temp registry BEFORE the dynamic import of ../xerb.mjs,
+// WAKEMAN_CONFIG is read at module load (CONFIG_PATH, captured once), so we set
+// it and write the temp registry BEFORE the dynamic import of ../wakeman.mjs,
 // then call the exported loadConfig() explicitly (the daemon only auto-loads
 // under RUN_AS_MAIN, which a test import deliberately skips).
 
@@ -22,7 +22,7 @@ import path from 'node:path';
 
 // --- temp registry + import (must precede importing the module) -------------
 
-const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'xerb-coldstart-'));
+const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'wakeman-coldstart-'));
 const configPath = path.join(tmpDir, 'projects.json');
 // A node_modules dir makes ensureUp skip the install step for every project that
 // uses tmpDir as its cwd — so the tests never shell out to a real `npm install`
@@ -37,7 +37,7 @@ function writeConfig(cfg) {
 }
 writeConfig({ port: 0, projects: [] });
 
-process.env.XERB_CONFIG = configPath;
+process.env.WAKEMAN_CONFIG = configPath;
 
 const {
   createDaemonServer,
@@ -50,7 +50,7 @@ const {
   stop,
   upstreamAgent,
   __setResolvePidCwd,
-} = await import('../xerb.mjs');
+} = await import('../wakeman.mjs');
 
 // These tests adopt fake HTTP servers whose real working directory is the test
 // runner's cwd, not the project dir. Under the cwd-verified adoption added later,
@@ -317,7 +317,7 @@ test('failed start surfaces the reason + log tail in the status page', async (t)
   assert.equal(res.status, 200, 'retry nav -> 200 status page');
   assert.doesNotMatch(res.body, /failed to start/i, 'retry does not immediately re-show the failure page');
   assert.match(res.body, /being turned on/i, 'retry shows the wake page while bring-up runs');
-  assert.match(res.body, /__xerb\/tail/, 'wake page wires up the terminal panel');
+  assert.match(res.body, /__wakeman\/tail/, 'wake page wires up the terminal panel');
 
   // Settle the re-kicked attempt now (config is still 300ms here) so it times
   // out fast and doesn't run under a later test's larger startTimeout.
@@ -332,7 +332,7 @@ test('N concurrent cold hits spawn exactly one child', async (t) => {
   // shared tmpDir (which other tests mutate). startCmd is a node one-liner that
   // (a) appends a unique line to a marker file on boot and (b) listens on the
   // project port, so we can count how many children actually launched.
-  const projDir = fs.mkdtempSync(path.join(os.tmpdir(), 'xerb-spawn-'));
+  const projDir = fs.mkdtempSync(path.join(os.tmpdir(), 'wakeman-spawn-'));
   fs.mkdirSync(path.join(projDir, 'node_modules'), { recursive: true }); // skip install
   const markerFile = path.join(projDir, 'boot-marker.txt');
 
@@ -386,7 +386,7 @@ test('N concurrent cold hits spawn exactly one child', async (t) => {
   // And no second listener collided on the port (EADDRINUSE would appear if a
   // second child had raced the first).
   const logTail = (() => {
-    try { return fs.readFileSync(path.join(process.env.XERB_LOGS_DIR, 'spawn.log'), 'utf8'); } catch { return ''; }
+    try { return fs.readFileSync(path.join(process.env.WAKEMAN_LOGS_DIR, 'spawn.log'), 'utf8'); } catch { return ''; }
   })();
   assert.doesNotMatch(logTail, /EADDRINUSE/, 'no port collision in the child log');
 });
@@ -531,7 +531,7 @@ function freePort() {
   });
 }
 
-// Everything xerb's own log() printed while fn ran.
+// Everything wakeman's own log() printed while fn ran.
 async function daemonLogDuring(fn) {
   let text = '';
   const orig = process.stdout.write;
@@ -548,7 +548,7 @@ async function daemonLogDuring(fn) {
 }
 
 test('a package.json with no dependencies starts without an install', async (t) => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'xerb-nodeps-'));
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'wakeman-nodeps-'));
   fs.writeFileSync(path.join(dir, 'package.json'), JSON.stringify({ scripts: { dev: 'node server.js' } }));
   const port = await freePort();
   const project = { host: 'nodeps', dir, port, startCmd: DEV_SERVER, enabled: true };
@@ -572,7 +572,7 @@ test('a package.json with no dependencies starts without an install', async (t) 
 });
 
 test('one dependency and no node_modules still installs', async (t) => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'xerb-onedep-'));
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'wakeman-onedep-'));
   // A file: dependency, so the install is real and never touches the network.
   const dep = path.join(dir, 'dep');
   fs.mkdirSync(dep);
@@ -593,10 +593,10 @@ test('one dependency and no node_modules still installs', async (t) => {
 });
 
 test('a workspace root installs, and a package.json that will not parse does not', async (t) => {
-  const ws = fs.mkdtempSync(path.join(os.tmpdir(), 'xerb-ws-'));
+  const ws = fs.mkdtempSync(path.join(os.tmpdir(), 'wakeman-ws-'));
   fs.mkdirSync(path.join(ws, 'packages'));
   fs.writeFileSync(path.join(ws, 'package.json'), JSON.stringify({ name: 'root', private: true, workspaces: ['packages/*'] }));
-  const bad = fs.mkdtempSync(path.join(os.tmpdir(), 'xerb-badjson-'));
+  const bad = fs.mkdtempSync(path.join(os.tmpdir(), 'wakeman-badjson-'));
   fs.writeFileSync(path.join(bad, 'package.json'), '{ not json');
   const wsProject = { host: 'wsroot', dir: ws, port: await freePort(), startCmd: DEV_SERVER, enabled: true };
   const badProject = { host: 'badjson', dir: bad, port: await freePort(), startCmd: DEV_SERVER, enabled: true };

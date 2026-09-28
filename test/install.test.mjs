@@ -39,7 +39,7 @@ test('assembleLaunchdPath keeps nonstandard tool dirs the daemon would otherwise
 });
 
 test('assembleLaunchdPath drops npx-injected and relative entries', () => {
-  // Under `npx xerb` the inherited PATH carries the npx cache and
+  // Under `npx wakeman` the inherited PATH carries the npx cache and
   // node_modules/.bin dirs — they vanish when the cache is pruned, so baking
   // them into a plist that outlives the run would leave dangling entries.
   const p = assembleLaunchdPath({
@@ -72,21 +72,21 @@ test('assembleLaunchdPath still covers the basics when the install PATH is minim
 test('renderPlist pins the state dir, the front door, and the daemon path', () => {
   const plist = renderPlist({
     nodeBin: '/opt/node/bin/node',
-    daemonPath: '/Users/x/.local/state/xerb/app/xerb.mjs',
-    workDir: '/Users/x/.local/state/xerb/app',
-    stateDir: '/Users/x/.local/state/xerb',
-    logsDir: '/Users/x/.local/state/xerb/logs',
+    daemonPath: '/Users/x/.local/state/wakeman/app/wakeman.mjs',
+    workDir: '/Users/x/.local/state/wakeman/app',
+    stateDir: '/Users/x/.local/state/wakeman',
+    logsDir: '/Users/x/.local/state/wakeman/logs',
     home: '/Users/x',
     pathEnv: '/opt/node/bin:/usr/bin:/bin',
   });
   assert.ok(plist.includes(`<string>${LAUNCHD_LABEL}</string>`));
   assert.ok(plist.includes('<string>/opt/node/bin/node</string>'));
-  assert.ok(plist.includes('<string>/Users/x/.local/state/xerb/app/xerb.mjs</string>'));
-  assert.ok(plist.includes('<key>XERB_STATE_DIR</key>'));
-  assert.ok(plist.includes('<string>/Users/x/.local/state/xerb</string>'));
-  assert.ok(plist.includes('<key>XERB_PORT</key>'));
+  assert.ok(plist.includes('<string>/Users/x/.local/state/wakeman/app/wakeman.mjs</string>'));
+  assert.ok(plist.includes('<key>WAKEMAN_STATE_DIR</key>'));
+  assert.ok(plist.includes('<string>/Users/x/.local/state/wakeman</string>'));
+  assert.ok(plist.includes('<key>WAKEMAN_PORT</key>'));
   assert.ok(plist.includes('<string>80</string>'));
-  assert.ok(plist.includes('<key>XERB_FALLBACK_PORT</key>'));
+  assert.ok(plist.includes('<key>WAKEMAN_FALLBACK_PORT</key>'));
   assert.ok(plist.includes('<string>4000</string>'));
   assert.ok(plist.includes('<key>KeepAlive</key>'));
   assert.ok(plist.includes('<key>RunAtLoad</key>'));
@@ -123,7 +123,7 @@ test('stripCaddyBlock removes the sentinel-marked block and nothing else', () =>
   ].join('\n');
   const { text, changed } = stripCaddyBlock(file);
   assert.equal(changed, true);
-  assert.ok(!text.includes('xerb'));
+  assert.ok(!text.includes('wakeman'));
   assert.ok(text.includes('example.test {'));
   assert.ok(text.includes('other.test {'));
 });
@@ -146,14 +146,14 @@ test('stripCaddyBlock removes the legacy comment-through-brace form', () => {
 test('extractWorkingDirectory round-trips through renderPlist and rejects garbage', () => {
   const plist = renderPlist({
     nodeBin: '/opt/node/bin/node',
-    daemonPath: '/d/xerb.mjs',
-    workDir: '/Users/x/xerb checkout',
+    daemonPath: '/d/wakeman.mjs',
+    workDir: '/Users/x/wakeman checkout',
     stateDir: '/s',
     logsDir: '/l',
     home: '/Users/x',
     pathEnv: '/a:/b',
   });
-  assert.equal(extractWorkingDirectory(plist), '/Users/x/xerb checkout');
+  assert.equal(extractWorkingDirectory(plist), '/Users/x/wakeman checkout');
   assert.equal(extractWorkingDirectory('not a plist'), null);
   assert.equal(extractWorkingDirectory(''), null);
 });
@@ -189,9 +189,9 @@ test('parseLaunchdPid finds the running job pid in launchctl print output', () =
   // Shape of the real thing, trimmed: uninstall needs the pid so it can watch
   // the daemon actually exit before it deletes the state dir.
   const out = [
-    'com.xerb.proxy = {',
+    'com.wakeman.proxy = {',
     '\tactive count = 1',
-    '\tpath = /Users/x/Library/LaunchAgents/com.xerb.proxy.plist',
+    '\tpath = /Users/x/Library/LaunchAgents/com.wakeman.proxy.plist',
     '\tstate = running',
     '',
     '\tprogram = /opt/node/bin/node',
@@ -205,7 +205,7 @@ test('parseLaunchdPid finds the running job pid in launchctl print output', () =
 test('parseLaunchdPid returns null when no job is running', () => {
   // A loaded-but-idle job prints no pid line, and an unknown label prints
   // nothing at all. Both mean "nothing to wait for".
-  assert.equal(parseLaunchdPid('com.xerb.proxy = {\n\tstate = not running\n}'), null);
+  assert.equal(parseLaunchdPid('com.wakeman.proxy = {\n\tstate = not running\n}'), null);
   assert.equal(parseLaunchdPid(''), null);
   assert.equal(parseLaunchdPid(undefined), null);
   // A pid mentioned inside another key is not the job's pid.
@@ -255,15 +255,15 @@ test('legacyRegistryCandidates: the lazydev state dir first, then the old checko
   assert.equal(LEGACY_LAUNCHD_LABEL, 'com.lazydev.proxy');
   const plist = '<key>WorkingDirectory</key>\n<string>/Users/x/lazydev</string>';
   assert.deepEqual(
-    legacyRegistryCandidates({ legacyStateDir: '/Users/x/.local/state/lazydev', legacyPlistText: plist, stateDir: '/Users/x/.local/state/xerb' }),
+    legacyRegistryCandidates({ legacyStateDir: '/Users/x/.local/state/lazydev', legacyPlistText: plist, stateDir: '/Users/x/.local/state/wakeman' }),
     ['/Users/x/.local/state/lazydev/projects.json', '/Users/x/lazydev/projects.json']
   );
   assert.deepEqual(
-    legacyRegistryCandidates({ legacyStateDir: '/s/lazydev', legacyPlistText: 'not a plist', stateDir: '/s/xerb' }),
+    legacyRegistryCandidates({ legacyStateDir: '/s/lazydev', legacyPlistText: 'not a plist', stateDir: '/s/wakeman' }),
     ['/s/lazydev/projects.json']
   );
   assert.deepEqual(
-    legacyRegistryCandidates({ legacyStateDir: '/s/lazydev', legacyPlistText: '<key>WorkingDirectory</key><string>/s/xerb</string>', stateDir: '/s/xerb' }),
+    legacyRegistryCandidates({ legacyStateDir: '/s/lazydev', legacyPlistText: '<key>WorkingDirectory</key><string>/s/wakeman</string>', stateDir: '/s/wakeman' }),
     ['/s/lazydev/projects.json']
   );
 });

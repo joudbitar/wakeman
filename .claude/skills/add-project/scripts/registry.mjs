@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// xerb registry helper for the add-project skill. Zero deps, Node 22+.
+// wakeman registry helper for the add-project skill. Zero deps, Node 22+.
 //
 //   node registry.mjs list
 //   node registry.mjs add --host myapp --dir /abs/path --start-cmd "cmd" \
@@ -12,7 +12,7 @@
 // project answers 200 (503 means the daemon is cold-starting it — keep
 // waiting). Exit codes: 0 ok, 1 validation/registry error, 2 verify timeout.
 //
-// The implementation is lib/registry-cli.mjs, the same module `xerb add`
+// The implementation is lib/registry-cli.mjs, the same module `wakeman add`
 // and the dashboard write through, so the skill and the CLI cannot drift.
 // This file only has to FIND that module: the install copies the skill to
 // ~/.claude/skills/add-project, where the package's lib/ is no longer a
@@ -26,19 +26,19 @@ import { pathToFileURL, fileURLToPath } from 'node:url';
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 
 // In order: the package or checkout this file ships inside; the app the
-// installed `xerb` command points at (the symlink's target is
-// <app>/bin/xerb.mjs); the npx install's app copy under the state dir.
+// installed `wakeman` command points at (the symlink's target is
+// <app>/bin/wakeman.mjs); the npx install's app copy under the state dir.
 function findLib() {
   const cands = [path.resolve(HERE, '..', '..', '..', '..', 'lib', 'registry-cli.mjs')];
   try {
-    const link = fs.realpathSync(path.join(os.homedir(), '.local', 'bin', 'xerb'));
+    const link = fs.realpathSync(path.join(os.homedir(), '.local', 'bin', 'wakeman'));
     cands.push(path.resolve(path.dirname(link), '..', 'lib', 'registry-cli.mjs'));
   } catch { /* not installed on PATH */ }
-  const stateDir = process.env.XERB_STATE_DIR
-    || (process.env.XDG_STATE_HOME ? path.join(process.env.XDG_STATE_HOME, 'xerb') : path.join(os.homedir(), '.local', 'state', 'xerb'));
+  const stateDir = process.env.WAKEMAN_STATE_DIR
+    || (process.env.XDG_STATE_HOME ? path.join(process.env.XDG_STATE_HOME, 'wakeman') : path.join(os.homedir(), '.local', 'state', 'wakeman'));
   cands.push(path.join(stateDir, 'app', 'lib', 'registry-cli.mjs'));
   for (const p of cands) if (fs.existsSync(p)) return p;
-  process.stderr.write(`registry.mjs: could not find xerb's lib/registry-cli.mjs; looked at:\n  ${cands.join('\n  ')}\ninstall xerb (npx xerb) so the skill has a package to talk to.\n`);
+  process.stderr.write(`registry.mjs: could not find wakeman's lib/registry-cli.mjs; looked at:\n  ${cands.join('\n  ')}\ninstall wakeman (npx wakeman) so the skill has a package to talk to.\n`);
   process.exit(1);
 }
 

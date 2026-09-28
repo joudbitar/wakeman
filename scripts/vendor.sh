@@ -4,8 +4,8 @@
 #   scripts/vendor.sh            refetch the pinned versions below
 #   scripts/vendor.sh --check    re-hash what is checked in, fetch nothing
 #
-# The panel loads xterm from /__xerb/vendor/*, which is lib/vendor/ on disk.
-# Those files are CHECKED IN on purpose: xerb is a local proxy that has to
+# The panel loads xterm from /__wakeman/vendor/*, which is lib/vendor/ on disk.
+# Those files are CHECKED IN on purpose: wakeman is a local proxy that has to
 # work on a plane, and an npm runtime dependency would put an install step
 # between a git pull and a working dashboard. The cost is about 300 KB in the
 # package (spec 0.3.0 section 6).

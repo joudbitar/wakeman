@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// xerb — on-demand local dev-server proxy daemon.
+// wakeman — on-demand local dev-server proxy daemon.
 // Zero npm dependencies. Node v22 built-ins only.
 //
 // See ./SPEC.md (project root) for the full build contract.
@@ -20,7 +20,7 @@ import { decideBindFallback, formatProjectUrl } from './lib/bind.mjs';
 import { handleUpgrade as wsAccept, isWebSocketUpgrade } from './lib/ws.mjs';
 import { protectedRoot, isAccessDenied, isToolStub, whichOn } from './lib/macos.mjs';
 // Every registry WRITE in this file goes through these, because the dashboard
-// and the `xerb add/remove/enable/disable/port/rename` subcommands must not
+// and the `wakeman add/remove/enable/disable/port/rename` subcommands must not
 // drift: one module owns what a valid entry is, and the daemon only decides
 // when to call it. (The terminal logo lives in lib/ui.mjs and stays there —
 // the dashboard draws its own word mark; see dashboardHtml.)
@@ -94,27 +94,27 @@ function frontUrl(host) {
 
 // This file's own directory — the next-to-script default state location, so the
 // whole project is relocatable: move or clone it anywhere and the registry,
-// logs, and daemon travel together. (Was hardcoded to ~/.config/xerb before
+// logs, and daemon travel together. (Was hardcoded to ~/.config/wakeman before
 // centralizing.)
 const CONFIG_DIR = path.dirname(fileURLToPath(import.meta.url));
 
 // One state directory holds the registry, logs, and control token. When
-// XERB_STATE_DIR is set (the npx entrypoint sets it), all three derive from
+// WAKEMAN_STATE_DIR is set (the npx entrypoint sets it), all three derive from
 // it, so an npx run and a persistent install share one layout. When it is NOT
 // set, the state dir IS CONFIG_DIR — the existing next-to-script layout — so an
 // installed daemon and every existing self-test are unchanged.
 //
 // preferXdg stays false here: the daemon must not silently relocate an existing
 // install to ~/.local/state on a bare boot. The npx path opts into the XDG
-// default by resolving it (bin/xerb.mjs) and exporting XERB_STATE_DIR
+// default by resolving it (bin/wakeman.mjs) and exporting WAKEMAN_STATE_DIR
 // before this module loads.
 const STATE_DIR = resolveStateDir({ env: process.env, home: os.homedir(), scriptDir: CONFIG_DIR, preferXdg: false });
 
 // The three state paths. Each still honors its OWN override env var
-// (XERB_CONFIG / XERB_LOGS_DIR / XERB_CONTROL_TOKEN_PATH) so every
+// (WAKEMAN_CONFIG / WAKEMAN_LOGS_DIR / WAKEMAN_CONTROL_TOKEN_PATH) so every
 // existing self-test hook keeps pointing its file at a temp dir; the per-path
 // override wins over the derived-from-state-dir default. The control token
-// defaults next to the registry, so a test that points XERB_CONFIG at a temp
+// defaults next to the registry, so a test that points WAKEMAN_CONFIG at a temp
 // file also gets an isolated token beside it.
 const { configPath: CONFIG_PATH, logsDir: LOGS_DIR, tokenPath: CONTROL_TOKEN_PATH } = resolveStatePaths({ env: process.env, stateDir: STATE_DIR });
 const DAEMON_LOG = path.join(LOGS_DIR, 'daemon.log');
@@ -160,7 +160,7 @@ function ensureDir(dir) {
 }
 
 // Make sure logs/ exists — but never RESURRECT a state dir that has been
-// deleted out from under us. `xerb uninstall` removes the whole state dir;
+// deleted out from under us. `wakeman uninstall` removes the whole state dir;
 // a daemon still winding down used to rebuild it on its very next line (one
 // ENOENT config-watch message was enough), so an uninstall that had just said
 // "every trace removed" left a logs/daemon.log behind. A missing logs/ inside
@@ -222,11 +222,11 @@ function rotateIfNeeded(file, maxBytes = 1_000_000, keep = 3) {
   }
 }
 
-// XERB_QUIET=1 keeps the terminal clean: log lines go to daemon.log only.
+// WAKEMAN_QUIET=1 keeps the terminal clean: log lines go to daemon.log only.
 // The npx entrypoint sets it — it prints its own short banner, and the
 // timestamped stream stays available in the state dir. FATAL lines still hit
 // stderr so a failed boot is never silent.
-const QUIET = process.env.XERB_QUIET === '1';
+const QUIET = process.env.WAKEMAN_QUIET === '1';
 
 function log(...parts) {
   const line = `[${ts()}] ${parts.join(' ')}`;
@@ -287,7 +287,7 @@ function flushOpened() {
 const connections = new Map();
 // Guard so a keep-alive HTTP socket carrying many requests is counted ONCE (add
 // a record on first request, decrement on socket close), not once per request.
-const CONN_TRACKED = Symbol('xerbConnTracked');
+const CONN_TRACKED = Symbol('wakemanConnTracked');
 
 function projectByHost(host) {
   return config.projects.find((p) => p.host === host);
@@ -372,14 +372,14 @@ function activeConnCount(host, now) {
 // `python3 "<abs path>/serve_static.py"`, and under npx that path lives in
 // ~/.npm/_npx/<hash>/, which npm prunes whenever it feels like it, and the
 // entry then dies with an ENOENT no one can read. The placeholder survives,
-// because it is resolved against the xerb.mjs that is running right now.
+// because it is resolved against the wakeman.mjs that is running right now.
 
 // Expand the placeholder to the command that actually runs. serve_static.py
 // ships next to this file, so CONFIG_DIR is the answer wherever the checkout
 // sits (npx cache, <state>/app, a clone). Quoted: the npx cache path can
 // contain spaces. Anything else is returned untouched.
 //
-// The match is the WHOLE command, not a substring: `$XERB_STATIC` inside a
+// The match is the WHOLE command, not a substring: `$WAKEMAN_STATIC` inside a
 // longer command would also be expanded by `sh -c` (to the empty string, since
 // it is not in the environment), so a half-expansion would be a trap. One
 // project, one placeholder, one command.
@@ -391,7 +391,7 @@ function expandStartCmd(startCmd) {
 
 // True for the forms older versions wrote: the absolute path from the old
 // scanner (with or without the quotes it wrapped the path in), and the
-// placeholder as it was spelled when xerb was lazydev.
+// placeholder as it was spelled when wakeman was lazydev.
 function isLegacyStaticCmd(startCmd) {
   const cmd = String(startCmd || '').trim();
   return cmd === '$LAZYDEV_STATIC' || /serve_static\.py"?\s*$/.test(cmd);
@@ -445,12 +445,12 @@ function loadConfig(reason) {
       log(`config: could not save the registry migration to ${CONFIG_PATH} (${err.code || err.message})`);
     }
   }
-  // XERB_PORT forces the listen port regardless of what the registry says.
+  // WAKEMAN_PORT forces the listen port regardless of what the registry says.
   // The npx entrypoint sets it to 80 to serve the front door directly; applying
   // it HERE (not just once at boot) keeps the override across config reloads
   // (SIGHUP / control:reload) instead of snapping back to the registry's port.
   // Production install leaves it unset, so the registry's port wins as before.
-  const envPort = Number(process.env.XERB_PORT);
+  const envPort = Number(process.env.WAKEMAN_PORT);
   const next = {
     port: Number.isFinite(envPort) && envPort > 0
       ? envPort
@@ -500,14 +500,14 @@ function startConfigWatch() {
 }
 
 // Dev-mode source watch, for installs that run a git checkout directly: the
-// plist sets XERB_WATCH_SOURCE=1 and launchd's KeepAlive restarts whatever
+// plist sets WAKEMAN_WATCH_SOURCE=1 and launchd's KeepAlive restarts whatever
 // exits, so "reload on change" is just "exit on change". Owned dev servers go
 // down with the daemon: each one's terminal is a pair of pipes this process
 // holds, so a survivor would come back adopted as external with a panel that
 // can never show or send anything, and its pty.py dies of EPIPE on the dev
 // server's next line of output anyway. The next request starts it fresh.
 function startSourceWatch() {
-  if (process.env.XERB_WATCH_SOURCE !== '1') return;
+  if (process.env.WAKEMAN_WATCH_SOURCE !== '1') return;
   const here = path.dirname(fileURLToPath(import.meta.url));
   let t = null;
   const kick = (file) => {
@@ -519,7 +519,7 @@ function startSourceWatch() {
       shutdown('source change');
     }, 300);
   };
-  for (const target of [path.join(here, 'xerb.mjs'), path.join(here, 'lib')]) {
+  for (const target of [path.join(here, 'wakeman.mjs'), path.join(here, 'lib')]) {
     try {
       const w = fs.watch(target, (ev, file) => kick(file || path.basename(target)));
       w.on('error', () => { /* watch died; the next install re-arms it */ });
@@ -673,7 +673,7 @@ function defaultResolvePidCwd(port) {
 }
 
 // Mutable binding so the bundled self-test can swap in a fake resolver (same
-// spirit as XERB_CONFIG / XERB_REAP_INTERVAL_MS) and never spawn lsof.
+// spirit as WAKEMAN_CONFIG / WAKEMAN_REAP_INTERVAL_MS) and never spawn lsof.
 // ensureUp calls through this binding, so the setter must reassign it in place.
 let resolvePidCwd = defaultResolvePidCwd;
 function __setResolvePidCwd(fn) {
@@ -849,7 +849,7 @@ function logFdFor(host) {
 //   -- 2026-09-12 17:31:17 . start: npm run dev (PORT=3030) --
 // with box-drawing rules and a middle dot, the one place the ASCII-only rule
 // for terminal output does not apply (this is a file, read back through the
-// terminal panel and `xerb logs`).
+// terminal panel and `wakeman logs`).
 const LOG_RULE = '──';
 const LOG_DOT = '·';
 const SEPARATOR_RE = new RegExp(`^${LOG_RULE} .* ${LOG_RULE}$`);
@@ -932,7 +932,7 @@ function firstErrorLine(tail) {
 // A terminal per dev server (spec section 6)
 // ---------------------------------------------------------------------------
 
-// The reason to install xerb instead of keeping a tab open is that the tab
+// The reason to install wakeman instead of keeping a tab open is that the tab
 // is gone, so the tab has to come back on demand, and a log tail is not a tab.
 // Next asks "port in use, use 3001 instead? (y/n)", Vite has keyboard
 // shortcuts, Rails drops into byebug, and a stack trace without its colors is a
@@ -944,7 +944,7 @@ function firstErrorLine(tail) {
 //
 //   stdout  raw terminal bytes -> the ring buffer, every open term socket, and
 //           an escape-stripped copy into <host>.log
-//   stdin   what someone types in a panel or in `xerb attach`
+//   stdin   what someone types in a panel or in `wakeman attach`
 //   fd 3    one "<rows> <cols>\n" line per resize
 const PTY_SCRIPT = path.join(CONFIG_DIR, 'lib', 'pty.py');
 
@@ -958,23 +958,23 @@ const PTY_COLS = 80;
 // the panel keeps the run that just died above the run that just started.
 const TERM_RING_BYTES = 256 * 1024;
 
-// The one line a read-only panel opens with, and the one `xerb status`
+// The one line a read-only panel opens with, and the one `wakeman status`
 // prints when there is no python3. ASCII: it is drawn in a terminal.
 const NO_PTY_NOTE = 'no python3, so terminals are read-only: output shows, nothing you type reaches the dev server';
 // What a panel says about a dev server somebody else started. ASCII, as above.
-const EXTERNAL_TERM_NOTE = 'this dev server was started outside xerb, so its output is in the terminal that started it. Stop it there and xerb starts its own, with a terminal here';
+const EXTERNAL_TERM_NOTE = 'this dev server was started outside wakeman, so its output is in the terminal that started it. Stop it there and wakeman starts its own, with a terminal here';
 
 // undefined = never looked, null = looked and there is none.
 let ptyPython;
 
 // The interpreter that runs lib/pty.py, or null for the pipe fallback. Resolved
 // once and remembered: this is a fact about the machine, and paying a fork per
-// wake to re-learn it would be silly. XERB_PYTHON overrides the search, and
-// an empty XERB_PYTHON is how a test asks for the fallback path on a machine
+// wake to re-learn it would be silly. WAKEMAN_PYTHON overrides the search, and
+// an empty WAKEMAN_PYTHON is how a test asks for the fallback path on a machine
 // that does have python3.
 function ptyInterpreter() {
   if (ptyPython !== undefined) return ptyPython;
-  const override = process.env.XERB_PYTHON;
+  const override = process.env.WAKEMAN_PYTHON;
   if (typeof override === 'string') {
     ptyPython = override.trim() || null;
   } else if (!fs.existsSync(PTY_SCRIPT)) {
@@ -1001,7 +1001,7 @@ function ptyInterpreter() {
   return ptyPython;
 }
 
-// What the status JSON carries, so `xerb status` prints the read-only line
+// What the status JSON carries, so `wakeman status` prints the read-only line
 // without going looking for python itself.
 function ptyStatus() {
   const python = ptyInterpreter();
@@ -1011,7 +1011,7 @@ function ptyStatus() {
 // host -> { chunks: Buffer[], size } of raw pty bytes.
 const termRings = new Map();
 // host -> Set of { conn, rec }: one entry per open terminal socket (a dashboard
-// panel, a `xerb attach`), with the live-connection record it holds.
+// panel, a `wakeman attach`), with the live-connection record it holds.
 const termSockets = new Map();
 // host -> { rows, cols } last asked for by a client. Remembered so the NEXT
 // child is born the size the panel already is: a resize only reaches a running
@@ -1086,7 +1086,7 @@ const ESC2_RE = /\u001b[()#][0-9A-Za-z]|\u001b[@A-Z\\^_=><]/g;
 const CTRL_RE = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g;
 
 // One spawn's output sink. Raw bytes go to the scrollback and the panels; a
-// plain-text copy goes into <host>.log, which is what `xerb logs` and grep
+// plain-text copy goes into <host>.log, which is what `wakeman logs` and grep
 // read. The daemon does that write itself now, because the child's own stdout
 // is the tty, not the file, and it writes SYNCHRONOUSLY so that a failure page
 // rendered the instant a child dies finds the last thing it said already there.
@@ -1169,8 +1169,8 @@ function logLines(text) {
   return out.join('\n') + (open ? '' : '\n');
 }
 
-// GET /__xerb/term/<host>, a WebSocket upgrade on the dashboard's own host.
-const TERM_PATH = '/__xerb/term/';
+// GET /__wakeman/term/<host>, a WebSocket upgrade on the dashboard's own host.
+const TERM_PATH = '/__wakeman/term/';
 
 // The terminal socket's handshake. Called from handleUpgrade before it hands
 // anything to the HMR proxy, because an http server gets exactly one 'upgrade'
@@ -1186,11 +1186,11 @@ function handleTermUpgrade(req, socket, head, url, key) {
       /* ignore */
     }
   };
-  // The terminal lives on the control plane: the xerb host, or a host naming
+  // The terminal lives on the control plane: the wakeman host, or a host naming
   // no project (bare localhost, an IP literal), which is where the dashboard is
   // also served. Anywhere else is a project host, and a page a dev server
   // serves must not be able to ask for anybody's terminal, its own included.
-  if (key !== 'xerb' && key !== null) return refuse(401, `term socket asked for on ${key}`);
+  if (key !== 'wakeman' && key !== null) return refuse(401, `term socket asked for on ${key}`);
   if (!isWebSocketUpgrade(req)) return refuse(400, 'not a websocket upgrade');
   if (!isSameOrigin(req)) return refuse(401, 'cross-origin');
   // A browser cannot set headers on a WebSocket, so the control token rides in
@@ -1237,7 +1237,7 @@ function attachTermSocket(conn, project) {
   // happened instead of an empty box. The read-only line goes in front of it
   // when there is no pty to type into.
   const opening = [];
-  if (!ptyInterpreter()) opening.push(Buffer.from(`\r\n[xerb] ${NO_PTY_NOTE}\r\n\r\n`, 'utf8'));
+  if (!ptyInterpreter()) opening.push(Buffer.from(`\r\n[wakeman] ${NO_PTY_NOTE}\r\n\r\n`, 'utf8'));
   const ring = termRingBytes(host);
   if (ring.length) opening.push(ring);
   conn.send(opening.length === 1 ? opening[0] : Buffer.concat(opening));
@@ -1261,10 +1261,10 @@ function attachTermSocket(conn, project) {
   // would mean the panel could not show the question.
   if (project.enabled !== false) {
     ensureUp(project).then((r) => {
-      // A server xerb did not start has no terminal here to show. Say so, to
+      // A server wakeman did not start has no terminal here to show. Say so, to
       // this panel only, instead of leaving an empty box under a green badge.
       if (r.state !== 'running' || r.owned || !socks.has(entry)) return;
-      conn.send(Buffer.from(`\r\n\x1b[2m[xerb] ${EXTERNAL_TERM_NOTE}\x1b[0m\r\n`, 'utf8'));
+      conn.send(Buffer.from(`\r\n\x1b[2m[wakeman] ${EXTERNAL_TERM_NOTE}\x1b[0m\r\n`, 'utf8'));
     }).catch(() => {
       /* the failure is on the page and in the log; the socket stays open */
     });
@@ -1469,7 +1469,7 @@ async function ensureUp(project) {
     // status page doesn't show stale wording while this one is in flight.
     r.lastError = null;
     // A stop that lands while this attempt is in flight is not a failure: the
-    // switch flipped off, `xerb stop` ran, the project was renamed. Every
+    // switch flipped off, `wakeman stop` ran, the project was renamed. Every
     // failure path below checks this before recording anything, because a
     // record left stopped-with-lastError shows a red `failed` badge AND stops
     // the URL from waking the project (see handleRequest's kick gate).
@@ -1571,7 +1571,7 @@ async function ensureUp(project) {
         r.owned = false;
         r.child = null;
         r.pid = null;
-        const e = new Error(`macOS did not let xerb read ${project.dir}`);
+        const e = new Error(`macOS did not let wakeman read ${project.dir}`);
         e.code = 'DIR_BLOCKED';
         e.host = host;
         r.lastError = { code: e.code, kind: 'blocked', message: e.message, at: Date.now(), dir: project.dir, node: process.execPath };
@@ -1881,7 +1881,7 @@ function stop(host, reason = 'manual') {
   const r = runtime.get(host);
   if (!r) return { ok: false, reason: 'unknown host' };
   if (!r.owned || !r.pid) {
-    return { ok: false, reason: 'not owned by xerb' };
+    return { ok: false, reason: 'not owned by wakeman' };
   }
   const pid = r.pid;
   // Before the signal, so a bring-up that is mid-await when the child dies can
@@ -2118,7 +2118,7 @@ function phaseLabel(r) {
 // unlike the raw `reason` line below it. Deliberate: the path IS the fix, the
 // two commands are useless without it, and this response is readable only from
 // the project's own origin (a cross-origin page can navigate a browser here but
-// cannot read what comes back). /__xerb/status already ships conflictDir on
+// cannot read what comes back). /__wakeman/status already ships conflictDir on
 // the same reasoning.
 // Failures that are decided before a spawn, so the log holds nothing from
 // this attempt and must not be quoted as if it did.
@@ -2135,9 +2135,9 @@ function failureCopy(project, lastError) {
     case 'timeout':
       return `Nothing answered on port ${esc(String(le.port ?? project.port))} within ${Math.round((le.timeoutMs ?? config.startTimeoutMs) / 1000)}s. The process is still being killed.`;
     case 'dir-missing':
-      return `The folder <code>${esc(le.dir || project.dir)}</code> is gone. Move it back, or <code>xerb remove ${esc(project.host)}</code> / <code>xerb add /new/path --name ${esc(project.host)}</code>.`;
+      return `The folder <code>${esc(le.dir || project.dir)}</code> is gone. Move it back, or <code>wakeman remove ${esc(project.host)}</code> / <code>wakeman add /new/path --name ${esc(project.host)}</code>.`;
     case 'blocked':
-      return `macOS did not let xerb read <code>${esc(le.dir || project.dir)}</code>. In System Settings › Privacy &amp; Security › Files and Folders, turn on the folder for <code>node</code>, or add <code>${esc(le.node || 'node')}</code> under Full Disk Access. Then reload.`;
+      return `macOS did not let wakeman read <code>${esc(le.dir || project.dir)}</code>. In System Settings › Privacy &amp; Security › Files and Folders, turn on the folder for <code>node</code>, or add <code>${esc(le.node || 'node')}</code> under Full Disk Access. Then reload.`;
     case 'no-devtools':
       return `Static sites are served by python3, which needs the Xcode command line tools. Run <code>xcode-select --install</code>, then reload.`;
     case 'install-failed':
@@ -2154,7 +2154,7 @@ function failureCopy(project, lastError) {
 }
 
 // Self-refreshing HTML served on a cold navigation hit. Names the project + its
-// phase, and polls the host-scoped GET /__xerb/tail once a second. That one
+// phase, and polls the host-scoped GET /__wakeman/tail once a second. That one
 // poll drives everything: the phase line updates in place (installing turns
 // into starting without a reload), an optional terminal panel shows the live
 // log tail, and a state that left the bring-up phases reloads the page — into
@@ -2164,7 +2164,7 @@ function failureCopy(project, lastError) {
 //
 // The raw failure message can leak filesystem paths, so it is shown ONLY to an
 // authorized caller (same-origin + capability token). The log tail itself is
-// no longer gated: /__xerb/tail serves it host-scoped to the project's own
+// no longer gated: /__wakeman/tail serves it host-scoped to the project's own
 // origin (its handler explains why that is sound), because "why is this taking
 // so long" is exactly the question this page exists to answer.
 function statusPageHtml(project, r, authorized = false) {
@@ -2172,7 +2172,7 @@ function statusPageHtml(project, r, authorized = false) {
   const phase = phaseLabel(r);
   // The terminal panel + its dim pointer at the CLI twin. Shared by the failed
   // page (open, fetched once) and the wake page (toggled, polled live).
-  const termNote = `<p class="muted">The same lines as <code>xerb logs ${esc(host)}</code>.</p>`;
+  const termNote = `<p class="muted">The same lines as <code>wakeman logs ${esc(host)}</code>.</p>`;
   if (phase === 'failed') {
     // The raw error message can leak paths too — redact it for the unauthorized.
     const reason = authorized
@@ -2187,7 +2187,7 @@ function statusPageHtml(project, r, authorized = false) {
       ? `<pre id="term">loading the log&hellip;</pre>
        ${termNote}
        <script>
-         fetch('/__xerb/tail', { cache: 'no-store' })
+         fetch('/__wakeman/tail', { cache: 'no-store' })
            .then((res) => res.json())
            .then((j) => {
              const t = document.getElementById('term');
@@ -2199,7 +2199,7 @@ function statusPageHtml(project, r, authorized = false) {
       : '';
     // Terminal page: no auto-refresh. The headline sentence comes from
     // failureCopy, so each kind says what actually happened, and a manual retry
-    // link points at the same URL. The log tail arrives via /__xerb/tail so
+    // link points at the same URL. The log tail arrives via /__wakeman/tail so
     // this page shows the WHY by default.
     return htmlPage(
       `${host} — failed to start`,
@@ -2252,7 +2252,7 @@ function statusPageHtml(project, r, authorized = false) {
        <button class="termbtn" id="termbtn">show the terminal</button>
        <pre id="term"></pre>
        <div id="termnote">${termNote}</div>
-       <a class="back" href="${esc(frontUrl('xerb'))}/">&larr; Back to dashboard</a>
+       <a class="back" href="${esc(frontUrl('wakeman'))}/">&larr; Back to dashboard</a>
      </div>
      <noscript><meta http-equiv="refresh" content="2"></noscript>
      <script>
@@ -2285,7 +2285,7 @@ function statusPageHtml(project, r, authorized = false) {
        let stoppedTicks = 0;
        async function tick() {
          try {
-           const res = await fetch('/__xerb/tail', { cache: 'no-store' });
+           const res = await fetch('/__wakeman/tail', { cache: 'no-store' });
            if (!res.ok) return;
            const j = await res.json();
            stoppedTicks = j.state === 'stopped' ? stoppedTicks + 1 : 0;
@@ -2322,7 +2322,7 @@ function sendRetry(res, project, r) {
 // to it and never invite a retry, so this is a hard 502 — NOT the transient 503.
 // But for the person standing in front of it this is a decision point, not a
 // dead end, so the page carries the fix: one button that POSTs the host-scoped
-// /__xerb/free (no token needed; see handleControl) and reloads into the
+// /__wakeman/free (no token needed; see handleControl) and reloads into the
 // normal wake flow. A browser navigation gets that page; curl/XHR gets a plain
 // 502. The foreign cwd is a filesystem path, so it is shown only to an
 // authorized caller (same-origin + token); an ordinary navigation gets the
@@ -2338,7 +2338,7 @@ function sendConflict(req, res, project, r, authorized = false) {
     return sendHtml(
       res,
       502,
-      `xerb · ${host} port in use`,
+      `wakeman · ${host} port in use`,
       `<style>
          .conflict { min-height: calc(100vh - 6rem); display: flex; flex-direction: column;
                      align-items: center; justify-content: center; text-align: center; gap: 0.25rem; }
@@ -2352,11 +2352,11 @@ function sendConflict(req, res, project, r, authorized = false) {
        </style>
        <div class="conflict">
          <h1>${esc(host)} is blocked, not broken</h1>
-         <p>Another process is sitting on port ${project.port}, and it is not this project's dev server. xerb stopped here instead of showing you the wrong app.</p>
+         <p>Another process is sitting on port ${project.port}, and it is not this project's dev server. wakeman stopped here instead of showing you the wrong app.</p>
          ${detail}
          <button class="freebtn" id="free">${esc(freeLabel)}</button>
          <p class="muted">This sends that process a normal quit signal. To keep it, give ${esc(host)} a different port in the registry instead.</p>
-         <a class="back" href="${esc(frontUrl('xerb'))}/">&larr; xerb dashboard</a>
+         <a class="back" href="${esc(frontUrl('wakeman'))}/">&larr; wakeman dashboard</a>
        </div>
        <script>
          const btn = document.getElementById('free');
@@ -2367,7 +2367,7 @@ function sendConflict(req, res, project, r, authorized = false) {
            // free the port of the project it is served for.
            let failed = 'The daemon did not answer.';
            try {
-             const res = await fetch('/__xerb/free', { method: 'POST' });
+             const res = await fetch('/__wakeman/free', { method: 'POST' });
              const j = await res.json();
              if (j.ok) {
                btn.textContent = ${JSON.stringify(`Starting ${host}…`)};
@@ -2465,7 +2465,7 @@ function isSameOrigin(req) {
 // mutating control action and for exposing log tails on error pages.
 function isControlAuthorized(req) {
   if (!isSameOrigin(req)) return false;
-  const tok = req.headers['x-xerb-token'];
+  const tok = req.headers['x-wakeman-token'];
   return typeof tok === 'string' && tok.length > 0 && tok === ensureControlToken();
 }
 
@@ -2474,7 +2474,7 @@ function isControlAuthorized(req) {
 // ---------------------------------------------------------------------------
 
 // `authorized` is the caller's own (same-origin + control token), not the
-// daemon's: GET /__xerb/status answers on every project host, so a page a
+// daemon's: GET /__wakeman/status answers on every project host, so a page a
 // dev server renders can read it same-origin. The fields that name the machine
 // (the start command, the raw failure message, a raw line of the dev server's
 // log) are therefore served only to a caller holding the token, the same rule
@@ -2519,7 +2519,7 @@ function liveState(host, project, authorized = false) {
           code: r.lastError.code || null,
           message: authorized ? r.lastError.message || null : null,
           at: r.lastError.at || null,
-          // What `xerb status` quotes in a failed row.
+          // What `wakeman status` quotes in a failed row.
           exitCode: r.lastError.exitCode ?? null,
           signal: r.lastError.signal || null,
           timeoutMs: r.lastError.timeoutMs ?? null,
@@ -2539,7 +2539,7 @@ function statusPayload(authorized = false) {
     uptimeMs: Date.now() - STARTED_AT,
     idleTimeoutMs: config.idleTimeoutMs,
     viewableArchiveDays: config.viewableArchiveDays,
-    // Whether dev servers get a real terminal on this machine. `xerb status`
+    // Whether dev servers get a real terminal on this machine. `wakeman status`
     // prints `pty.note` once at the top when there is none, which is the same
     // line a read-only panel opens with: one sentence, one source.
     pty: ptyStatus(),
@@ -2574,7 +2574,7 @@ function sendRegistryError(res, err) {
   return sendJson(res, status, { ok: false, reason: err.message });
 }
 
-// The host part of /__xerb/<verb>/<host>, decoded.
+// The host part of /__wakeman/<verb>/<host>, decoded.
 function hostFromPath(pathname, prefix) {
   return decodeURIComponent(pathname.slice(prefix.length));
 }
@@ -2602,7 +2602,7 @@ function chooseFolder(res) {
     // behind the browser.
     const child = spawn('osascript', [
       '-e', 'tell me to activate',
-      '-e', 'POSIX path of (choose folder with prompt "Add a project to xerb")',
+      '-e', 'POSIX path of (choose folder with prompt "Add a project to wakeman")',
     ], { stdio: ['ignore', 'pipe', 'pipe'] });
     pickerChild = child;
     let out = '';
@@ -2629,10 +2629,10 @@ function chooseFolder(res) {
 async function handleEditControl(req, res, url) {
   const pathname = url.pathname;
   try {
-    // POST /__xerb/detect — the add form's prefill, and nothing else: it
-    // writes nothing. Runs the same detectors `xerb add` runs on one
+    // POST /__wakeman/detect — the add form's prefill, and nothing else: it
+    // writes nothing. Runs the same detectors `wakeman add` runs on one
     // directory and hands back what the form should show.
-    if (pathname === '/__xerb/detect') {
+    if (pathname === '/__wakeman/detect') {
       const body = (await readJsonBody(req)) || {};
       if (rejectUnknown(res, body, ['dir'])) return true;
       const raw = typeof body.dir === 'string' ? body.dir.trim() : '';
@@ -2658,7 +2658,7 @@ async function handleEditControl(req, res, url) {
       // Against the live registry plus a real bind probe, same as the CLI.
       const port = await pickPort({ projects: config.projects });
       const det = detectOne(dir);
-      // Exactly what `xerb add` would store for this folder, placeholder and
+      // Exactly what `wakeman add` would store for this folder, placeholder and
       // all, so the form prefills with the string that is going to be written.
       const detected = det ? startCmdFor(det, port) : null;
       sendJson(res, 200, {
@@ -2669,18 +2669,18 @@ async function handleEditControl(req, res, url) {
         framework: det ? det.framework : null,
         startCmd: detected,
         // Nothing provable: the form says what was looked for, in the same
-        // words `xerb add` prints, and waits for a typed command.
+        // words `wakeman add` prints, and waits for a typed command.
         evidence: det ? null : DETECTOR_EVIDENCE,
       });
       return true;
     }
 
-    // POST /__xerb/pick — a browser cannot hand a page a folder's absolute
+    // POST /__wakeman/pick — a browser cannot hand a page a folder's absolute
     // path, and the daemon is on the same Mac as the person clicking, so it
     // opens Finder's own folder dialog and answers with what was chosen.
     // Writes nothing. Awaited, never execFileSync: the dialog stays up for as
     // long as someone browses, and the proxy keeps serving meanwhile.
-    if (pathname === '/__xerb/pick') {
+    if (pathname === '/__wakeman/pick') {
       if (pickerChild) {
         sendJson(res, 409, { ok: false, reason: 'a folder dialog is already open' });
         return true;
@@ -2690,7 +2690,7 @@ async function handleEditControl(req, res, url) {
       return true;
     }
 
-    if (pathname === '/__xerb/add') {
+    if (pathname === '/__wakeman/add') {
       const body = (await readJsonBody(req)) || {};
       if (rejectUnknown(res, body, ['dir', 'name', 'host', 'startCmd', 'port', 'framework', 'parked'])) return true;
       // The registry key is `host`, the CLI flag is `--name`, the form field is
@@ -2751,8 +2751,8 @@ async function handleEditControl(req, res, url) {
       return true;
     }
 
-    if (pathname.startsWith('/__xerb/remove/')) {
-      const host = hostFromPath(pathname, '/__xerb/remove/');
+    if (pathname.startsWith('/__wakeman/remove/')) {
+      const host = hostFromPath(pathname, '/__wakeman/remove/');
       const project = projectByHost(host);
       if (!project) {
         sendJson(res, 404, { ok: false, reason: 'unknown host' });
@@ -2770,9 +2770,9 @@ async function handleEditControl(req, res, url) {
       return true;
     }
 
-    if (pathname.startsWith('/__xerb/enable/') || pathname.startsWith('/__xerb/disable/')) {
-      const on = pathname.startsWith('/__xerb/enable/');
-      const host = hostFromPath(pathname, on ? '/__xerb/enable/' : '/__xerb/disable/');
+    if (pathname.startsWith('/__wakeman/enable/') || pathname.startsWith('/__wakeman/disable/')) {
+      const on = pathname.startsWith('/__wakeman/enable/');
+      const host = hostFromPath(pathname, on ? '/__wakeman/enable/' : '/__wakeman/disable/');
       if (!projectByHost(host)) {
         sendJson(res, 404, { ok: false, reason: 'unknown host' });
         return true;
@@ -2786,12 +2786,12 @@ async function handleEditControl(req, res, url) {
       return true;
     }
 
-    // POST /__xerb/archive/<host>, /__xerb/restore/<host> — a viewable's row
+    // POST /__wakeman/archive/<host>, /__wakeman/restore/<host> — a viewable's row
     // and the archived list. Restoring counts as opening it, or the next
     // sweep would put a stale page straight back.
-    if (pathname.startsWith('/__xerb/archive/') || pathname.startsWith('/__xerb/restore/')) {
-      const archiving = pathname.startsWith('/__xerb/archive/');
-      const host = hostFromPath(pathname, archiving ? '/__xerb/archive/' : '/__xerb/restore/');
+    if (pathname.startsWith('/__wakeman/archive/') || pathname.startsWith('/__wakeman/restore/')) {
+      const archiving = pathname.startsWith('/__wakeman/archive/');
+      const host = hostFromPath(pathname, archiving ? '/__wakeman/archive/' : '/__wakeman/restore/');
       if (!projectByHost(host)) {
         sendJson(res, 404, { ok: false, reason: 'unknown host' });
         return true;
@@ -2806,11 +2806,11 @@ async function handleEditControl(req, res, url) {
       return true;
     }
 
-    // POST /__xerb/delete/<host> — the one route that touches a folder. Only
+    // POST /__wakeman/delete/<host> — the one route that touches a folder. Only
     // an archived viewable, only a folder strictly inside the viewables root,
     // and the folder goes to the Trash (see trashFolder).
-    if (pathname.startsWith('/__xerb/delete/')) {
-      const host = hostFromPath(pathname, '/__xerb/delete/');
+    if (pathname.startsWith('/__wakeman/delete/')) {
+      const host = hostFromPath(pathname, '/__wakeman/delete/');
       const project = projectByHost(host);
       if (!project) {
         sendJson(res, 404, { ok: false, reason: 'unknown host' });
@@ -2842,9 +2842,9 @@ async function handleEditControl(req, res, url) {
       return true;
     }
 
-    // POST /__xerb/set/<host> { port?, startCmd? } — the row's edit panel.
-    if (pathname.startsWith('/__xerb/set/')) {
-      const host = hostFromPath(pathname, '/__xerb/set/');
+    // POST /__wakeman/set/<host> { port?, startCmd? } — the row's edit panel.
+    if (pathname.startsWith('/__wakeman/set/')) {
+      const host = hostFromPath(pathname, '/__wakeman/set/');
       const project = projectByHost(host);
       if (!project) {
         sendJson(res, 404, { ok: false, reason: 'unknown host' });
@@ -2888,11 +2888,11 @@ async function handleEditControl(req, res, url) {
       return true;
     }
 
-    // POST /__xerb/restart/<host> — the row's restart button, and what the
-    // CLI's `xerb restart` should call instead of stop-then-up (one call,
+    // POST /__wakeman/restart/<host> — the row's restart button, and what the
+    // CLI's `wakeman restart` should call instead of stop-then-up (one call,
     // one log separator).
-    if (pathname.startsWith('/__xerb/restart/')) {
-      const host = hostFromPath(pathname, '/__xerb/restart/');
+    if (pathname.startsWith('/__wakeman/restart/')) {
+      const host = hostFromPath(pathname, '/__wakeman/restart/');
       const project = projectByHost(host);
       if (!project) {
         sendJson(res, 404, { ok: false, reason: 'unknown host' });
@@ -2932,23 +2932,23 @@ async function handleControl(req, res, url) {
   const method = req.method || 'GET';
   const pathname = url.pathname;
 
-  // Dashboard home (host key === xerb, path /)
+  // Dashboard home (host key === wakeman, path /)
   if (method === 'GET' && (pathname === '/' || pathname === '')) {
-    return sendHtml(res, 200, 'xerb', dashboardHtml());
+    return sendHtml(res, 200, 'wakeman', dashboardHtml());
   }
 
-  if (method === 'GET' && pathname === '/__xerb/status') {
+  if (method === 'GET' && pathname === '/__wakeman/status') {
     return sendJson(res, 200, statusPayload(isControlAuthorized(req)));
   }
 
-  // GET /__xerb/tail — the wake page's terminal view. Host-scoped and
-  // tokenless for the same reasons as POST /__xerb/free: the person staring
+  // GET /__wakeman/tail — the wake page's terminal view. Host-scoped and
+  // tokenless for the same reasons as POST /__wakeman/free: the person staring
   // at a slow start is standing on the project's origin, where the dashboard's
   // token cannot reach; the same-origin policy keeps other sites from reading
   // the response; and a local same-user process could already read the log
   // file directly. Returns the live phase plus the log tail, so the page can
   // say WHY a start is slow, not just that it is.
-  if (method === 'GET' && pathname === '/__xerb/tail') {
+  if (method === 'GET' && pathname === '/__wakeman/tail') {
     if (!isSameOrigin(req)) return sendJson(res, 403, { ok: false, reason: 'unauthorized' });
     const key = resolveHostKey(String(req.headers.host || ''));
     const project = key ? projectByHost(key) : null;
@@ -2962,7 +2962,7 @@ async function handleControl(req, res, url) {
     return sendJson(res, 200, { ok: true, state: r.state, phase: phaseLabel(r), all, tail: tailLog(project.host, all ? 400 : 60, { all }) });
   }
 
-  // GET /__xerb/vendor/<file> — the two xterm files the terminal panel
+  // GET /__wakeman/vendor/<file> — the two xterm files the terminal panel
   // needs, straight off disk. Ungated like the dashboard itself: these are
   // published npm bytes, identical on every machine, and the panel they draw is
   // useless without the token anyway (the socket checks it).
@@ -2981,36 +2981,36 @@ async function handleControl(req, res, url) {
     }
     const project = host ? projectByHost(host) : null;
     if (!project) {
-      return sendHtml(res, 404, 'xerb — not found', `<h1>xerb</h1><p class="muted">No project registered as <code>${esc(host)}</code>.</p>${dashboardHomeLink()}`);
+      return sendHtml(res, 404, 'wakeman — not found', `<h1>wakeman</h1><p class="muted">No project registered as <code>${esc(host)}</code>.</p>${dashboardHomeLink()}`);
     }
     return sendHtml(res, 200, `${project.host} — terminal`, termPageHtml(project));
   }
 
-  // One guard for every mutating control action: reject any POST /__xerb/*
+  // One guard for every mutating control action: reject any POST /__wakeman/*
   // that is not both same-origin AND carrying the capability token. GET / and
-  // GET /__xerb/status stay ungated so the CLI's read path and the dashboard
+  // GET /__wakeman/status stay ungated so the CLI's read path and the dashboard
   // load keep working; status answers a tokenless caller with the fields that
   // name no secret and redacts the rest (see liveState), because that route is
   // reachable from every project origin, not just this one. The one exemption is
-  // the exact path /__xerb/free (its handler explains why); the token-gated
-  // /__xerb/free/<host> form still falls under this guard.
-  if (method === 'POST' && pathname.startsWith('/__xerb/') && pathname !== '/__xerb/free' && !isControlAuthorized(req)) {
+  // the exact path /__wakeman/free (its handler explains why); the token-gated
+  // /__wakeman/free/<host> form still falls under this guard.
+  if (method === 'POST' && pathname.startsWith('/__wakeman/') && pathname !== '/__wakeman/free' && !isControlAuthorized(req)) {
     return sendJson(res, 403, { ok: false, reason: 'unauthorized' });
   }
 
-  if (method === 'POST' && pathname === '/__xerb/reload') {
+  if (method === 'POST' && pathname === '/__wakeman/reload') {
     const ok = loadConfig('control:reload');
     return sendJson(res, ok ? 200 : 500, { ok });
   }
 
-  if (method === 'POST' && pathname.startsWith('/__xerb/stop/')) {
-    const host = decodeURIComponent(pathname.slice('/__xerb/stop/'.length));
+  if (method === 'POST' && pathname.startsWith('/__wakeman/stop/')) {
+    const host = decodeURIComponent(pathname.slice('/__wakeman/stop/'.length));
     const result = stop(host, 'control');
     return sendJson(res, 200, result);
   }
 
-  if (method === 'POST' && pathname.startsWith('/__xerb/up/')) {
-    const host = decodeURIComponent(pathname.slice('/__xerb/up/'.length));
+  if (method === 'POST' && pathname.startsWith('/__wakeman/up/')) {
+    const host = decodeURIComponent(pathname.slice('/__wakeman/up/'.length));
     const project = projectByHost(host);
     if (!project) return sendJson(res, 404, { ok: false, reason: 'unknown host' });
     if (project.enabled === false) return sendJson(res, 409, { ok: false, reason: 'disabled' });
@@ -3025,17 +3025,17 @@ async function handleControl(req, res, url) {
     }
   }
 
-  // POST /__xerb/free — the conflict page's button. Host-scoped: it acts on
+  // POST /__wakeman/free — the conflict page's button. Host-scoped: it acts on
   // the project whose host the request ARRIVED on, so a page served on
   // proj.localhost can free proj's port and nobody else's. This is the one
   // mutating action without the capability token, because the token lives only
   // in the dashboard's origin and the person who needs this fix is standing on
   // the project's origin, where it can never reach. Tokenless is sound here:
-  // the same-origin check pins browser callers to pages xerb itself served
+  // the same-origin check pins browser callers to pages wakeman itself served
   // on this host, a non-browser local caller could already kill the user's own
   // processes without our help, and freePort refuses to touch any listener
   // except a cwd-verified squatter, checked again at click time.
-  if (method === 'POST' && pathname === '/__xerb/free') {
+  if (method === 'POST' && pathname === '/__wakeman/free') {
     if (!isSameOrigin(req)) return sendJson(res, 403, { ok: false, reason: 'unauthorized' });
     const key = resolveHostKey(String(req.headers.host || ''));
     const project = key ? projectByHost(key) : null;
@@ -3044,12 +3044,12 @@ async function handleControl(req, res, url) {
     return sendJson(res, result.ok ? 200 : 409, result);
   }
 
-  // POST /__xerb/free/<host> — the dashboard's form of the same action,
+  // POST /__wakeman/free/<host> — the dashboard's form of the same action,
   // token-gated by the blanket guard above. Frees the port and immediately
   // re-arms bring-up: the dashboard user who clicked "free port" wants the
   // project running, not merely unblocked.
-  if (method === 'POST' && pathname.startsWith('/__xerb/free/')) {
-    const host = decodeURIComponent(pathname.slice('/__xerb/free/'.length));
+  if (method === 'POST' && pathname.startsWith('/__wakeman/free/')) {
+    const host = decodeURIComponent(pathname.slice('/__wakeman/free/'.length));
     const project = projectByHost(host);
     if (!project) return sendJson(res, 404, { ok: false, reason: 'unknown host' });
     const result = await freePort(project, getRuntime(project.host));
@@ -3062,8 +3062,8 @@ async function handleControl(req, res, url) {
   // of truth — a rename that only touched in-memory state would be undone by
   // the next reload, and a later rescan preserves the new name through the
   // ordinary host-merge path.
-  if (method === 'POST' && pathname.startsWith('/__xerb/rename/')) {
-    const from = decodeURIComponent(pathname.slice('/__xerb/rename/'.length));
+  if (method === 'POST' && pathname.startsWith('/__wakeman/rename/')) {
+    const from = decodeURIComponent(pathname.slice('/__wakeman/rename/'.length));
     const body = await readJsonBody(req);
     const to = body && typeof body.to === 'string' ? body.to.trim() : '';
     const project = projectByHost(from);
@@ -3072,7 +3072,7 @@ async function handleControl(req, res, url) {
     if (!/^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$/.test(to)) {
       return sendJson(res, 400, { ok: false, reason: 'lowercase letters, digits, and hyphens only' });
     }
-    if (to === 'xerb') return sendJson(res, 400, { ok: false, reason: '"xerb" is the dashboard' });
+    if (to === 'wakeman') return sendJson(res, 400, { ok: false, reason: '"wakeman" is the dashboard' });
     if (to === from) return sendJson(res, 200, { ok: true, host: to });
     if (projectByHost(to)) return sendJson(res, 409, { ok: false, reason: `"${to}" is taken` });
     // The runtime record is keyed by host, so an owned running server is
@@ -3098,12 +3098,12 @@ async function handleControl(req, res, url) {
   // the token guard above, like every other mutating action.
   if (method === 'POST' && (await handleEditControl(req, res, url))) return;
 
-  // GET requests to /__xerb/* that aren't matched, or anything else.
-  return sendHtml(res, 404, 'xerb — not found', `<h1>xerb</h1><p class="muted">No such control endpoint: <code>${esc(method)} ${esc(pathname)}</code></p>${dashboardHomeLink()}`);
+  // GET requests to /__wakeman/* that aren't matched, or anything else.
+  return sendHtml(res, 404, 'wakeman — not found', `<h1>wakeman</h1><p class="muted">No such control endpoint: <code>${esc(method)} ${esc(pathname)}</code></p>${dashboardHomeLink()}`);
 }
 
 function dashboardHomeLink() {
-  return `<p><a href="${esc(frontUrl('xerb'))}/">&larr; xerb dashboard</a></p>`;
+  return `<p><a href="${esc(frontUrl('wakeman'))}/">&larr; wakeman dashboard</a></p>`;
 }
 
 // Badge classes live in dashboardHtml's <style>; the poll script rebuilds the
@@ -3175,12 +3175,12 @@ function fmtAgo(ms) {
 // the pop-out page (spec 0.3.0 section 6)
 // ---------------------------------------------------------------------------
 
-// GET /__xerb/vendor/<file>. xterm.js, its stylesheet, and the fit addon are
+// GET /__wakeman/vendor/<file>. xterm.js, its stylesheet, and the fit addon are
 // checked into lib/vendor/ instead of being an npm dependency or a CDN link:
 // the dashboard has to draw a terminal on a laptop with no network, and a
 // runtime dependency would put an install step between a git pull and a working
 // page. scripts/vendor.sh fetched what is in there and records the versions.
-const VENDOR_PATH = '/__xerb/vendor/';
+const VENDOR_PATH = '/__wakeman/vendor/';
 const VENDOR_DIR = path.join(CONFIG_DIR, 'lib', 'vendor');
 const VENDOR_TYPES = { '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8' };
 
@@ -3252,9 +3252,9 @@ function termClientScript() {
       // The stylesheet and xterm.js are independent; the addon needs the global
       // xterm.js defines, so it goes after.
       vendorReady = Promise.all([
-        add('link', { rel: 'stylesheet', href: '/__xerb/vendor/xterm.css' }),
-        add('script', { src: '/__xerb/vendor/xterm.js' }),
-      ]).then(() => add('script', { src: '/__xerb/vendor/addon-fit.js' }));
+        add('link', { rel: 'stylesheet', href: '/__wakeman/vendor/xterm.css' }),
+        add('script', { src: '/__wakeman/vendor/xterm.js' }),
+      ]).then(() => add('script', { src: '/__wakeman/vendor/addon-fit.js' }));
       return vendorReady;
     }
 
@@ -3268,7 +3268,7 @@ function termClientScript() {
 
     // Draw a terminal into box and wire it to the host's term socket. Returns a
     // handle: clear(), refit(), close().
-    function openXerbTerm(box, host, opts) {
+    function openWakemanTerm(box, host, opts) {
       opts = opts || {};
       const term = new Terminal({
         rows: opts.rows || 24,
@@ -3296,8 +3296,8 @@ function termClientScript() {
 
       const proto = location.protocol === 'https:' ? 'wss://' : 'ws://';
       // Relative to this page's own origin: in a real install that IS
-      // xerb.localhost, and in a test it is whatever port the daemon got.
-      const ws = new WebSocket(proto + location.host + '/__xerb/term/' + encodeURIComponent(host), [TOKEN]);
+      // wakeman.localhost, and in a test it is whatever port the daemon got.
+      const ws = new WebSocket(proto + location.host + '/__wakeman/term/' + encodeURIComponent(host), [TOKEN]);
       ws.binaryType = 'arraybuffer';
       let live = false;
       function sendSize() {
@@ -3318,7 +3318,7 @@ function termClientScript() {
       ws.onerror = () => { /* onclose says the same thing, once */ };
       ws.onclose = () => {
         live = false;
-        term.write('\\r\\n\\x1b[2m[xerb] terminal disconnected\\x1b[0m\\r\\n');
+        term.write('\\r\\n\\x1b[2m[wakeman] terminal disconnected\\x1b[0m\\r\\n');
       };
       // xterm hands us exactly the bytes a tty would get: arrow keys, Ctrl-C,
       // a pasted block. They go through unread.
@@ -3354,7 +3354,7 @@ function termPanelCss() {
     .termbtns { margin-left: auto; white-space: nowrap; }
     .termhead .rowbtn { color: #d5dae2; border-color: #ffffff33; margin-left: 6px; }
     .termhead .rowbtn:hover { background: #ffffff14; }
-    /* border-box so the height the panel pins on open (see openXerbTerm) is
+    /* border-box so the height the panel pins on open (see openWakemanTerm) is
        the height fit() reads back: with content-box the padding would buy an
        extra row on every refit. */
     .termbox { padding: 6px 4px 6px 8px; box-sizing: border-box; }
@@ -3395,17 +3395,17 @@ function termPageHtml(project) {
     let panel = null;
     const box = document.getElementById('termbox');
     loadTermVendor().then(() => {
-      panel = openXerbTerm(box, HOST, { lockRows: false });
+      panel = openWakemanTerm(box, HOST, { lockRows: false });
       panel.refit();
     }).catch((err) => {
-      box.innerHTML = '<p class="termfail">' + err.message + '. Run scripts/vendor.sh in the xerb checkout.</p>';
+      box.innerHTML = '<p class="termfail">' + err.message + '. Run scripts/vendor.sh in the wakeman checkout.</p>';
     });
     // restart and stop are the same token-gated endpoints the dashboard calls.
     async function popAction(verb) {
       try {
-        await fetch('/__xerb/' + verb + '/' + encodeURIComponent(HOST), {
+        await fetch('/__wakeman/' + verb + '/' + encodeURIComponent(HOST), {
           method: 'POST',
-          headers: { 'X-Xerb-Token': TOKEN },
+          headers: { 'X-Wakeman-Token': TOKEN },
         });
       } catch (err) { /* the terminal shows what happened next */ }
     }
@@ -3427,11 +3427,11 @@ function dashboardHtml() {
       const on = ls.state === 'running' || ls.state === 'starting' || ls.state === 'installing';
       // The switch is inert where flipping it couldn't work: a disabled project
       // (enable it in the registry), a port conflict, and an external server
-      // xerb didn't start and therefore can't stop.
+      // wakeman didn't start and therefore can't stop.
       const locked = !ls.enabled || ls.state === 'conflict' || (ls.state === 'running' && !ls.owned);
       const lockReason = !ls.enabled ? 'disabled in the registry'
         : ls.state === 'conflict' ? 'free the port first'
-        : ls.state === 'running' && !ls.owned ? 'started outside xerb' : '';
+        : ls.state === 'running' && !ls.owned ? 'started outside wakeman' : '';
       // On conflict, hovering the state cell explains which foreign cwd holds it,
       // and the cell offers the fix: free the port, then start the project.
       // Mirrored client-side in stateCellHtml — change both together.
@@ -3509,7 +3509,7 @@ function dashboardHtml() {
   // a fixed cell grid. A browser is not that: every mac font stack smeared it
   // into a grey block. The word itself, set in the monospace stack, plus the
   // sleeping z's, says the same thing and survives a font substitution.
-  return `<h1 class="logo">xerb<span class="zzz" aria-hidden="true">z<b>z</b><i>z</i></span></h1>
+  return `<h1 class="logo">wakeman<span class="zzz" aria-hidden="true">z<b>z</b><i>z</i></span></h1>
   <p class="muted">On-demand local dev proxy · uptime <span id="uptime">${fmtIdle(Date.now() - STARTED_AT)}</span> · idle sleep after ${fmtIdle(config.idleTimeoutMs)}</p>
   <style>
     .logo { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 28px;
@@ -3681,7 +3681,7 @@ function dashboardHtml() {
       <span class="found" id="a-found" hidden></span>
       <button type="button" class="choose" onclick="pickFolder()">choose…</button>
     </div>
-    <p class="adderr" id="a-err">Choose a folder or paste its path. xerb only reads it.</p>
+    <p class="adderr" id="a-err">Choose a folder or paste its path. wakeman only reads it.</p>
     <div class="addmore" id="a-more" inert><div>
       <div class="addgrid">
         <div class="wide">
@@ -3761,7 +3761,7 @@ function dashboardHtml() {
 
     // --- terminal panels -----------------------------------------------------
 
-    // host -> the handle openXerbTerm returned. One per row, so a second
+    // host -> the handle openWakemanTerm returned. One per row, so a second
     // click on the same row closes and disposes instead of stacking a second
     // terminal on the same socket. Several different rows can be open at once.
     const panels = new Map();
@@ -3799,10 +3799,10 @@ function dashboardHtml() {
       loadTermVendor().then(() => {
         // The row may have been closed again while 300 KB loaded.
         if (!tr.isConnected) return;
-        panels.set(host, openXerbTerm(td.querySelector('.termbox'), host, { rows: 24 }));
+        panels.set(host, openWakemanTerm(td.querySelector('.termbox'), host, { rows: 24 }));
       }).catch((err) => {
         td.querySelector('.termbox').innerHTML =
-          '<p class="termfail">' + escAttr(err.message) + '. Run scripts/vendor.sh in the xerb checkout.</p>';
+          '<p class="termfail">' + escAttr(err.message) + '. Run scripts/vendor.sh in the wakeman checkout.</p>';
       });
     }
 
@@ -3828,7 +3828,7 @@ function dashboardHtml() {
     }
 
     // Pop out to this page's own origin: in an install that is
-    // http://xerb.localhost/term/<host>, and in a test it is whatever port
+    // http://wakeman.localhost/term/<host>, and in a test it is whatever port
     // the daemon got. Closing the panel behind it keeps one terminal per host.
     function termPop(btn) {
       const host = hostOfPanel(btn);
@@ -3843,7 +3843,7 @@ function dashboardHtml() {
       const host = hostOfPanel(btn);
       btn.disabled = true;
       if (verb === 'restart') pending.set(host, { on: true, at: Date.now() });
-      const j = await post('/__xerb/' + verb + '/' + encodeURIComponent(host));
+      const j = await post('/__wakeman/' + verb + '/' + encodeURIComponent(host));
       btn.disabled = false;
       if (!j.ok) btn.title = j.reason || (verb + ' failed');
       schedulePoll(300);
@@ -3857,9 +3857,9 @@ function dashboardHtml() {
       btn.disabled = true;
       btn.textContent = 'freeing…';
       try {
-        const res = await fetch('/__xerb/free/' + encodeURIComponent(host), {
+        const res = await fetch('/__wakeman/free/' + encodeURIComponent(host), {
           method: 'POST',
-          headers: { 'X-Xerb-Token': TOKEN },
+          headers: { 'X-Wakeman-Token': TOKEN },
         });
         const j = await res.json();
         if (j.ok) {
@@ -3892,9 +3892,9 @@ function dashboardHtml() {
       // badge immediately and let the poll settle the truth.
       row.querySelector('.c-state').innerHTML = badgeHtml(on ? 'starting' : 'stopped', true);
       schedulePoll(400);
-      fetch('/__xerb/' + (on ? 'up/' : 'stop/') + encodeURIComponent(host), {
+      fetch('/__wakeman/' + (on ? 'up/' : 'stop/') + encodeURIComponent(host), {
         method: 'POST',
-        headers: { 'X-Xerb-Token': TOKEN },
+        headers: { 'X-Wakeman-Token': TOKEN },
       }).catch(() => {});
     }
 
@@ -3917,7 +3917,7 @@ function dashboardHtml() {
     // Every mutating call carries the capability token and never throws: a
     // daemon that went away is just another inline message.
     async function post(pathname, body) {
-      const headers = { 'X-Xerb-Token': TOKEN };
+      const headers = { 'X-Wakeman-Token': TOKEN };
       if (body !== undefined) headers['content-type'] = 'application/json';
       try {
         const res = await fetch(pathname, {
@@ -3959,7 +3959,7 @@ function dashboardHtml() {
       pending.set(host, { on: true, at: Date.now() });
       row.querySelector('.c-state').innerHTML = stateCellHtml('starting', true);
       schedulePoll(400);
-      const j = await post('/__xerb/restart/' + encodeURIComponent(host));
+      const j = await post('/__wakeman/restart/' + encodeURIComponent(host));
       btn.disabled = false;
       btn.textContent = 'restart';
       if (!j.ok) btn.title = j.reason || 'restart failed';
@@ -3974,7 +3974,7 @@ function dashboardHtml() {
       const host = row.dataset.host;
       const enable = row.querySelector('.c-proj').classList.contains('off');
       btn.disabled = true;
-      const j = await post('/__xerb/' + (enable ? 'enable/' : 'disable/') + encodeURIComponent(host));
+      const j = await post('/__wakeman/' + (enable ? 'enable/' : 'disable/') + encodeURIComponent(host));
       if (j.ok) { location.reload(); return; }
       btn.disabled = false;
       btn.title = j.reason || 'failed';
@@ -3985,9 +3985,9 @@ function dashboardHtml() {
     async function removeHost(btn) {
       const row = btn.closest('tr');
       const host = row.dataset.host;
-      if (!confirm('Remove ' + host + ' from xerb?\\n\\nThis deletes the registry entry only. The project folder on disk is never touched, and you can add it back any time.')) return;
+      if (!confirm('Remove ' + host + ' from wakeman?\\n\\nThis deletes the registry entry only. The project folder on disk is never touched, and you can add it back any time.')) return;
       btn.disabled = true;
-      const j = await post('/__xerb/remove/' + encodeURIComponent(host));
+      const j = await post('/__wakeman/remove/' + encodeURIComponent(host));
       if (j.ok) { location.reload(); return; }
       btn.disabled = false;
       btn.title = j.reason || 'failed';
@@ -3999,32 +3999,32 @@ function dashboardHtml() {
     // folder goes.
     async function archiveHost(btn) {
       btn.disabled = true;
-      const j = await post('/__xerb/archive/' + encodeURIComponent(btn.closest('tr').dataset.host));
+      const j = await post('/__wakeman/archive/' + encodeURIComponent(btn.closest('tr').dataset.host));
       if (j.ok) { location.reload(); return; }
       btn.disabled = false;
       btn.title = j.reason || 'failed';
     }
     async function restoreHost(btn) {
       btn.disabled = true;
-      const j = await post('/__xerb/restore/' + encodeURIComponent(btn.closest('tr').dataset.archived));
+      const j = await post('/__wakeman/restore/' + encodeURIComponent(btn.closest('tr').dataset.archived));
       if (j.ok) { location.reload(); return; }
       btn.disabled = false;
       btn.title = j.reason || 'failed';
     }
     async function deleteHost(btn) {
       const host = btn.closest('tr').dataset.archived;
-      if (!confirm('Delete ' + host + '?\\n\\nThis removes it from xerb and moves its folder to the Trash.')) return;
+      if (!confirm('Delete ' + host + '?\\n\\nThis removes it from wakeman and moves its folder to the Trash.')) return;
       btn.disabled = true;
-      const j = await post('/__xerb/delete/' + encodeURIComponent(host));
+      const j = await post('/__wakeman/delete/' + encodeURIComponent(host));
       if (j.ok) { location.reload(); return; }
       btn.disabled = false;
       btn.title = j.reason || 'failed';
     }
     // Remember which shelves are open across the reloads the actions above do.
     for (const d of document.querySelectorAll('details.shelf')) {
-      try { if (localStorage.getItem('xerb:' + d.id) === '1') d.open = true; } catch {}
+      try { if (localStorage.getItem('wakeman:' + d.id) === '1') d.open = true; } catch {}
       d.addEventListener('toggle', () => {
-        try { localStorage.setItem('xerb:' + d.id, d.open ? '1' : '0'); } catch {}
+        try { localStorage.setItem('wakeman:' + d.id, d.open ? '1' : '0'); } catch {}
       });
     }
 
@@ -4067,10 +4067,10 @@ function dashboardHtml() {
       const saveName = async (input) => {
         const to = input.value.trim();
         if (to === host) return close();
-        if (!/^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$/.test(to) || to === 'xerb') {
+        if (!/^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$/.test(to) || to === 'wakeman') {
           return fail(input, 'lowercase letters, digits, and hyphens');
         }
-        const j = await post('/__xerb/rename/' + encodeURIComponent(host), { to });
+        const j = await post('/__wakeman/rename/' + encodeURIComponent(host), { to });
         if (j.ok) { location.reload(); return; }
         fail(input, j.reason || 'rename failed');
       };
@@ -4078,7 +4078,7 @@ function dashboardHtml() {
         const port = Number(input.value);
         if (!Number.isInteger(port) || port < 1 || port > 65535) return fail(input, 'port must be 1-65535');
         if (port === Number(rowData(row).port)) return close();
-        const j = await post('/__xerb/set/' + encodeURIComponent(host), { port });
+        const j = await post('/__wakeman/set/' + encodeURIComponent(host), { port });
         if (j.ok) { location.reload(); return; }
         fail(input, j.reason || 'could not set the port');
       };
@@ -4086,7 +4086,7 @@ function dashboardHtml() {
         const startCmd = input.value.trim();
         if (!startCmd) return fail(input, 'a start command is required');
         if (startCmd === rowData(row).cmd) return close();
-        const j = await post('/__xerb/set/' + encodeURIComponent(host), { startCmd });
+        const j = await post('/__wakeman/set/' + encodeURIComponent(host), { startCmd });
         if (j.ok) { location.reload(); return; }
         fail(input, j.reason || 'could not set the start command');
       };
@@ -4151,7 +4151,7 @@ function dashboardHtml() {
     async function pickFolder() {
       if (picking) return;
       picking = true;
-      const j = await post('/__xerb/pick', {});
+      const j = await post('/__wakeman/pick', {});
       picking = false;
       if (j.canceled) return;
       if (addForm.hidden) toggleAdd();
@@ -4183,7 +4183,7 @@ function dashboardHtml() {
     }
 
     // Asks the daemon what the folder proves and fills in every field the user
-    // has not touched. The same detectors "xerb add" runs, so the form and the
+    // has not touched. The same detectors "wakeman add" runs, so the form and the
     // CLI agree about what a folder is before anything is written. It runs as
     // the path is typed; "quiet" is that case, where a path that does not
     // exist yet is a path half typed, not a mistake to paint red.
@@ -4194,7 +4194,7 @@ function dashboardHtml() {
       if (!dir || dir === detectedDir) return;
       const seq = ++detectSeq;
       addSpin.hidden = false;
-      const j = await post('/__xerb/detect', { dir });
+      const j = await post('/__wakeman/detect', { dir });
       // A slower answer about an older path must not overwrite a newer one.
       if (seq !== detectSeq) return;
       addSpin.hidden = true;
@@ -4251,7 +4251,7 @@ function dashboardHtml() {
       const btn = addForm.querySelector('button[type=submit]');
       btn.disabled = true;
       addSay('adding…');
-      const j = await post('/__xerb/add', {
+      const j = await post('/__wakeman/add', {
         dir: document.getElementById('a-dir').value.trim(),
         name: document.getElementById('a-name').value.trim(),
         startCmd: document.getElementById('a-cmd').value.trim(),
@@ -4269,7 +4269,7 @@ function dashboardHtml() {
         // With the token, because the payload's start command and failure
         // detail are served only to a caller that has it, and this table shows
         // both. Same header every mutating call here sends.
-        const res = await fetch('/__xerb/status', { cache: 'no-store', headers: { 'X-Xerb-Token': TOKEN } });
+        const res = await fetch('/__wakeman/status', { cache: 'no-store', headers: { 'X-Wakeman-Token': TOKEN } });
         if (!res.ok) return;
         const data = await res.json();
         document.getElementById('uptime').textContent = fmtIdle(data.uptimeMs);
@@ -4358,7 +4358,7 @@ function proxyHttp(req, res, project) {
   if (cs && !cs[CONN_TRACKED]) {
     cs[CONN_TRACKED] = true;
     const rec = addConn(host);
-    cs.__xerbRec = rec;
+    cs.__wakemanRec = rec;
     cs.once('close', () => removeConn(host, rec));
     // A single 'data' listener keeps lastByteAt fresh on real traffic; a truly
     // silent keep-alive socket ages past the hard cap and stops deferring.
@@ -4366,7 +4366,7 @@ function proxyHttp(req, res, project) {
       rec.lastByteAt = Date.now();
     });
   }
-  if (cs && cs.__xerbRec) cs.__xerbRec.lastByteAt = Date.now();
+  if (cs && cs.__wakemanRec) cs.__wakemanRec.lastByteAt = Date.now();
 
   // ensureUp() already probed both loopback families and pinned the one that
   // answered (Vite -> ::1, Next -> 127.0.0.1), so we proxy straight to it — no
@@ -4443,7 +4443,7 @@ function proxyHttp(req, res, project) {
       sendHtml(
         res,
         502,
-        'xerb — upstream error',
+        'wakeman — upstream error',
         `<h1>Upstream connection failed</h1>
          <p>Could not reach <code>${esc(host)}</code> on <code>${esc(upHost)}:${project.port}</code>.</p>
          <p class="muted">${esc(err.message)}</p>${dashboardHomeLink()}`
@@ -4495,7 +4495,7 @@ function createDaemonServer() {
         log(`request-handler crash: ${err && err.stack ? err.stack : err}`);
         try {
           if (!res.headersSent) {
-            sendHtml(res, 500, 'xerb — error', `<h1>Internal error</h1><pre>${esc(String(err && err.message))}</pre>`);
+            sendHtml(res, 500, 'wakeman — error', `<h1>Internal error</h1><pre>${esc(String(err && err.message))}</pre>`);
           } else {
             res.destroy();
           }
@@ -4536,10 +4536,10 @@ async function handleRequest(req, res) {
   // Parse URL relative to a dummy base; we only need pathname.
   const url = new URL(req.url, 'http://localhost');
 
-  // Control plane: key === xerb OR path starts with /__xerb/.
-  // Control plane: the xerb host, a host naming no project (bare localhost
-  // or an IP literal — serve the dashboard rather than a 502), or /__xerb/.
-  if (key === 'xerb' || key === null || url.pathname.startsWith('/__xerb/')) {
+  // Control plane: key === wakeman OR path starts with /__wakeman/.
+  // Control plane: the wakeman host, a host naming no project (bare localhost
+  // or an IP literal — serve the dashboard rather than a 502), or /__wakeman/.
+  if (key === 'wakeman' || key === null || url.pathname.startsWith('/__wakeman/')) {
     return handleControl(req, res, url);
   }
 
@@ -4548,7 +4548,7 @@ async function handleRequest(req, res) {
     return sendHtml(
       res,
       502,
-      'xerb — no such project',
+      'wakeman — no such project',
       `<h1>No project for <code>${esc(key)}</code></h1>
        <p>Nothing is registered under that host. Available projects:</p>${availableList()}`
     );
@@ -4558,9 +4558,9 @@ async function handleRequest(req, res) {
     return sendHtml(
       res,
       410,
-      'xerb — archived',
+      'wakeman — archived',
       `<h1>${esc(project.host)} is archived</h1>
-       <p class="muted">Nobody opened it for ${config.viewableArchiveDays} days, so xerb put it away. The folder is still at <code>${esc(project.dir)}</code>. Restore it from the dashboard's archived list.</p>${dashboardHomeLink()}`
+       <p class="muted">Nobody opened it for ${config.viewableArchiveDays} days, so wakeman put it away. The folder is still at <code>${esc(project.dir)}</code>. Restore it from the dashboard's archived list.</p>${dashboardHomeLink()}`
     );
   }
 
@@ -4570,7 +4570,7 @@ async function handleRequest(req, res) {
     return sendHtml(
       res,
       404,
-      'xerb — disabled',
+      'wakeman — disabled',
       `<h1>${esc(project.host)} is disabled</h1>
        <p class="muted">This project is marked <code>enabled: false</code> in the registry.</p>${dashboardHomeLink()}`
     );
@@ -4713,7 +4713,7 @@ async function handleUpgrade(req, clientSocket, head) {
   }
 
   // Never proxy the control plane over websockets.
-  if (key === 'xerb') {
+  if (key === 'wakeman') {
     try {
       clientSocket.destroy();
     } catch {
@@ -4959,10 +4959,10 @@ if (RUN_AS_MAIN) {
   ensureControlToken();
   startConfigWatch();
   startSourceWatch();
-  // Reaper cadence is 30s in production. XERB_REAP_INTERVAL_MS exists solely so
+  // Reaper cadence is 30s in production. WAKEMAN_REAP_INTERVAL_MS exists solely so
   // the bundled self-test can exercise the idle reaper quickly (same spirit as the
-  // XERB_CONFIG override). Production never sets it.
-  const REAP_INTERVAL_MS = Number(process.env.XERB_REAP_INTERVAL_MS) || 30_000;
+  // WAKEMAN_CONFIG override). Production never sets it.
+  const REAP_INTERVAL_MS = Number(process.env.WAKEMAN_REAP_INTERVAL_MS) || 30_000;
   setInterval(reapIdle, REAP_INTERVAL_MS).unref?.();
   opened = readOpened(OPENED_PATH);
   askForGuardedFolders();
@@ -4971,11 +4971,11 @@ if (RUN_AS_MAIN) {
 
   // The numbered port to fall back to when the front-door port cannot be bound.
   // On the npx path the front door is :80; macOS grants an unprivileged process
-  // that bind, Linux does not (no CAP_NET_BIND_SERVICE), so a plain `npx xerb`
+  // that bind, Linux does not (no CAP_NET_BIND_SERVICE), so a plain `npx wakeman`
   // on Linux gets EACCES and lands here. EADDRINUSE (port already held) falls back
-  // the same way. XERB_FALLBACK_PORT exists so the npx path and the self-test
-  // can force the fallback deterministically (same spirit as XERB_CONFIG).
-  const FALLBACK_PORT = Number(process.env.XERB_FALLBACK_PORT) || 4000;
+  // the same way. WAKEMAN_FALLBACK_PORT exists so the npx path and the self-test
+  // can force the fallback deterministically (same spirit as WAKEMAN_CONFIG).
+  const FALLBACK_PORT = Number(process.env.WAKEMAN_FALLBACK_PORT) || 4000;
 
   // Bind ONE loopback family+port. Resolves { server } on listen, rejects with
   // the bind error (its .code intact) on failure — the one-time error/listening
@@ -5040,8 +5040,8 @@ if (RUN_AS_MAIN) {
     // Later runtime errors must not crash the daemon.
     server.on('error', (err) => log(`server error: ${err && err.message}`));
 
-    log(`xerb listening on :${servePort}, loopback-only enforced per connection (config=${CONFIG_PATH})`);
-    log(`dashboard: ${frontUrl('xerb')}/`);
+    log(`wakeman listening on :${servePort}, loopback-only enforced per connection (config=${CONFIG_PATH})`);
+    log(`dashboard: ${frontUrl('wakeman')}/`);
     for (const p of config.projects) {
       if (p && p.enabled !== false) log(`  ${frontUrl(p.host)}`);
     }
@@ -5077,7 +5077,7 @@ function askForGuardedFolders() {
 // RUN_AS_MAIN (which would listen and set the 30s interval). These expose just
 // enough state to force ownership, inject connection presence, and age the idle
 // clock — the raw Maps stay encapsulated. Prefixed `__` to signal test-only,
-// matching the XERB_CONFIG / XERB_REAP_INTERVAL_MS self-test hooks.
+// matching the WAKEMAN_CONFIG / WAKEMAN_REAP_INTERVAL_MS self-test hooks.
 
 // Force runtime fields on a host (e.g. {state:'running', owned:true,
 // upstreamHost:'127.0.0.1'}). Needed because adoption forces owned=false, so a
@@ -5106,7 +5106,7 @@ function __liveConnInfo(host) {
 // Exported for the bundled self-test (no behavior change for the daemon itself).
 // upstreamAgent is exposed so a test can destroy its pooled keep-alive sockets
 // on teardown (they'd otherwise keep the test process from exiting). log,
-// logFdFor, and LOGS_DIR are exposed (with the XERB_LOGS_DIR override) so a
+// logFdFor, and LOGS_DIR are exposed (with the WAKEMAN_LOGS_DIR override) so a
 // test can prove the daemon rotates through its real logging call sites.
 export {
   resolveHostKey,
@@ -5168,7 +5168,7 @@ export {
   expandStartCmd,
   rewriteStaticStartCmds,
   // #9 — npx front door: state-dir resolution + bind fallback. Re-exported from
-  // their libs so a test importing ../xerb.mjs reaches the same helpers the
+  // their libs so a test importing ../wakeman.mjs reaches the same helpers the
   // daemon uses, and STATE_DIR/CONFIG_PATH expose what this module resolved.
   resolveStateDir,
   resolveStatePaths,
