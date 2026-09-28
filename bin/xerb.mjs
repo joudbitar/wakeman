@@ -36,7 +36,7 @@ import { spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { resolveStateDir, resolveStatePaths } from '../lib/state.mjs';
 import { formatProjectUrl } from '../lib/bind.mjs';
-import { makeStyler, makeSpinner, LOGO } from '../lib/ui.mjs';
+import { makeStyler, makeSpinner, columnize, frameworkTally, paintLogo } from '../lib/ui.mjs';
 import { CANCEL_EXIT } from '../lib/picker.mjs';
 import {
   RegistryError, readRegistry, writeRegistry, addEntry, removeEntry, setEnabled,
@@ -200,6 +200,13 @@ function readProjects() {
   }
 }
 
+// The scan's one-line result: the count, then what kinds they are, as chips.
+function foundLine(projects) {
+  const n = projects.length;
+  const tally = n ? `  ${frameworkTally(projects.map((p) => p.framework), ui)}` : '';
+  return `${ui.green('✓')} ${ui.dim(`found ${n} project${n === 1 ? '' : 's'}`)}${tally}`;
+}
+
 // Interactive runs hand the terminal to the scan child: it may raise the
 // project picker, and a parent spinner redrawing over the child's raw-mode
 // input would garble both. Two ways out of that picker come back as exit
@@ -221,8 +228,7 @@ async function scanWithStatus(env, interactive) {
       process.stderr.write(`xerb: scan failed (${err.message}); continuing with whatever registry exists.\n`);
       return;
     }
-    const n = readProjects().length;
-    process.stdout.write(`  ${ui.green('✓')} ${ui.dim(`found ${n} project${n === 1 ? '' : 's'}`)}\n`);
+    process.stdout.write(`  ${foundLine(readProjects())}\n`);
     return;
   }
   const spin = makeSpinner({ isTTY: process.stdout.isTTY, styler: ui });
@@ -234,8 +240,7 @@ async function scanWithStatus(env, interactive) {
     process.stderr.write(`xerb: scan failed (${err.message}); continuing with whatever registry exists.\n`);
     return;
   }
-  const n = readProjects().length;
-  await spin.done(`${ui.green('✓')} ${ui.dim(`found ${n} project${n === 1 ? '' : 's'}`)}`);
+  await spin.done(foundLine(readProjects()));
 }
 
 // ---------------------------------------------------------------------------
@@ -246,27 +251,29 @@ async function scanWithStatus(env, interactive) {
 // single directory is read. Declining exits with nothing scanned and nothing
 // installed. Re-runs (a registry already exists) skip it — consent was given.
 async function askConsent({ willInstallSkill }) {
-  const { bold, dim, cyan } = ui;
+  const { bold, dim, cyan, green, yellow, magenta } = ui;
   const out = (s = '') => process.stdout.write(s + '\n');
   out();
-  for (const line of LOGO) out(`  ${cyan(line)}`);
+  for (const line of paintLogo(ui)) out(`  ${line}`);
   out();
   out(`  ${dim(`v${VERSION} · starts dev servers when you open their URL, stops them when idle`)}`);
   out();
-  out(`  this will:`);
-  out(`  scan your home folder for dev projects ${dim('· reads config files, writes nothing')}`);
-  out(`  let you pick which get a URL: ${bold('http://<name>.localhost')} ${dim('· works only on this machine')}`);
-  out(`  install a background service ${dim('· no sudo, keeps the URLs working after reboot')}`);
+  // One colored verb per action, in a column: the eye lands on four verbs
+  // first and reads a line only if it wants the detail.
+  const step = (color, verb, what, note) => out(`  ${bold(color(verb.padEnd(9)))}${what} ${dim(`· ${note}`)}`);
+  step(cyan, 'scan', 'your home folder for dev projects', 'reads config files, writes nothing');
+  step(magenta, 'pick', `which get a URL like ${bold(cyan('http://<name>.localhost'))}`, 'works only on this machine');
+  step(green, 'install', 'a background service', 'no sudo, keeps the URLs working after reboot');
   if (willInstallSkill) {
-    out(`  add the add-project skill to ~/.claude/skills ${dim('· for projects the scan misses')}`);
+    step(yellow, 'add', 'the add-project skill to ~/.claude/skills', 'for projects the scan misses');
   }
   out();
-  out(dim(`  everything is stored in ${tilde(stateDir)} · \`xerb uninstall\` deletes all of it`));
+  out(`  ${dim('everything is stored in')} ${tilde(stateDir)} ${dim('·')} ${cyan('xerb uninstall')} ${dim('deletes all of it')}`);
   out();
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
   let answer;
   try {
-    answer = (await rl.question('  proceed? [Y/n] ')).trim().toLowerCase();
+    answer = (await rl.question(`  ${bold('proceed?')} ${dim('[')}${green('Y')}${dim('/n]')} `)).trim().toLowerCase();
   } finally {
     rl.close();
   }
@@ -458,9 +465,15 @@ function printInstalledBanner({ projects, port, startedAt, skillInstalled, verb 
     out(`  no projects found under ${tilde(os.homedir())}.`);
     out(dim('  a project is anything the scan can prove how to run: package.json with a "dev" script, rails, django with a venv, a static folder; add one and run `xerb` again.'));
   } else {
-    const example = projects[0].host;
     out(`  ${dim('dashboard')}  ${bold(formatProjectUrl('xerb', port))}`);
-    out(`  ${dim('projects')}   ${bold(formatProjectUrl('<name>', port))} ${dim(`for each of ${projects.length} projects, e.g. ${formatProjectUrl(example, port)}`)}`);
+    out(`  ${dim('projects')}   ${projects.length} ${dim('· open a URL and its dev server starts')}`);
+    out();
+    const urls = projects.map((p) => formatProjectUrl(p.host, port)).sort();
+    // The host is the part that differs row to row, so it alone stays bright.
+    const paint = (url) => url.replace(/^(http:\/\/)(.+?)(\.localhost(?::\d+)?)$/, (_, a, host, b) => dim(a) + host + dim(b));
+    const { lines, hidden } = columnize(urls, { width: process.stdout.columns || 80, paint });
+    for (const line of lines) out(line);
+    if (hidden) out(dim(`  and ${hidden} more · \`xerb status\` lists them all`));
   }
   out();
   out(dim(`  runs in the background and survives reboots · registry: ${tilde(configPath)} · logs: ${tilde(logsDir)}`));

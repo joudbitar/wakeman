@@ -41,7 +41,22 @@ import {
   startCmdFor,
   DETECTOR_EVIDENCE,
   STATIC_PLACEHOLDER,
+  archiveEntry,
+  restoreEntry,
 } from './lib/registry-cli.mjs';
+import {
+  viewablesRoot,
+  isViewable,
+  isArchived,
+  tagViewables,
+  archiveDays,
+  lastSeen,
+  dueForArchive,
+  newestFileTime,
+  readOpened,
+  writeOpened,
+  trashFolder,
+} from './lib/viewables.mjs';
 
 // The port the front door actually bound (set at boot). config.port is what we
 // ASK for; after a fallback they differ, and every URL the daemon renders must
@@ -102,6 +117,11 @@ const STATE_DIR = resolveStateDir({ env: process.env, home: os.homedir(), script
 // file also gets an isolated token beside it.
 const { configPath: CONFIG_PATH, logsDir: LOGS_DIR, tokenPath: CONTROL_TOKEN_PATH } = resolveStatePaths({ env: process.env, stateDir: STATE_DIR });
 const DAEMON_LOG = path.join(LOGS_DIR, 'daemon.log');
+// When each viewable was last opened, beside the registry rather than in it:
+// a page view is not a registry edit, and writing projects.json on every
+// visit would fire the config watch each time. See lib/viewables.mjs.
+const OPENED_PATH = path.join(path.dirname(CONFIG_PATH), 'opened.json');
+const VIEWABLES_ROOT = viewablesRoot();
 
 const DEFAULTS = {
   port: 4000,
@@ -242,6 +262,23 @@ let config = { ...DEFAULTS, projects: [] };
 const runtime = new Map();
 // lastAccess[host] = epoch ms of last proxied request
 const lastAccess = new Map();
+// opened[host] = epoch ms a viewable was last requested. Persisted to
+// OPENED_PATH by the reaper tick (at most every 30s), not per request.
+let opened = {};
+let openedDirty = false;
+function noteOpened(host, now = Date.now()) {
+  opened[host] = now;
+  openedDirty = true;
+}
+function flushOpened() {
+  if (!openedDirty) return;
+  try {
+    writeOpened(OPENED_PATH, opened);
+    openedDirty = false;
+  } catch (err) {
+    log(`viewables: could not save ${OPENED_PATH} (${err.code || err.message})`);
+  }
+}
 // connections[host] = Set of live connection records { lastByteAt }. A record is
 // one proxied keep-alive HTTP socket or one WS/HMR upgrade; `lastByteAt` is the
 // last time a byte crossed in either direction. `set.size` is the live count the
@@ -395,12 +432,15 @@ function loadConfig(reason) {
   // dir) is logged and otherwise ignored: the in-memory registry is already
   // correct, so the project still starts, it just gets migrated again next boot.
   const rewritten = rewriteStaticStartCmds(parsed);
-  if (rewritten > 0) {
+  // Same idempotent write-back for viewables registered before the tag existed.
+  const tagged = tagViewables(parsed, VIEWABLES_ROOT);
+  if (rewritten + tagged > 0) {
     try {
       fs.writeFileSync(CONFIG_PATH, `${JSON.stringify(parsed, null, 2)}\n`);
-      log(`config: rewrote ${rewritten} static startCmd(s) to ${STATIC_PLACEHOLDER} in ${CONFIG_PATH}`);
+      if (rewritten) log(`config: rewrote ${rewritten} static startCmd(s) to ${STATIC_PLACEHOLDER} in ${CONFIG_PATH}`);
+      if (tagged) log(`config: tagged ${tagged} entr${tagged === 1 ? 'y' : 'ies'} under ${VIEWABLES_ROOT} as viewable`);
     } catch (err) {
-      log(`config: could not save the ${STATIC_PLACEHOLDER} rewrite to ${CONFIG_PATH} (${err.code || err.message})`);
+      log(`config: could not save the registry migration to ${CONFIG_PATH} (${err.code || err.message})`);
     }
   }
   // XERB_PORT forces the listen port regardless of what the registry says.
@@ -417,6 +457,7 @@ function loadConfig(reason) {
     startTimeoutMs: Number.isFinite(parsed.startTimeoutMs) ? parsed.startTimeoutMs : DEFAULTS.startTimeoutMs,
     installTimeoutMs: Number.isFinite(parsed.installTimeoutMs) ? parsed.installTimeoutMs : DEFAULTS.installTimeoutMs,
     connectionHardCapMs: Number.isFinite(parsed.connectionHardCapMs) ? parsed.connectionHardCapMs : DEFAULTS.connectionHardCapMs,
+    viewableArchiveDays: archiveDays(parsed),
     projects: Array.isArray(parsed.projects) ? parsed.projects : [],
   };
   config = next;
@@ -458,9 +499,11 @@ function startConfigWatch() {
 
 // Dev-mode source watch, for installs that run a git checkout directly: the
 // plist sets XERB_WATCH_SOURCE=1 and launchd's KeepAlive restarts whatever
-// exits, so "reload on change" is just "exit on change". Owned dev servers
-// live in their own process groups and the adopt path picks them back up on
-// the next request, so a daemon restart does not cost the running servers.
+// exits, so "reload on change" is just "exit on change". Owned dev servers go
+// down with the daemon: each one's terminal is a pair of pipes this process
+// holds, so a survivor would come back adopted as external with a panel that
+// can never show or send anything, and its pty.py dies of EPIPE on the dev
+// server's next line of output anyway. The next request starts it fresh.
 function startSourceWatch() {
   if (process.env.XERB_WATCH_SOURCE !== '1') return;
   const here = path.dirname(fileURLToPath(import.meta.url));
@@ -2414,6 +2457,10 @@ function liveState(host, project, authorized = false) {
     port: project.port,
     enabled: project.enabled !== false,
     framework: project.framework || 'node',
+    kind: project.kind || null,
+    archived: project.archived || null,
+    // A viewable's last sign of life, what its archive clock runs from.
+    lastSeenAt: isViewable(project) ? lastSeen(project, opened, newestFileTime) || null : null,
     // What the row's edit panel prefills its "start command" field with.
     startCmd: authorized ? project.startCmd || '' : '',
     state,
@@ -2449,6 +2496,7 @@ function statusPayload(authorized = false) {
   return {
     uptimeMs: Date.now() - STARTED_AT,
     idleTimeoutMs: config.idleTimeoutMs,
+    viewableArchiveDays: config.viewableArchiveDays,
     // Whether dev servers get a real terminal on this machine. `xerb status`
     // prints `pty.note` once at the top when there is none, which is the same
     // line a read-only panel opens with: one sentence, one source.
@@ -2504,6 +2552,38 @@ function rejectUnknown(res, body, allowed) {
   return true;
 }
 
+let pickerChild = null;
+function chooseFolder(res) {
+  return new Promise((resolve) => {
+    // "tell me to activate" brings osascript's own dialog to the front without
+    // asking for any automation permission; without it the dialog opens
+    // behind the browser.
+    const child = spawn('osascript', [
+      '-e', 'tell me to activate',
+      '-e', 'POSIX path of (choose folder with prompt "Add a project to xerb")',
+    ], { stdio: ['ignore', 'pipe', 'pipe'] });
+    pickerChild = child;
+    let out = '';
+    let err = '';
+    child.stdout.on('data', (d) => (out += d));
+    child.stderr.on('data', (d) => (err += d));
+    // The tab that asked went away: nobody is left to read the answer.
+    res.on('close', () => { if (!res.writableEnded) child.kill(); });
+    child.on('error', (e) => {
+      pickerChild = null;
+      resolve({ ok: false, reason: 'could not open a folder dialog: ' + e.message });
+    });
+    child.on('close', (code) => {
+      pickerChild = null;
+      const dir = out.trim().replace(/(.)\/+$/, '$1');
+      if (code === 0 && dir) return resolve({ ok: true, dir });
+      // -128 is AppleScript's "User canceled".
+      if (/-128/.test(err)) return resolve({ ok: false, canceled: true });
+      resolve({ ok: false, reason: 'the folder dialog failed: ' + (err.trim() || 'exit ' + code) });
+    });
+  });
+}
+
 async function handleEditControl(req, res, url) {
   const pathname = url.pathname;
   try {
@@ -2550,6 +2630,21 @@ async function handleEditControl(req, res, url) {
         // words `xerb add` prints, and waits for a typed command.
         evidence: det ? null : DETECTOR_EVIDENCE,
       });
+      return true;
+    }
+
+    // POST /__xerb/pick — a browser cannot hand a page a folder's absolute
+    // path, and the daemon is on the same Mac as the person clicking, so it
+    // opens Finder's own folder dialog and answers with what was chosen.
+    // Writes nothing. Awaited, never execFileSync: the dialog stays up for as
+    // long as someone browses, and the proxy keeps serving meanwhile.
+    if (pathname === '/__xerb/pick') {
+      if (pickerChild) {
+        sendJson(res, 409, { ok: false, reason: 'a folder dialog is already open' });
+        return true;
+      }
+      const picked = await chooseFolder(res);
+      sendJson(res, picked.ok ? 200 : picked.canceled ? 200 : 500, picked);
       return true;
     }
 
@@ -2646,6 +2741,62 @@ async function handleEditControl(req, res, url) {
       await editRegistry(`control:${on ? 'enable' : 'disable'}`, (reg) => setEnabled(reg, host, on));
       log(`${on ? 'enable' : 'disable'}: ${host}`);
       sendJson(res, 200, { ok: true, host, enabled: on });
+      return true;
+    }
+
+    // POST /__xerb/archive/<host>, /__xerb/restore/<host> — a viewable's row
+    // and the archived list. Restoring counts as opening it, or the next
+    // sweep would put a stale page straight back.
+    if (pathname.startsWith('/__xerb/archive/') || pathname.startsWith('/__xerb/restore/')) {
+      const archiving = pathname.startsWith('/__xerb/archive/');
+      const host = hostFromPath(pathname, archiving ? '/__xerb/archive/' : '/__xerb/restore/');
+      if (!projectByHost(host)) {
+        sendJson(res, 404, { ok: false, reason: 'unknown host' });
+        return true;
+      }
+      if (archiving) stop(host, 'archive');
+      else noteOpened(host);
+      await editRegistry(`control:${archiving ? 'archive' : 'restore'}`, (reg) =>
+        archiving ? archiveEntry(reg, host) : restoreEntry(reg, host));
+      flushOpened();
+      log(`${archiving ? 'archive' : 'restore'}: ${host}`);
+      sendJson(res, 200, { ok: true, host, archived: archiving });
+      return true;
+    }
+
+    // POST /__xerb/delete/<host> — the one route that touches a folder. Only
+    // an archived viewable, only a folder strictly inside the viewables root,
+    // and the folder goes to the Trash (see trashFolder).
+    if (pathname.startsWith('/__xerb/delete/')) {
+      const host = hostFromPath(pathname, '/__xerb/delete/');
+      const project = projectByHost(host);
+      if (!project) {
+        sendJson(res, 404, { ok: false, reason: 'unknown host' });
+        return true;
+      }
+      if (!isViewable(project) || !isArchived(project)) {
+        sendJson(res, 409, { ok: false, reason: 'only an archived viewable can be deleted; use remove for a project' });
+        return true;
+      }
+      stop(host, 'delete');
+      let where = null;
+      if (fs.existsSync(project.dir)) {
+        try {
+          where = trashFolder(project.dir, VIEWABLES_ROOT);
+        } catch (err) {
+          sendJson(res, 409, { ok: false, reason: err.message });
+          return true;
+        }
+      }
+      await editRegistry('control:delete', (reg) => removeEntry(reg, host));
+      runtime.delete(host);
+      lastAccess.delete(host);
+      connections.delete(host);
+      delete opened[host];
+      openedDirty = true;
+      flushOpened();
+      log(`delete: ${host} (${where ? (where.trashed ? `folder moved to ${where.trashed}` : `folder deleted`) : 'folder already gone'})`);
+      sendJson(res, 200, { ok: true, host, ...(where || {}) });
       return true;
     }
 
@@ -2965,6 +3116,18 @@ function fmtIdle(ms) {
   return `${h}h ${m % 60}m`;
 }
 
+// Coarse "how long ago" for the viewables shelves, where days are the unit
+// that matters (the archive clock is counted in them).
+function fmtAgo(ms) {
+  if (ms == null || ms < 0) return '—';
+  const m = Math.floor(ms / 60000);
+  if (m < 1) return 'just now';
+  if (m < 60) return `${m}m ago`;
+  const h = Math.floor(m / 60);
+  if (h < 24) return `${h}h ago`;
+  return `${Math.floor(h / 24)}d ago`;
+}
+
 // ---------------------------------------------------------------------------
 // Terminal panel: the vendored xterm files, the client that drives them, and
 // the pop-out page (spec 0.3.0 section 6)
@@ -3213,8 +3376,7 @@ function dashboardHtml() {
   // reading this HTML. The switches and the rename editor send it back as a
   // header, which authorizes their POSTs. JSON.stringify escapes it for JS use.
   const token = ensureControlToken();
-  const rows = config.projects
-    .map((p) => {
+  const rowFor = (p) => {
       // Authorized rows: this page is only ever served on the control host, it
       // already carries the token in its own script, and the same-origin policy
       // is what keeps another site from reading it — the same reasoning the
@@ -3258,22 +3420,48 @@ function dashboardHtml() {
       const termBtn = `<button class="rowbtn term" title="open this project's terminal" onclick="openTerm(this)">terminal</button>`;
       const enableBtn = `<button class="rowbtn" onclick="toggleEnabled(this)">${ls.enabled ? 'disable' : 'enable'}</button>`;
       const removeBtn = `<button class="rowbtn danger" onclick="removeHost(this)">remove</button>`;
+      const viewable = isViewable(p);
+      // A viewable is a static page: no terminal worth opening, no enable
+      // toggle (archive is its off switch). The framework cell becomes how long
+      // ago it was last seen, which is what its archive clock runs from.
+      const archiveBtn = `<button class="rowbtn" title="hide it in the archived list; the folder stays" onclick="archiveHost(this)">archive</button>`;
+      const switchHtml = `<label class="switch"${lockReason ? ` title="${lockReason}"` : ''}><input type="checkbox" role="switch" aria-label="run ${esc(p.host)}"${on ? ' checked' : ''}${locked ? ' disabled' : ''} onchange="toggleHost(this)"><span class="track"></span></label>`;
+      const actions = viewable
+        ? `${restartBtn}${switchHtml}${archiveBtn}${removeBtn}`
+        : `${termBtn}${restartBtn}${switchHtml}${enableBtn}${removeBtn}`;
       // A disabled project is greyed cell by cell rather than by a class on the
       // <tr>: the row tag carries data-host and nothing else, because that is
       // the handle everything else in this file (and the tests) grabs a row by.
       // Its registry values ride on the first cell, where the edit panel reads
       // them without a second request.
       const dim = ls.enabled ? '' : ' off';
+      const secondCell = viewable
+        ? `<td class="c-fw${dim}" title="last opened or edited">${ls.lastSeenAt ? fmtAgo(Date.now() - ls.lastSeenAt) : '—'}</td>`
+        : `<td class="c-fw${dim}">${frameworkIcon(ls.framework)} ${esc(ls.framework)}</td>`;
       return `<tr data-host="${esc(p.host)}">
-        <td class="c-proj${dim}" data-port="${esc(String(ls.port))}" data-cmd="${esc(ls.startCmd)}"><a href="${esc(frontUrl(p.host))}/" target="_blank" rel="noopener" onclick="linkClicked(this)">${esc(frontUrl(p.host))}</a> <button class="edit" title="edit name, port, start command" aria-label="edit ${esc(p.host)}" onclick="editHost(this)">&#9998;</button></td>
-        <td class="c-fw${dim}">${frameworkIcon(ls.framework)} ${esc(ls.framework)}</td>
+        <td class="c-proj${dim}" data-port="${esc(String(ls.port))}" data-cmd="${esc(ls.startCmd)}"><a href="${esc(frontUrl(p.host))}/" target="_blank" rel="noopener" onclick="linkClicked(this)">${esc(frontUrl(p.host).replace(/^https?:\/\//, ''))}</a> <button class="edit" title="edit name, port, start command" aria-label="edit ${esc(p.host)}" onclick="editHost(this)">&#9998;</button></td>
+        ${secondCell}
         <td class="c-state${dim}"${stateTitle}>${stateBadge(ls.state, ls.owned, ls.lastError)}${freeBtn}${errLine}</td>
         <td class="c-idle${dim}">${ls.state === 'running' ? fmtIdle(ls.idleForMs) : '—'}</td>
         <td class="c-conn${dim}">${ls.connCount}</td>
-        <td class="c-act${dim}">${termBtn}${restartBtn}<label class="switch"${lockReason ? ` title="${lockReason}"` : ''}><input type="checkbox" role="switch" aria-label="run ${esc(p.host)}"${on ? ' checked' : ''}${locked ? ' disabled' : ''} onchange="toggleHost(this)"><span class="track"></span></label>${enableBtn}${removeBtn}</td>
+        <td class="c-act${dim}">${actions}</td>
       </tr>`;
-    })
-    .join('');
+  };
+  const rows = config.projects.filter((p) => !isViewable(p)).map(rowFor).join('');
+  const liveViewables = config.projects.filter((p) => isViewable(p) && !isArchived(p));
+  // Newest first: the page you were just handed is the one you are looking for.
+  const seen = (p) => lastSeen(p, opened, newestFileTime);
+  const viewRows = liveViewables.sort((a, b) => seen(b) - seen(a)).map(rowFor).join('');
+  // Archived rows carry data-archived, not data-host, so the status poll (which
+  // finds rows by data-host) leaves them alone: nothing about them is live.
+  const archivedList = config.projects
+    .filter(isArchived)
+    .sort((a, b) => (b.archived || 0) - (a.archived || 0));
+  const archivedRows = archivedList.map((p) => `<tr data-archived="${esc(p.host)}">
+        <td class="c-proj off">${esc(p.host)}</td>
+        <td class="off" title="${esc(p.dir)}">archived ${typeof p.archived === 'number' ? fmtAgo(Date.now() - p.archived) : ''}</td>
+        <td class="c-act"><button class="rowbtn" onclick="restoreHost(this)">restore</button>${isViewable(p) ? '<button class="rowbtn danger" onclick="deleteHost(this)">delete</button>' : ''}</td>
+      </tr>`).join('');
 
   // The ASCII LOGO stays in lib/ui.mjs for the terminal, where it is drawn with
   // a fixed cell grid. A browser is not that: every mac font stack smeared it
@@ -3353,39 +3541,147 @@ function dashboardHtml() {
     .f-name { width: 12ch; } .f-port { width: 8ch; } .f-cmd { width: 34ch; }
     .ederr { flex-basis: 100%; margin: 0; font-size: 12px; opacity: .6; }
     .ederr.bad { opacity: 1; color: #dc2626; }
+    .shelf { margin-top: 1.4rem; }
+    .shelf summary { cursor: pointer; font-size: 13px; font-weight: 600; }
+    .shelf summary .muted { font-weight: 400; margin-left: 0.4rem; }
+    .shelf table { margin-top: 0.4rem; }
     .addbar { margin-top: 1.2rem; }
     .addbar .rowbtn { margin-left: 0; }
-    .addform { margin-top: 0.8rem; padding: 0.9rem 1rem; border: 1px solid #8884;
-               border-radius: 10px; display: flex; flex-wrap: wrap; gap: 0.7rem 1.1rem;
-               align-items: center; font-size: 13px; }
-    .addform label { display: inline-flex; align-items: center; gap: 0.35rem; opacity: .75; }
-    .addform input[type=text], .addform input[type=number] {
-      font: inherit; padding: 3px 7px; border: 1px solid #8886; border-radius: 6px;
-      background: transparent; color: inherit; }
-    .addform input.bad { border-color: #dc2626; outline: none; }
-    #a-dir { width: 26ch; } #a-name { width: 12ch; } #a-cmd { width: 30ch; } #a-port { width: 8ch; }
-    .addactions { margin-left: auto; }
-    .addactions button { font: inherit; font-size: 13px; padding: 3px 12px; border-radius: 8px;
-                         border: 1px solid #8886; background: none; color: inherit; cursor: pointer; }
-    .addactions button[type=submit] { border-color: #2563eb; background: #2563eb; color: #fff; }
-    .adderr { flex-basis: 100%; margin: 0; font-size: 12px; opacity: .6; }
+    /* The add form is one question first: which folder. Everything else is
+       an answer the daemon can usually give, so it stays folded away until
+       the folder has been read, then opens already filled in. */
+    .addform { --line: #8884; --ring: #0891b2; margin-top: 0.8rem; padding: 1.1rem 1.2rem 1rem;
+               border: 1px solid var(--line); border-radius: 14px; background: #8881;
+               font-size: 13px; animation: addin .18s ease-out; }
+    @keyframes addin { from { opacity: 0; transform: translateY(-4px); } }
+    .addform .lbl { display: block; font-size: 11px; text-transform: uppercase;
+                    letter-spacing: .05em; opacity: .55; margin-bottom: 0.3rem; }
+    .addform .field { display: flex; align-items: center; gap: 0.45rem; padding: 0 0.7rem;
+                      border: 1px solid var(--line); border-radius: 9px; background: Canvas;
+                      transition: border-color .12s; }
+    .addform .field:focus-within { border-color: var(--ring); }
+    .addform .field.bad { border-color: #dc2626; }
+    .addform .field input { flex: 1; min-width: 0; font: inherit; padding: 0.5rem 0; border: 0;
+                            outline: 0; background: none; color: inherit; }
+    .addform .field input::placeholder { color: inherit; opacity: .35; }
+    .addform .mono, .addform .mono input { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12.5px; }
+    .addform .affix { opacity: .45; white-space: nowrap; }
+    .addform .field.url { gap: 0; }
+    .addform input[type=number] { appearance: textfield; -moz-appearance: textfield; }
+    .addform input[type=number]::-webkit-inner-spin-button { -webkit-appearance: none; }
+    .dirfield { padding: 0 0.85rem; }
+    .dirfield input { font-size: 14px; padding: 0.7rem 0; }
+    .dirfield svg { flex: none; opacity: .5; }
+    .found { flex: none; display: inline-flex; align-items: center; gap: 0.3rem; font-size: 12px;
+             padding: 2px 9px 2px 5px; border-radius: 999px; background: #8882; white-space: nowrap;
+             font-family: -apple-system, BlinkMacSystemFont, system-ui, sans-serif; }
+    .found .fwicon { margin: 0; vertical-align: 0; }
+    .found[hidden] { display: none; }
+    .spin { flex: none; width: 13px; height: 13px; border-radius: 50%; border: 2px solid #8885;
+            border-top-color: var(--ring); animation: spin .6s linear infinite; }
+    .spin[hidden] { display: none; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    /* 0fr -> 1fr animates to the content's own height without measuring it. */
+    .addmore { display: grid; grid-template-rows: 0fr; transition: grid-template-rows .22s ease; }
+    .addform.ready .addmore { grid-template-rows: 1fr; }
+    /* The padding is room for the focus ring, which overflow would clip. */
+    .addmore > div { overflow: hidden; min-height: 0; padding: 0 4px; margin: 0 -4px; }
+    .addgrid { display: grid; grid-template-columns: 1fr 1fr 7rem; gap: 0.8rem; padding-top: 0.9rem; }
+    .addgrid .wide { grid-column: 1 / -1; }
+    .addgrid .two { grid-column: span 2; }
+    .addopts { display: grid; grid-template-rows: 0fr; transition: grid-template-rows .2s ease; }
+    .addform.opts .addopts { grid-template-rows: 1fr; }
+    .addopts > div { overflow: hidden; min-height: 0; padding: 0 4px; margin: 0 -4px; }
+    .choose { flex: none; font: inherit; font-family: -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
+              font-size: 12px; padding: 3px 10px; border-radius: 7px; border: 1px solid var(--line);
+              background: none; color: inherit; cursor: pointer; }
+    .choose:hover { background: #8881; }
+    .linkbtn { font: inherit; font-size: 12px; padding: 0; margin-left: 0.6rem; border: 0; background: none;
+               color: inherit; opacity: .5; cursor: pointer; }
+    .linkbtn:hover { opacity: 1; text-decoration: underline; }
+    .optbtn::before { content: '▸'; display: inline-block; margin-right: 0.35rem; font-size: 10px;
+                      transition: transform .15s; }
+    .addform.opts .optbtn::before { transform: rotate(90deg); }
+    .addfoot .optbtn { border-color: transparent; padding-left: 0.3rem; opacity: .7; }
+    @media (max-width: 620px) {
+      .addgrid { grid-template-columns: 1fr; }
+      .addgrid .wide, .addgrid .two { grid-column: auto; }
+    }
+    .addfoot { display: flex; align-items: center; gap: 0.6rem; padding: 1rem 0 4px; }
+    .parklbl { display: inline-flex; justify-self: start; align-items: center; gap: 0.5rem; opacity: .8; cursor: pointer; }
+    .parklbl .switch { width: 32px; height: 18px; }
+    .parklbl .switch .track::after { width: 14px; height: 14px; }
+    .parklbl .switch input:checked + .track { background: #64748b; }
+    .parklbl .switch input:checked + .track::after { transform: translateX(14px); }
+    .addfoot button { font: inherit; font-size: 13px; padding: 0.4rem 0.95rem; border-radius: 9px;
+                      border: 1px solid var(--line); background: none; color: inherit; cursor: pointer; }
+    .addfoot button:hover { background: #8881; }
+    .addfoot .cancel { margin-left: auto; }
+    .addfoot button[type=submit] { border-color: #0891b2; background: #0891b2;
+                                   color: #fff; font-weight: 500; }
+    .addfoot button[type=submit]:hover { background: #0e7490; border-color: #0e7490; }
+    .addfoot button:disabled { opacity: .5; cursor: default; }
+    .adderr { margin: 0.55rem 0 0; font-size: 12px; opacity: .6; }
     .adderr.bad { opacity: 1; color: #dc2626; }
+    @media (prefers-reduced-motion: reduce) {
+      .addform, .addmore, .addopts, .optbtn::before { animation: none; transition: none; }
+      .spin { animation-duration: 2s; }
+    }
     ${termPanelCss()}
   </style>
-  <div class="addbar"><button class="rowbtn" id="addtoggle" onclick="toggleAdd()">add project</button></div>
+  <div class="addbar"><button class="rowbtn" id="addtoggle" onclick="addClick()">add project</button><button class="linkbtn" id="addtype" onclick="toggleAdd()">or type a path</button></div>
   <form class="addform" id="addform" hidden onsubmit="return submitAdd(event)">
-    <label>folder <input type="text" id="a-dir" placeholder="~/code/app" autocomplete="off" spellcheck="false"></label>
-    <label>name <input type="text" id="a-name" autocomplete="off" spellcheck="false"><span class="muted">.localhost</span></label>
-    <label>start command <input type="text" id="a-cmd" autocomplete="off" spellcheck="false"></label>
-    <label>port <input type="number" id="a-port" autocomplete="off"></label>
-    <label>parked <input type="checkbox" id="a-parked"></label>
-    <span class="addactions"><button type="submit">add</button> <button type="button" onclick="toggleAdd()">cancel</button></span>
-    <p class="adderr" id="a-err">The folder is read, never changed. Tab out of it to fill in the rest.</p>
+    <label class="lbl" for="a-dir">folder</label>
+    <div class="field dirfield mono" id="a-dirfield">
+      <svg viewBox="0 0 20 20" width="16" height="16" aria-hidden="true"><path d="M2.5 5.5a1.5 1.5 0 0 1 1.5-1.5h3.4l1.6 1.8H16a1.5 1.5 0 0 1 1.5 1.5v7.2A1.5 1.5 0 0 1 16 16H4a1.5 1.5 0 0 1-1.5-1.5z" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/></svg>
+      <input type="text" id="a-dir" placeholder="~/code/app" autocomplete="off" spellcheck="false">
+      <span class="spin" id="a-spin" hidden></span>
+      <span class="found" id="a-found" hidden></span>
+      <button type="button" class="choose" onclick="pickFolder()">choose…</button>
+    </div>
+    <p class="adderr" id="a-err">Choose a folder or paste its path. xerb only reads it.</p>
+    <div class="addmore" id="a-more" inert><div>
+      <div class="addgrid">
+        <div class="wide">
+          <label class="lbl" for="a-name">url</label>
+          <div class="field url mono"><span class="affix">http://</span><input type="text" id="a-name" autocomplete="off" spellcheck="false"><span class="affix">.localhost</span></div>
+        </div>
+      </div>
+      <div class="addopts" id="a-opts" inert><div>
+        <div class="addgrid">
+          <div class="two">
+            <label class="lbl" for="a-cmd">start command</label>
+            <div class="field mono"><input type="text" id="a-cmd" autocomplete="off" spellcheck="false"></div>
+          </div>
+          <div>
+            <label class="lbl" for="a-port">port</label>
+            <div class="field mono"><input type="number" id="a-port" autocomplete="off"></div>
+          </div>
+          <label class="parklbl wide" title="Registered and listed, but never started"><span class="switch"><input type="checkbox" id="a-parked"><span class="track"></span></span>parked</label>
+        </div>
+      </div></div>
+      <div class="addfoot">
+        <button type="button" class="optbtn" id="a-optbtn" onclick="addOpts()" aria-expanded="false">options</button>
+        <button type="button" class="cancel" onclick="toggleAdd()">cancel</button>
+        <button type="submit">add project</button>
+      </div>
+    </div></div>
   </form>
   <table>
     <thead><tr><th>Project</th><th>Framework</th><th>State</th><th>Idle</th><th>Conn</th><th></th></tr></thead>
     <tbody>${rows || '<tr><td colspan="6" class="muted">No projects registered.</td></tr>'}</tbody>
   </table>
+  ${liveViewables.length ? `<details class="shelf" id="shelf-viewables">
+    <summary>viewables <span class="muted">${liveViewables.length} · archived after ${config.viewableArchiveDays} days unopened</span></summary>
+    <table>
+      <thead><tr><th>Viewable</th><th>Seen</th><th>State</th><th>Idle</th><th>Conn</th><th></th></tr></thead>
+      <tbody>${viewRows}</tbody>
+    </table>
+  </details>` : ''}
+  ${archivedList.length ? `<details class="shelf" id="shelf-archived">
+    <summary>archived <span class="muted">${archivedList.length} · folders untouched until you delete</span></summary>
+    <table><tbody>${archivedRows}</tbody></table>
+  </details>` : ''}
   <script>
     const TOKEN = ${JSON.stringify(token)};
     const ON_STATES = ['running', 'starting', 'installing'];
@@ -3655,6 +3951,41 @@ function dashboardHtml() {
       btn.title = j.reason || 'failed';
     }
 
+    // Viewables shelves. Archive and restore change which table a row lives
+    // in, so like enable/disable the answer is a reload. Delete is the one
+    // action on this page that touches a folder, so its confirm says where the
+    // folder goes.
+    async function archiveHost(btn) {
+      btn.disabled = true;
+      const j = await post('/__xerb/archive/' + encodeURIComponent(btn.closest('tr').dataset.host));
+      if (j.ok) { location.reload(); return; }
+      btn.disabled = false;
+      btn.title = j.reason || 'failed';
+    }
+    async function restoreHost(btn) {
+      btn.disabled = true;
+      const j = await post('/__xerb/restore/' + encodeURIComponent(btn.closest('tr').dataset.archived));
+      if (j.ok) { location.reload(); return; }
+      btn.disabled = false;
+      btn.title = j.reason || 'failed';
+    }
+    async function deleteHost(btn) {
+      const host = btn.closest('tr').dataset.archived;
+      if (!confirm('Delete ' + host + '?\\n\\nThis removes it from xerb and moves its folder to the Trash.')) return;
+      btn.disabled = true;
+      const j = await post('/__xerb/delete/' + encodeURIComponent(host));
+      if (j.ok) { location.reload(); return; }
+      btn.disabled = false;
+      btn.title = j.reason || 'failed';
+    }
+    // Remember which shelves are open across the reloads the actions above do.
+    for (const d of document.querySelectorAll('details.shelf')) {
+      try { if (localStorage.getItem('xerb:' + d.id) === '1') d.open = true; } catch {}
+      d.addEventListener('toggle', () => {
+        try { localStorage.setItem('xerb:' + d.id, d.open ? '1' : '0'); } catch {}
+      });
+    }
+
     // The pencil opens one panel under the row holding everything the registry
     // has for it. Enter saves the field you are in, Esc closes — the two keys
     // rename has always used. Clicking the pencil again closes it, so nothing
@@ -3751,10 +4082,50 @@ function dashboardHtml() {
       document.getElementById(id).addEventListener('input', (e) => typed.add(e.target.id));
     }
 
+    const FW_ICONS = ${JSON.stringify(Object.fromEntries(
+      ['next', 'vite', 'cra', 'astro', 'remix', 'sveltekit', 'rails', 'django', 'node', 'static'].map((fw) => [fw, frameworkIcon(fw)]),
+    ))};
+    const dirEl = document.getElementById('a-dir');
+    const dirField = document.getElementById('a-dirfield');
+    const addMore = document.getElementById('a-more');
+    const addSpin = document.getElementById('a-spin');
+    const addFound = document.getElementById('a-found');
+
     function toggleAdd() {
       addForm.hidden = !addForm.hidden;
       document.getElementById('addtoggle').textContent = addForm.hidden ? 'add project' : 'close';
-      if (!addForm.hidden) document.getElementById('a-dir').focus();
+      document.getElementById('addtype').hidden = !addForm.hidden;
+      if (!addForm.hidden) dirEl.focus();
+    }
+
+    // The button goes straight to Finder: for most projects the only thing
+    // worth asking is which folder, and the form that follows arrives filled.
+    function addClick() {
+      if (addForm.hidden) pickFolder();
+      else toggleAdd();
+    }
+
+    let picking = false;
+    async function pickFolder() {
+      if (picking) return;
+      picking = true;
+      const j = await post('/__xerb/pick', {});
+      picking = false;
+      if (j.canceled) return;
+      if (addForm.hidden) toggleAdd();
+      if (!j.ok) { addSay(j.reason || 'could not open a folder dialog', true); return; }
+      dirEl.value = j.dir;
+      clearTimeout(detectTimer);
+      detectDir(false);
+    }
+
+    // Start command, port and parked are answers the detector already gave;
+    // they stay folded unless someone asks, or unless it had no answer.
+    function addOpts(on) {
+      const open = on === undefined ? !addForm.classList.contains('opts') : on;
+      addForm.classList.toggle('opts', open);
+      document.getElementById('a-opts').inert = !open;
+      document.getElementById('a-optbtn').setAttribute('aria-expanded', String(open));
     }
 
     function addSay(msg, bad) {
@@ -3762,21 +4133,39 @@ function dashboardHtml() {
       addErr.classList.toggle('bad', !!bad);
     }
 
-    // Leaving the folder field (tab, or Enter) asks the daemon what that folder
-    // proves, and fills in every field the user has not touched. The same
-    // detectors "xerb add" runs, so the form and the CLI agree about what a
-    // folder is before anything is written.
-    async function detectDir() {
-      const dirEl = document.getElementById('a-dir');
+    // The rest of the form is inert while folded, so Tab cannot land in a
+    // field nobody can see.
+    function addReady(on) {
+      addForm.classList.toggle('ready', on);
+      addMore.inert = !on;
+    }
+
+    // Asks the daemon what the folder proves and fills in every field the user
+    // has not touched. The same detectors "xerb add" runs, so the form and the
+    // CLI agree about what a folder is before anything is written. It runs as
+    // the path is typed; "quiet" is that case, where a path that does not
+    // exist yet is a path half typed, not a mistake to paint red.
+    let detectSeq = 0;
+    let detectedDir = null;
+    async function detectDir(quiet) {
       const dir = dirEl.value.trim();
-      if (!dir) return;
+      if (!dir || dir === detectedDir) return;
+      const seq = ++detectSeq;
+      addSpin.hidden = false;
       const j = await post('/__xerb/detect', { dir });
+      // A slower answer about an older path must not overwrite a newer one.
+      if (seq !== detectSeq) return;
+      addSpin.hidden = true;
       if (!j.ok) {
-        dirEl.classList.add('bad');
+        detectedDir = null;
+        addFound.hidden = true;
+        if (quiet) return;
+        dirField.classList.add('bad');
         addSay(j.reason || 'could not read that folder', true);
         return;
       }
-      dirEl.classList.remove('bad');
+      detectedDir = dir;
+      dirField.classList.remove('bad');
       const fill = (id, value) => {
         if (typed.has(id) || value === null || value === undefined || value === '') return;
         document.getElementById(id).value = value;
@@ -3784,16 +4173,35 @@ function dashboardHtml() {
       fill('a-name', j.name);
       fill('a-port', j.port);
       fill('a-cmd', j.startCmd);
-      if (j.startCmd) addSay('detected ' + j.framework + '; change anything before you add it.');
-      else addSay('nothing provable there (looked for ' + (j.evidence || []).map((e) => e[0]).join(', ') + '); type a start command.', true);
+      addFound.hidden = !j.startCmd;
+      if (j.startCmd) {
+        addFound.innerHTML = (FW_ICONS[j.framework] || '') + escAttr(j.framework);
+        addSay('Detected ' + j.framework + '. Change anything before you add it.');
+      } else {
+        addSay('Nothing provable there (looked for ' + (j.evidence || []).map((e) => e[0]).join(', ') + '). Type a start command.', true);
+      }
+      addReady(true);
+      if (!j.startCmd) addOpts(true);
+      if (!quiet) (j.startCmd ? addForm.querySelector('button[type=submit]') : document.getElementById('a-cmd')).focus();
     }
 
-    document.getElementById('a-dir').addEventListener('change', detectDir);
-    document.getElementById('a-dir').addEventListener('keydown', (e) => {
+    let detectTimer = null;
+    dirEl.addEventListener('input', () => {
+      dirField.classList.remove('bad');
+      if (addErr.classList.contains('bad')) addSay(ADD_HINT);
+      clearTimeout(detectTimer);
+      const v = dirEl.value.trim();
+      // Only a path the daemon would accept is worth a round trip.
+      if (v[0] !== '/' && v[0] !== '~') return;
+      detectTimer = setTimeout(() => detectDir(true), 350);
+    });
+    dirEl.addEventListener('change', () => { clearTimeout(detectTimer); detectDir(false); });
+    dirEl.addEventListener('keydown', (e) => {
       // Enter in the folder field means "look at this folder", not "submit".
       if (e.key !== 'Enter') return;
       e.preventDefault();
-      detectDir();
+      clearTimeout(detectTimer);
+      detectDir(false);
     });
 
     async function submitAdd(e) {
@@ -4104,6 +4512,18 @@ async function handleRequest(req, res) {
     );
   }
 
+  if (isArchived(project)) {
+    return sendHtml(
+      res,
+      410,
+      'xerb — archived',
+      `<h1>${esc(project.host)} is archived</h1>
+       <p class="muted">Nobody opened it for ${config.viewableArchiveDays} days, so xerb put it away. The folder is still at <code>${esc(project.dir)}</code>. Restore it from the dashboard's archived list.</p>${dashboardHomeLink()}`
+    );
+  }
+
+  if (isViewable(project)) noteOpened(project.host);
+
   if (project.enabled === false) {
     return sendHtml(
       res,
@@ -4404,6 +4824,36 @@ function reapIdle() {
   }
 }
 
+// Archive every viewable nobody has opened in viewableArchiveDays, and save
+// the opened times. Runs on the reaper's tick; the file-time stat is a couple
+// of syscalls per viewable, so there is no reason to run it less often.
+let sweeping = false;
+async function sweepViewables(now = Date.now()) {
+  flushOpened();
+  if (sweeping) return [];
+  const due = dueForArchive(config.projects, {
+    opened,
+    now,
+    days: config.viewableArchiveDays,
+    touched: newestFileTime,
+  });
+  if (!due.length) return [];
+  sweeping = true;
+  try {
+    for (const host of due) stop(host, 'archive');
+    await editRegistry('archive', (reg) => {
+      for (const host of due) if (reg.projects.some((p) => p.host === host)) archiveEntry(reg, host, now);
+    });
+    for (const host of due) log(`archived ${host} (unopened ${config.viewableArchiveDays}d)`);
+    return due;
+  } catch (err) {
+    log(`viewables: archive sweep failed: ${err.message}`);
+    return [];
+  } finally {
+    sweeping = false;
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Signals & global error handling — the daemon must never die.
 // ---------------------------------------------------------------------------
@@ -4429,6 +4879,7 @@ function shutdown(sig) {
   if (shuttingDown) return;
   shuttingDown = true;
   log(`${sig} -> stopping all owned children`);
+  flushOpened();
   for (const [host, r] of runtime.entries()) {
     if (r.owned && r.pid) {
       killGroup(r, 'SIGTERM');
@@ -4471,6 +4922,9 @@ if (RUN_AS_MAIN) {
   // XERB_CONFIG override). Production never sets it.
   const REAP_INTERVAL_MS = Number(process.env.XERB_REAP_INTERVAL_MS) || 30_000;
   setInterval(reapIdle, REAP_INTERVAL_MS).unref?.();
+  opened = readOpened(OPENED_PATH);
+  sweepViewables();
+  setInterval(() => sweepViewables(), REAP_INTERVAL_MS).unref?.();
 
   // The numbered port to fall back to when the front-door port cannot be bound.
   // On the npx path the front door is :80; macOS grants an unprivileged process
@@ -4606,6 +5060,8 @@ export {
   stop,
   upstreamAgent,
   reapIdle,
+  sweepViewables,
+  dashboardHtml,
   __setRuntimeForTest,
   makeTermSink,
   __addConnForTest,

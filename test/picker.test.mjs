@@ -6,7 +6,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { makeState, decodeKey, reduceKey, renderLines, runPicker } from '../lib/picker.mjs';
+import { makeState, decodeKey, reduceKey, renderLines, scrollTop, runPicker } from '../lib/picker.mjs';
 import { makeStyler } from '../lib/ui.mjs';
 
 // isTTY false -> every style function is identity, so rendered lines are
@@ -85,14 +85,28 @@ test('renders every row with cursor and checkbox state', () => {
   assert.ok(!lines[0].includes('❯'), 'only the cursor row carries the marker');
 });
 
-test('long lists window around the cursor with "more" markers', () => {
+test('long lists keep one height: a window of rows plus one position line', () => {
   let s = makeState(items(20));
+  const at = (st) => renderLines(st, { styler: plain, maxVisible: 5 });
+  assert.equal(at(s).length, 6);
+  assert.match(at(s)[5], / ↓ 1–5 of 20/);
   for (let i = 0; i < 10; i += 1) s = reduceKey(s, 'down').state;
-  const lines = renderLines(s, { styler: plain, maxVisible: 5 });
-  assert.equal(lines.length, 7, 'five rows plus a marker on each side');
-  assert.match(lines[0], /↑ \d+ more/);
-  assert.match(lines[lines.length - 1], /↓ \d+ more/);
-  assert.ok(lines.some((l) => l.includes('❯ ◉ p10')), 'cursor row stays in the window');
+  assert.equal(at(s).length, 6, 'the frame never grows or shrinks');
+  assert.match(at(s)[5], /↑↓ \d+–\d+ of 20/);
+  assert.ok(at(s).some((l) => l.includes('❯ ◉ p10')), 'cursor row stays in the window');
+});
+
+test('the window scrolls at the edges, not on every key', () => {
+  // 20 items, 8 visible, 2 rows of lookahead: rows 0-5 move the cursor only.
+  let top = 0;
+  for (let c = 0; c <= 5; c += 1) top = scrollTop(top, c, 20, 8);
+  assert.equal(top, 0, 'moving through the middle holds the list still');
+  assert.equal(scrollTop(top, 6, 20, 8), 1, 'two rows from the bottom edge, it scrolls one');
+  assert.equal(scrollTop(5, 9, 20, 8), 5, 'coming back up inside the window holds still too');
+  assert.equal(scrollTop(5, 6, 20, 8), 4);
+  assert.equal(scrollTop(0, 19, 20, 8), 12, 'wrapping to the end lands on the last window');
+  assert.equal(scrollTop(12, 0, 20, 8), 0, 'and wrapping back lands on the first');
+  assert.equal(scrollTop(3, 2, 5, 8), 0, 'a list that fits never scrolls');
 });
 
 test('hints truncate to the terminal width before styling', () => {
@@ -212,4 +226,17 @@ process.stdin.setRawMode = () => {};
   assert.equal(r.code, CANCEL_EXIT);
   assert.match(r.out, /ok, nothing registered/);
   assert.equal(wrote, false, 'no registry written, so nothing was registered and nothing declined');
+});
+
+test('chips sit before the label, labels share a column, unrevealed rows stay blank', () => {
+  const s = makeState([
+    { label: 'shop', hint: '~/code/shop', chip: { text: '[vite]  ', width: 8 } },
+    { label: 'portfolio', hint: '~/code/portfolio', chip: { text: '[next]  ', width: 8 } },
+  ]);
+  const plain = { bold: (x) => x, dim: (x) => x, cyan: (x) => x };
+  assert.deepEqual(renderLines(s, { styler: plain }), [
+    '  ❯ ◉ [vite]   shop       ~/code/shop',
+    '    ◉ [next]   portfolio  ~/code/portfolio',
+  ]);
+  assert.deepEqual(renderLines(s, { styler: plain, revealed: 1 })[1], '');
 });

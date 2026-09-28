@@ -17,30 +17,32 @@ $ npx xerb
 
   v0.3.0 · starts dev servers when you open their URL, stops them when idle
 
-  this will:
-  scan your home folder for dev projects · reads config files, writes nothing
-  let you pick which get a URL: http://<name>.localhost · works only on this machine
-  install a background service · no sudo, keeps the URLs working after reboot
-  add the add-project skill to ~/.claude/skills · for projects the scan misses
+  scan     your home folder for dev projects · reads config files, writes nothing
+  pick     which get a URL like http://<name>.localhost · works only on this machine
+  install  a background service · no sudo, keeps the URLs working after reboot
+  add      the add-project skill to ~/.claude/skills · for projects the scan misses
 
-  everything is stored in ~/.local/state/xerb · `xerb uninstall` deletes all of it
+  everything is stored in ~/.local/state/xerb · xerb uninstall deletes all of it
 
   proceed? [Y/n] y
 
-  3 new projects found — pick which get a URL
-  ❯ ◉ portfolio  node · ~/code/portfolio
-    ◉ shop  next · ~/code/shop
-    ◉ notes  static · ~/code/notes
+  found 3 new projects · read 4,812 folders in 0.4s · pick which get a URL
+  ❯ ◉  static  notes      ~/code/notes
+    ◉  node    portfolio  ~/code/portfolio
+    ◉  next    shop       ~/code/shop
   ↑↓ move · space toggle · a all · enter confirm · q not now
   unchecked ones are not asked about again · undo: "scanDeclined" in ~/.local/state/xerb/projects.json
 
-  ✓ found 3 projects
+  ✓ found 3 projects  1 next  1 node  1 static
   ✓ service running
 
   xerb v0.3.0  installed in 1214 ms
 
   dashboard  http://xerb.localhost
-  projects   http://<name>.localhost for each of 3 projects, e.g. http://portfolio.localhost
+  projects   3 · open a URL and its dev server starts
+
+  http://notes.localhost         http://shop.localhost
+  http://portfolio.localhost
 
   runs in the background and survives reboots · registry: ~/.local/state/xerb/projects.json · logs: ~/.local/state/xerb/logs
   `xerb` rescans for new projects · `xerb uninstall` removes everything
@@ -88,6 +90,8 @@ xerb uninstall
 ```
 
 Each project runs under a real pty, so its dev server has a tty: colors survive and you can type back at it. `xerb attach portfolio` hands your terminal to that dev server, which is how you answer Next's "port in use, use 3001 instead?" or press `r` at Vite. Ctrl-] detaches and the server keeps running, because it is xerb's process and not your shell's. The `terminal` button on a dashboard row is the same session in the page, with a pop-out into its own tab, and `xerb logs <host> -f` is the same stream with the escapes stripped and nothing going back. Without `python3` on PATH there is no pty: the output still shows, what you type goes nowhere, and the panel says so on its first line.
+
+Anything registered from a folder under `~/viewables` (or `XERB_VIEWABLES_DIR`) is a viewable: a one-off page, like a report or a mockup, that only needs a URL. Viewables sit in their own collapsed list under the projects. When one hasn't been opened or edited in 14 days (`viewableArchiveDays` in the registry), xerb archives it: the URL answers 410 and the entry moves to an archived list, where restore brings it back. Archiving never touches the folder. The archived list's delete button is the only thing that does, and it moves the folder to the Trash.
 
 Logs are plain files: `~/.local/state/xerb/logs/daemon.log` for the proxy, `<host>.log` per project. The registry at `~/.local/state/xerb/projects.json` is yours to edit: rename a project, change its port, park it, or add `scanRoots` and `scanExclude` to steer the scanner. A rescan merges; it never clobbers what you fixed by hand.
 

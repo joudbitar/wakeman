@@ -49,3 +49,31 @@ test('done() waits out minMs so a fast phase still shows its work', async () => 
   await spin.done('held');
   assert.ok(Date.now() - before >= 110, 'done() holds until minMs has passed');
 });
+
+test('columnize reads down each column and pads on plain width, not painted width', async () => {
+  const { columnize } = await import('../lib/ui.mjs');
+  const { lines, hidden } = columnize(['a', 'bb', 'ccc', 'dddd', 'e'], { width: 80, paint: (s) => `<${s}>` });
+  assert.deepEqual(lines, ['  <a>       <dddd>', '  <bb>      <e>', '  <ccc>']);
+  assert.equal(hidden, 0);
+});
+
+test('columnize falls back to one column when two do not fit, and reports what it cut', async () => {
+  const { columnize } = await import('../lib/ui.mjs');
+  const narrow = columnize(['http://portfolio.localhost', 'http://shop.localhost'], { width: 40 });
+  assert.deepEqual(narrow.lines, ['  http://portfolio.localhost', '  http://shop.localhost']);
+  const cut = columnize(['a', 'b', 'c', 'd', 'e'], { maxRows: 2 });
+  assert.equal(cut.lines.length, 2);
+  assert.equal(cut.hidden, 1);
+  assert.deepEqual(columnize([]), { lines: [], hidden: 0 });
+});
+
+test('framework chips: plain text on a pipe, cube colors without COLORTERM, 24-bit with it', async () => {
+  const { frameworkChip, chipWidth, frameworkTally } = await import('../lib/ui.mjs');
+  const plain = makeStyler({ isTTY: false });
+  assert.equal(frameworkChip('vite', plain, chipWidth(['vite', 'sveltekit'])), ' vite      ');
+  assert.equal(frameworkTally(['next', 'vite', 'next', 'static'], plain), '2 next · 1 static · 1 vite');
+  assert.match(frameworkChip('vite', makeStyler({ isTTY: true, env: {} })), /^\x1b\[48;5;\d+;38;5;\d+m vite \x1b\[39;49m$/);
+  assert.match(frameworkChip('vite', makeStyler({ isTTY: true, env: { COLORTERM: 'truecolor' } })), /^\x1b\[48;2;100;108;255;/);
+  // An unknown framework still gets a chip, never a throw.
+  assert.equal(frameworkChip('phoenix', plain), ' phoenix ');
+});

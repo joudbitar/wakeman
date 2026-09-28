@@ -16,7 +16,7 @@ import os from 'node:os';
 import { mergeRegistry } from './lib/registry.mjs';
 import { detectRails, detectDjango, detectStatic, detectNode, normalizeScanRoots, VITE_BASED } from './lib/detect.mjs';
 import { resolveStateDir, resolveStatePaths } from './lib/state.mjs';
-import { makeStyler } from './lib/ui.mjs';
+import { makeStyler, frameworkChip, chipWidth } from './lib/ui.mjs';
 import { runPicker } from './lib/picker.mjs';
 import { STATIC_PLACEHOLDER } from './lib/registry-cli.mjs';
 
@@ -85,6 +85,7 @@ const scanDeclined = existing && Array.isArray(existing.scanDeclined)
 // ---------------------------------------------------------------------------
 const found = [];
 const seenDirs = new Set(); // scanRoots may overlap; never register a dir twice
+let foldersRead = 0;
 function walk(dir, depth) {
   if (depth > MAXDEPTH) return;
   // scanExclude prunes the walk itself, so it holds for every ecosystem and
@@ -92,6 +93,7 @@ function walk(dir, depth) {
   if (scanExclude.some((s) => typeof s === 'string' && s && dir.includes(s))) return;
   let entries;
   try { entries = readdirSync(dir, { withFileTypes: true }); } catch { return; }
+  foldersRead += 1;
   const names = new Set(entries.map((e) => e.name));
 
   // Detection order: rails and django before node, because manage.py and
@@ -133,7 +135,9 @@ const roots = normalizeScanRoots(scanRoots, HOME).filter((r) => existsSync(r));
 // The walk is synchronous, so no spinner can animate over it; a static line
 // that is wiped afterwards is the honest version.
 if (PICK) process.stdout.write(ui.dim(`  scanning ${roots.map(tilde).join(', ')} for projects`));
+const walkStarted = Date.now();
 for (const root of roots) walk(root, 0);
+const walkMs = Date.now() - walkStarted;
 if (PICK) process.stdout.write('\r\x1b[2K');
 
 // ---------------------------------------------------------------------------
@@ -175,16 +179,20 @@ const knownDirs = new Set(
 let rows = candidates.filter((c) => !declined.has(c.dir));
 const fresh = rows.filter((c) => !knownDirs.has(c.dir)).sort((a, b) => a.dir.localeCompare(b.dir));
 if (PICK && fresh.length) {
+  const chipCols = chipWidth(fresh.map((c) => c.framework));
   const res = await runPicker({
     styler: ui,
-    heading: `  ${fresh.length} new project${fresh.length === 1 ? '' : 's'} found — pick which get a URL`,
+    heading:
+      `  found ${ui.bold(`${fresh.length} new project${fresh.length === 1 ? '' : 's'}`)} ` +
+      ui.dim(`· read ${foldersRead.toLocaleString('en-US')} folders in ${(walkMs / 1000).toFixed(1)}s · pick which get a URL`),
     notes: [
       ui.dim('  ↑↓ move · space toggle · a all · enter confirm · q not now'),
       ui.dim(`  unchecked ones are not asked about again · undo: "scanDeclined" in ${tilde(OUT)}`),
     ],
     items: fresh.map((c) => ({
       label: sanitizeHost(c.name) || 'project',
-      hint: `${c.framework} · ${tilde(c.dir)}`,
+      chip: { text: frameworkChip(c.framework, ui, chipCols), width: chipCols },
+      hint: tilde(c.dir),
     })),
   });
   if (res.cancelled) {
