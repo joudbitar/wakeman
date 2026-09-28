@@ -15,7 +15,7 @@ $ npx wakeman
    \ V  V / | (_| ||   < |  __/| | | | | || (_| || | | |
     \_/\_/   \__,_||_|\_\ \___||_| |_| |_| \__,_||_| |_|
 
-  v0.3.2 · starts dev servers when you open their URL, stops them when idle
+  v0.4.0 · starts dev servers when you open their URL, stops them when idle
 
   scan     your home folder for dev projects · reads config files, writes nothing
            macOS may ask to let your terminal read Desktop, Documents or Downloads; Don't Allow skips that folder
@@ -37,7 +37,7 @@ $ npx wakeman
   ✓ found 3 projects  1 next  1 node  1 static
   ✓ service running
 
-  wakeman v0.3.2  installed in 1214 ms
+  wakeman v0.4.0  installed in 1214 ms
 
   dashboard  http://wakeman.localhost
   projects   3 · open a URL and its dev server starts

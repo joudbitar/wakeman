@@ -14,8 +14,8 @@ permissions:
 
 jobs:
   publish:
-    # macos, not ubuntu: the test suite drives a macOS-only CLI, and the gate
-    # before a publish has to be the same suite CI runs.
+    # macos: the suite passes on ubuntu too (ci.yml runs both), and one OS is
+    # enough for the gate in front of a publish.
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
