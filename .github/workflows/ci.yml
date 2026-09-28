@@ -10,7 +10,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-latest]
+        os: [macos-latest, ubuntu-latest]
         node: [22, 24]
     runs-on: ${{ matrix.os }}
     steps:
@@ -19,3 +19,55 @@ jobs:
         with:
           node-version: ${{ matrix.node }}
       - run: npm test
+
+  # The unit tests drive the systemd half through pure functions. This runs the
+  # real thing on a real systemd: install from the checkout, reach a project
+  # through the front door, give the pinned node the port-80 capability, rerun,
+  # uninstall, and check nothing is left.
+  linux-install:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: start a systemd user session
+        run: |
+          sudo loginctl enable-linger "$USER"
+          for i in $(seq 1 50); do [ -S "/run/user/$(id -u)/bus" ] && break; sleep 0.2; done
+          echo "XDG_RUNTIME_DIR=/run/user/$(id -u)" >> "$GITHUB_ENV"
+          echo "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(id -u)/bus" >> "$GITHUB_ENV"
+      - name: a project for the scan to find
+        run: |
+          mkdir -p ~/e2e-site
+          cat > ~/e2e-site/package.json <<'EOF'
+          { "name": "e2e-site", "scripts": { "dev": "node server.js" } }
+          EOF
+          cat > ~/e2e-site/server.js <<'EOF'
+          require('http').createServer((_, res) => res.end('e2e-site ok')).listen(process.env.PORT, '127.0.0.1');
+          EOF
+      - name: install, no sudo, lands on the fallback port
+        run: |
+          node bin/wakeman.mjs --yes
+          systemctl --user is-active wakeman.service
+          curl -sf http://wakeman.localhost:4000/ > /dev/null
+          curl -sf --max-time 30 http://e2e-site.localhost:4000/ | grep -q 'e2e-site ok'
+      - name: the capability on the pinned node moves it to :80 and survives a rerun
+        run: |
+          pin=~/.local/state/wakeman/bin/node
+          sudo setcap cap_net_bind_service=+ep "$pin"
+          node bin/wakeman.mjs install --yes
+          getcap "$pin" | grep -q cap_net_bind_service
+          curl -sf --max-time 30 http://e2e-site.localhost/ | grep -q 'e2e-site ok'
+      - name: uninstall leaves nothing behind
+        run: |
+          node bin/wakeman.mjs uninstall --yes
+          test ! -e ~/.config/systemd/user/wakeman.service
+          test ! -e ~/.local/state/wakeman
+          test ! -e ~/.local/bin/wakeman
+          ! curl -s --max-time 2 http://wakeman.localhost/ > /dev/null
+      - name: daemon logs on failure
+        if: failure()
+        run: |
+          journalctl --user -u wakeman.service --no-pager | tail -100 || true
+          tail -100 ~/.local/state/wakeman/logs/* || true
