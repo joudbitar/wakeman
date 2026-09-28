@@ -19,6 +19,7 @@ import { decideBindFallback, formatProjectUrl } from './lib/bind.mjs';
 // project hosts, this one completes a handshake on the control plane.
 import { handleUpgrade as wsAccept, isWebSocketUpgrade } from './lib/ws.mjs';
 import { protectedRoot, isAccessDenied, isToolStub, whichOn } from './lib/macos.mjs';
+import { listenerPid, processCwd } from './lib/procnet.mjs';
 // Every registry WRITE in this file goes through these, because the dashboard
 // and the `wakeman add/remove/enable/disable/port/rename` subcommands must not
 // drift: one module owns what a valid entry is, and the daemon only decides
@@ -515,7 +516,7 @@ function startSourceWatch() {
     // Debounced past the editor's write burst; ThrottleInterval in the plist
     // keeps a pathological loop from thrashing launchd.
     t = setTimeout(() => {
-      log(`source: ${file || 'a file'} changed; exiting so launchd restarts with the new code`);
+      log(`source: ${file || 'a file'} changed; exiting so the service restarts with the new code`);
       shutdown('source change');
     }, 300);
   };
@@ -623,10 +624,12 @@ async function probePort(port, timeoutMs = 300) {
   }
 }
 
-// Resolve the PID of the process LISTENing on `port`, via lsof (macOS).
-// Returns a positive number, or null when it cannot be determined (lsof
-// missing/ENOENT, non-zero exit, timeout, or unparseable output). NEVER throws.
+// Resolve the PID of the process LISTENing on `port`: lsof on macOS, /proc on
+// Linux, where minimal installs ship no lsof. Returns a positive number, or
+// null when it cannot be determined (lsof missing/ENOENT, non-zero exit,
+// timeout, or unparseable output). NEVER throws.
 function defaultResolveListenerPid(port) {
+  if (process.platform === 'linux') return listenerPid(port);
   try {
     const out = execFileSync('lsof', ['-nP', '-iTCP:' + port, '-sTCP:LISTEN', '-Fpn'], {
       encoding: 'utf8',
@@ -654,6 +657,7 @@ function defaultResolveListenerPid(port) {
 function defaultResolvePidCwd(port) {
   const pid = defaultResolveListenerPid(port);
   if (!pid) return null;
+  if (process.platform === 'linux') return processCwd(pid);
   try {
     const out = execFileSync('lsof', ['-a', '-p', String(pid), '-d', 'cwd', '-Fn'], {
       encoding: 'utf8',
@@ -1571,7 +1575,7 @@ async function ensureUp(project) {
         r.owned = false;
         r.child = null;
         r.pid = null;
-        const e = new Error(`macOS did not let wakeman read ${project.dir}`);
+        const e = new Error(`${process.platform === 'darwin' ? 'macOS did not let wakeman' : 'wakeman cannot'} read ${project.dir}`);
         e.code = 'DIR_BLOCKED';
         e.host = host;
         r.lastError = { code: e.code, kind: 'blocked', message: e.message, at: Date.now(), dir: project.dir, node: process.execPath };
@@ -2137,6 +2141,11 @@ function failureCopy(project, lastError) {
     case 'dir-missing':
       return `The folder <code>${esc(le.dir || project.dir)}</code> is gone. Move it back, or <code>wakeman remove ${esc(project.host)}</code> / <code>wakeman add /new/path --name ${esc(project.host)}</code>.`;
     case 'blocked':
+      // Only macOS has a privacy system to blame; elsewhere EACCES is the
+      // folder's own permission bits, and the service runs as this user.
+      if (process.platform !== 'darwin') {
+        return `wakeman runs as you and cannot read <code>${esc(le.dir || project.dir)}</code>. Fix the folder's permissions (<code>ls -ld ${esc(le.dir || project.dir)}</code> shows them), then reload.`;
+      }
       return `macOS did not let wakeman read <code>${esc(le.dir || project.dir)}</code>. In System Settings › Privacy &amp; Security › Files and Folders, turn on the folder for <code>node</code>, or add <code>${esc(le.node || 'node')}</code> under Full Disk Access. Then reload.`;
     case 'no-devtools':
       return `Static sites are served by python3, which needs the Xcode command line tools. Run <code>xcode-select --install</code>, then reload.`;

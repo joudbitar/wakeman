@@ -6,24 +6,24 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { nodeTooOld, protectedRoot, isAccessDenied, isToolStub, whichOn, pinNode, stableNode } from '../lib/macos.mjs';
+import { nodeTooOld, protectedRoot, isAccessDenied, isToolStub, hasDeveloperTools, whichOn, pinNode, stableNode } from '../lib/macos.mjs';
 
 test('nodeTooOld passes 22 and up and names the version it refuses', () => {
   assert.equal(nodeTooOld('22.0.0'), null);
   assert.equal(nodeTooOld('24.16.0'), null);
-  const msg = nodeTooOld('20.11.1');
+  const msg = nodeTooOld('20.11.1', undefined, 'darwin');
   assert.match(msg, /needs node 22 or newer, and this is node 20\.11\.1/);
 });
 
 test('protectedRoot names the guarded folder a project sits under', () => {
   const home = '/Users/a';
-  assert.equal(protectedRoot('/Users/a/Documents/site', home), '~/Documents');
-  assert.equal(protectedRoot('/Users/a/Desktop', home), '~/Desktop');
-  assert.equal(protectedRoot('/Users/a/Downloads/x/y', home), '~/Downloads');
-  assert.equal(protectedRoot('/Users/a/Library/Mobile Documents/com~apple~CloudDocs/app', home), 'iCloud Drive');
-  assert.equal(protectedRoot('/Volumes/ext/code/app', home), '/Volumes/ext');
-  assert.equal(protectedRoot('/Users/a/code/app', home), null);
-  assert.equal(protectedRoot('/Users/a/Documentsx/app', home), null, 'a prefix is not a parent');
+  assert.equal(protectedRoot('/Users/a/Documents/site', home, 'darwin'), '~/Documents');
+  assert.equal(protectedRoot('/Users/a/Desktop', home, 'darwin'), '~/Desktop');
+  assert.equal(protectedRoot('/Users/a/Downloads/x/y', home, 'darwin'), '~/Downloads');
+  assert.equal(protectedRoot('/Users/a/Library/Mobile Documents/com~apple~CloudDocs/app', home, 'darwin'), 'iCloud Drive');
+  assert.equal(protectedRoot('/Volumes/ext/code/app', home, 'darwin'), '/Volumes/ext');
+  assert.equal(protectedRoot('/Users/a/code/app', home, 'darwin'), null);
+  assert.equal(protectedRoot('/Users/a/Documentsx/app', home, 'darwin'), null, 'a prefix is not a parent');
 });
 
 test('isAccessDenied is EPERM or EACCES and nothing else', () => {
@@ -34,11 +34,20 @@ test('isAccessDenied is EPERM or EACCES and nothing else', () => {
 });
 
 test('isToolStub is only the known /usr/bin stubs, only without developer tools', () => {
-  assert.equal(isToolStub('/usr/bin/python3', { devTools: false }), true);
-  assert.equal(isToolStub('/usr/bin/python3', { devTools: true }), false);
-  assert.equal(isToolStub('/usr/bin/ruby', { devTools: false }), false, 'ruby is a real binary');
-  assert.equal(isToolStub('/opt/homebrew/bin/python3', { devTools: false }), false);
-  assert.equal(isToolStub(null, { devTools: false }), false);
+  assert.equal(isToolStub('/usr/bin/python3', { devTools: false, platform: 'darwin' }), true);
+  assert.equal(isToolStub('/usr/bin/python3', { devTools: true, platform: 'darwin' }), false);
+  assert.equal(isToolStub('/usr/bin/ruby', { devTools: false, platform: 'darwin' }), false, 'ruby is a real binary');
+  assert.equal(isToolStub('/opt/homebrew/bin/python3', { devTools: false, platform: 'darwin' }), false);
+  assert.equal(isToolStub(null, { devTools: false, platform: 'darwin' }), false);
+});
+
+test('off macOS there is no privacy system and no tool stubs', () => {
+  assert.equal(protectedRoot('/home/a/Documents/site', '/home/a', 'linux'), null);
+  assert.equal(protectedRoot('/Volumes/ext/code/app', '/home/a', 'linux'), null);
+  assert.equal(isToolStub('/usr/bin/python3', { devTools: false, platform: 'linux' }), false);
+  assert.equal(hasDeveloperTools({ platform: 'linux', run: () => { throw new Error('must not run xcode-select'); } }), true);
+  assert.match(nodeTooOld('20.11.1', undefined, 'linux'), /your package manager/);
+  assert.doesNotMatch(nodeTooOld('20.11.1', undefined, 'linux'), /brew/);
 });
 
 test('whichOn resolves on the given PATH, not the process one', () => {

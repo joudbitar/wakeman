@@ -270,8 +270,13 @@ test('blocked: a folder the daemon may not read says so instead of "gone"', asyn
   );
 
   assert.ok(firstMs < 3000, `failed without riding out the start timeout (took ${firstMs}ms)`);
-  assert.match(page.body, new RegExp(`macOS did not let wakeman read <code>${locked}</code>`));
-  assert.match(page.body, /Files and Folders/);
+  if (process.platform === 'darwin') {
+    assert.match(page.body, new RegExp(`macOS did not let wakeman read <code>${locked}</code>`));
+    assert.match(page.body, /Files and Folders/);
+  } else {
+    assert.match(page.body, new RegExp(`wakeman runs as you and cannot read <code>${locked}</code>`));
+    assert.doesNotMatch(page.body, /macOS|System Settings/);
+  }
   assert.doesNotMatch(page.body, /is gone/);
   assert.equal(entry.lastError.kind, 'blocked');
   assert.equal(entry.lastError.errorLine, null, 'no error line: this attempt never spawned');
