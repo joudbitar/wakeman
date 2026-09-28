@@ -46,7 +46,7 @@ import {
   DETECTOR_EVIDENCE,
 } from '../lib/registry-cli.mjs';
 import { nodeTooOld, protectedRoot, isToolStub, whichOn, stableNode } from '../lib/macos.mjs';
-import { unitPathFor, systemdUsable, systemdRequirementLine, bindCapState, setcapArgs, setcapCommand, linuxNode } from '../lib/linux.mjs';
+import { unitPathFor, systemdUsable, systemdRequirementLine, bindCapState, setcapArgs, setcapCommand, linuxNode, PORT_START_COMMAND } from '../lib/linux.mjs';
 import { listenerPid, processName } from '../lib/procnet.mjs';
 import {
   LAUNCHD_LABEL, SYSTEMD_UNIT, LEGACY_NAME, LEGACY_LAUNCHD_LABEL, assembleServicePath, renderPlist, renderUnit,
@@ -552,7 +552,7 @@ function linuxBindCapState(nodeBin) {
   let portStartText = '';
   try { portStartText = fs.readFileSync('/proc/sys/net/ipv4/ip_unprivileged_port_start', 'utf8'); } catch { /* unreadable: assume 1024 */ }
   const cap = spawnSync('getcap', [NODE_PIN], { encoding: 'utf8', timeout: 3000 });
-  return bindCapState({ portStartText, frontPort: FRONT_PORT, getcapOutput: cap.stdout || '' });
+  return bindCapState({ portStartText, frontPort: FRONT_PORT, getcapOutput: cap.stdout || '', getcapError: cap.stderr || '' });
 }
 
 // The daemon is up on the fallback port with :80 free and the capability
@@ -607,7 +607,14 @@ function printInstalledBanner({ projects, port, startedAt, skillInstalled, verb 
   if (port !== FRONT_PORT) {
     const holder = portHolder(FRONT_PORT);
     out();
-    if (!holder && linuxBindCapState(nodeBin) === 'missing') {
+    const capState = holder ? null : linuxBindCapState(nodeBin);
+    if (capState === 'unsupported') {
+      // An NFS home: setcap cannot store the capability there, so offering
+      // the sudo would only cost a password. Name the machine-wide fix and
+      // leave it to whoever owns the machine.
+      out(`  ${yellow('!')} port ${FRONT_PORT} needs a permission that ${tilde(path.dirname(NODE_PIN))} cannot store (network filesystems can't), so every URL ends in :${port}.`);
+      out(dim(`    an admin can let every user bind it with ${PORT_START_COMMAND}, then \`wakeman install\`.`));
+    } else if (capState === 'missing') {
       // Nothing holds :80; the kernel refused it. The exact command, so the
       // person who said no (or ran with --yes) can do it later.
       out(`  ${yellow('!')} port ${FRONT_PORT} needs a one-time permission on linux, so every URL ends in :${port}.`);

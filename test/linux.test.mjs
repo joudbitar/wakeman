@@ -73,6 +73,10 @@ test('bindCapState: the kernel setting first, then getcap', () => {
   assert.equal(bindCapState({ portStartText: '1024\n', frontPort: 80, getcapOutput: '/p/node cap_net_bind_service=ep' }), 'granted');
   assert.equal(bindCapState({ portStartText: '1024\n', frontPort: 80, getcapOutput: '' }), 'missing');
   assert.equal(bindCapState({ portStartText: '', frontPort: 80 }), 'missing', 'an unreadable sysctl is treated as the stock 1024');
+  // Verbatim from getcap on an NFS home (Ubuntu 20.04, libcap 2.32).
+  const nfs = "Failed to get capabilities of file `/home/a/.local/state/wakeman/bin/node' (Operation not supported)\n";
+  assert.equal(bindCapState({ portStartText: '1024\n', frontPort: 80, getcapError: nfs }), 'unsupported', 'no sudo offer that setcap cannot honor');
+  assert.equal(bindCapState({ portStartText: '80\n', frontPort: 80, getcapError: nfs }), 'unneeded', 'the kernel setting still wins');
 });
 
 test('setcapCommand is the pasteable line, on the pin only, quoted when the path needs it', () => {
