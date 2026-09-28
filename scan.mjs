@@ -16,6 +16,7 @@ import os from 'node:os';
 import { mergeRegistry } from './lib/registry.mjs';
 import { detectRails, detectDjango, detectStatic, detectNode, normalizeScanRoots, VITE_BASED } from './lib/detect.mjs';
 import { resolveStateDir, resolveStatePaths } from './lib/state.mjs';
+import { protectedRoot, isAccessDenied } from './lib/macos.mjs';
 import { makeStyler, frameworkChip, chipWidth } from './lib/ui.mjs';
 import { runPicker } from './lib/picker.mjs';
 import { STATIC_PLACEHOLDER } from './lib/registry-cli.mjs';
@@ -86,13 +87,22 @@ const scanDeclined = existing && Array.isArray(existing.scanDeclined)
 const found = [];
 const seenDirs = new Set(); // scanRoots may overlap; never register a dir twice
 let foldersRead = 0;
+const deniedRoots = new Set();
 function walk(dir, depth) {
   if (depth > MAXDEPTH) return;
   // scanExclude prunes the walk itself, so it holds for every ecosystem and
   // for everything underneath the excluded path.
   if (scanExclude.some((s) => typeof s === 'string' && s && dir.includes(s))) return;
   let entries;
-  try { entries = readdirSync(dir, { withFileTypes: true }); } catch { return; }
+  try {
+    entries = readdirSync(dir, { withFileTypes: true });
+  } catch (err) {
+    // A guarded folder the person said no to (or has not answered for) is
+    // worth one line after the walk, since it hides every project inside it.
+    const guarded = protectedRoot(dir, HOME);
+    if (guarded && isAccessDenied(err)) deniedRoots.add(guarded);
+    return;
+  }
   foldersRead += 1;
   const names = new Set(entries.map((e) => e.name));
 
@@ -139,6 +149,13 @@ const walkStarted = Date.now();
 for (const root of roots) walk(root, 0);
 const walkMs = Date.now() - walkStarted;
 if (PICK) process.stdout.write('\r\x1b[2K');
+if (deniedRoots.size) {
+  const list = [...deniedRoots].join(', ');
+  process.stderr.write(
+    ui.dim(`  macOS kept ${list} closed, so the scan skipped it. to include it: System Settings › Privacy & Security ›\n`) +
+    ui.dim(`  Files and Folders, turn it on for your terminal, then run xerb again.\n`)
+  );
+}
 
 // ---------------------------------------------------------------------------
 // 2. Helpers for hosts and start commands (detection lives in lib/detect.mjs).

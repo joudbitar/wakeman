@@ -252,6 +252,31 @@ test('dir-missing: a moved folder fails instantly and the copy carries both fixe
   assert.equal(entry.lastError.errorLine, null, 'no error line: this attempt wrote nothing to the log');
 });
 
+// --- kind: blocked -----------------------------------------------------------
+
+test('blocked: a folder the daemon may not read says so instead of "gone"', async (t) => {
+  // macOS privacy answers EPERM for ~/Documents and friends; a mode-000 folder
+  // answers EACCES, which takes the same path.
+  const port = await freePort();
+  const locked = path.join(tmpDir, 'locked');
+  fs.mkdirSync(locked);
+  fs.chmodSync(locked, 0o000);
+  t.after(() => fs.chmodSync(locked, 0o755));
+
+  const { page, entry, firstMs } = await failAndRead(
+    t,
+    { host: 'locked', dir: locked, port, startCmd: 'npm run dev', enabled: true },
+    { startTimeoutMs: 30_000 }
+  );
+
+  assert.ok(firstMs < 3000, `failed without riding out the start timeout (took ${firstMs}ms)`);
+  assert.match(page.body, new RegExp(`macOS did not let xerb read <code>${locked}</code>`));
+  assert.match(page.body, /Files and Folders/);
+  assert.doesNotMatch(page.body, /is gone/);
+  assert.equal(entry.lastError.kind, 'blocked');
+  assert.equal(entry.lastError.errorLine, null, 'no error line: this attempt never spawned');
+});
+
 // --- kind: install-failed ---------------------------------------------------
 
 test('install-failed: the page quotes the install command and its code, and a reload does not reinstall', async (t) => {

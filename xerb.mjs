@@ -18,6 +18,7 @@ import { decideBindFallback, formatProjectUrl } from './lib/bind.mjs';
 // because this file already has a handleUpgrade: that one is the HMR proxy for
 // project hosts, this one completes a handshake on the control plane.
 import { handleUpgrade as wsAccept, isWebSocketUpgrade } from './lib/ws.mjs';
+import { protectedRoot, isAccessDenied, isToolStub, whichOn } from './lib/macos.mjs';
 // Every registry WRITE in this file goes through these, because the dashboard
 // and the `xerb add/remove/enable/disable/port/rename` subcommands must not
 // drift: one module owns what a valid entry is, and the daemon only decides
@@ -298,7 +299,8 @@ function getRuntime(host) {
     // lastError persists on the record after startPromise clears, so the cold
     // status page can read WHY a background bring-up failed (see ensureUp). Its
     // `kind` is the closed set the failure copy switches on: 'exited',
-    // 'timeout', 'dir-missing', 'install-failed', 'conflict'. phase is derived
+    // 'timeout', 'dir-missing', 'blocked', 'no-devtools', 'install-failed',
+    // 'conflict'. phase is derived
     // from `state` by phaseLabel(); we keep a slot but state is truth.
     // conflictDir holds the foreign cwd when a port-conflict is detected on adopt.
     // installFailed remembers a dependency install that already failed on this
@@ -982,8 +984,10 @@ function ptyInterpreter() {
   } else {
     ptyPython = null;
     // PATH first, then the Xcode command line tools' copy, which is on any
-    // machine that has git.
+    // machine that has git. Without those tools /usr/bin/python3 is a stub
+    // that opens an install dialog, so it is never run to find out.
     for (const candidate of ['python3', '/usr/bin/python3']) {
+      if (isToolStub(whichOn(candidate, process.env.PATH))) continue;
       try {
         execFileSync(candidate, ['-c', ''], { stdio: 'ignore', timeout: 10_000 });
         ptyPython = candidate;
@@ -1550,11 +1554,41 @@ async function ensureUp(project) {
     // 'exit', so the exit race below never settles and the old code sat in
     // 'starting' for the full startTimeoutMs. One statSync fails it in a
     // millisecond, with copy that names the folder and the way back.
+    //
+    // readdir, not stat: a folder under ~/Documents or ~/Desktop that macOS
+    // has not let this process read fails here with EPERM, and that is a
+    // different sentence (and fix) from a folder that is gone.
+    // Async on purpose: while macOS shows its access dialog the read blocks
+    // until someone answers, and a sync read would freeze every other URL.
     let dirExists = false;
     try {
-      dirExists = fs.statSync(project.dir).isDirectory();
-    } catch {
+      await fs.promises.readdir(project.dir);
+      dirExists = true;
+    } catch (err) {
+      if (isAccessDenied(err)) {
+        log(`blocked: ${host} ${project.dir} (${err.code}) -> failed`);
+        r.state = 'stopped';
+        r.owned = false;
+        r.child = null;
+        r.pid = null;
+        const e = new Error(`macOS did not let xerb read ${project.dir}`);
+        e.code = 'DIR_BLOCKED';
+        e.host = host;
+        r.lastError = { code: e.code, kind: 'blocked', message: e.message, at: Date.now(), dir: project.dir, node: process.execPath };
+        throw e;
+      }
       dirExists = false;
+    }
+    // A static site is served by python3. On a Mac without the developer
+    // tools that is the stub, which would open an install dialog from a
+    // background process and then exit; fail with the fix instead.
+    if (String(project.startCmd || '').trim() === STATIC_PLACEHOLDER && isToolStub(whichOn('python3', process.env.PATH))) {
+      r.state = 'stopped';
+      const e = new Error('python3 needs the Xcode command line tools');
+      e.code = 'NO_DEVTOOLS';
+      e.host = host;
+      r.lastError = { code: e.code, kind: 'no-devtools', message: e.message, at: Date.now() };
+      throw e;
     }
     if (!dirExists) {
       log(`dir-missing: ${host} ${project.dir} is gone -> failed`);
@@ -2077,7 +2111,7 @@ function phaseLabel(r) {
 // This is the whole of section 4's complaint: before it, every failure rendered
 // the start-timeout sentence, so a dev server that died in 100ms read as "did
 // not open 127.0.0.1:3010 within 30s" and the log was the only way to tell.
-// `kind` is the closed set ensureUp writes: exited, timeout, dir-missing,
+// `kind` is the closed set ensureUp writes: exited, timeout, dir-missing, blocked, no-devtools,
 // install-failed, conflict. Returns HTML; every interpolated value is escaped.
 //
 // The dir-missing sentence names the folder even for an unauthorized caller,
@@ -2086,6 +2120,10 @@ function phaseLabel(r) {
 // the project's own origin (a cross-origin page can navigate a browser here but
 // cannot read what comes back). /__xerb/status already ships conflictDir on
 // the same reasoning.
+// Failures that are decided before a spawn, so the log holds nothing from
+// this attempt and must not be quoted as if it did.
+const NO_SPAWN_KINDS = new Set(['dir-missing', 'blocked', 'no-devtools']);
+
 function failureCopy(project, lastError) {
   const le = lastError || {};
   const lived = le.elapsedMs == null ? null : (le.elapsedMs / 1000).toFixed(1);
@@ -2098,6 +2136,10 @@ function failureCopy(project, lastError) {
       return `Nothing answered on port ${esc(String(le.port ?? project.port))} within ${Math.round((le.timeoutMs ?? config.startTimeoutMs) / 1000)}s. The process is still being killed.`;
     case 'dir-missing':
       return `The folder <code>${esc(le.dir || project.dir)}</code> is gone. Move it back, or <code>xerb remove ${esc(project.host)}</code> / <code>xerb add /new/path --name ${esc(project.host)}</code>.`;
+    case 'blocked':
+      return `macOS did not let xerb read <code>${esc(le.dir || project.dir)}</code>. In System Settings › Privacy &amp; Security › Files and Folders, turn on the folder for <code>node</code>, or add <code>${esc(le.node || 'node')}</code> under Full Disk Access. Then reload.`;
+    case 'no-devtools':
+      return `Static sites are served by python3, which needs the Xcode command line tools. Run <code>xcode-select --install</code>, then reload.`;
     case 'install-failed':
       if (le.timedOut) return `<code>${esc(le.installCmd || 'npm install')}</code> did not finish within ${Math.round((le.timeoutMs ?? config.installTimeoutMs) / 1000)}s.`;
       if (le.exitCode == null) return `<code>${esc(le.installCmd || 'npm install')}</code> could not be run.`;
@@ -2140,7 +2182,7 @@ function statusPageHtml(project, r, authorized = false) {
     // to the log; showing the previous run's tail under it would answer a
     // question nobody asked. Every other kind ends in output worth reading.
     const kind = (r.lastError && r.lastError.kind) || null;
-    const withLog = kind !== 'dir-missing';
+    const withLog = !NO_SPAWN_KINDS.has(kind);
     const logBlock = withLog
       ? `<pre id="term">loading the log&hellip;</pre>
        ${termNote}
@@ -2448,7 +2490,7 @@ function liveState(host, project, authorized = false) {
   // and firstErrorLine falls back to the last of them, which captioned a red
   // row with a line from a start that worked. Same rule statusPageHtml uses to
   // leave the log box off that page.
-  const errorLine = r && r.lastError && r.lastError.kind !== 'dir-missing'
+  const errorLine = r && r.lastError && !NO_SPAWN_KINDS.has(r.lastError.kind)
     ? firstErrorLine(tailLog(host, 40))
     : null;
   return {
@@ -4923,6 +4965,7 @@ if (RUN_AS_MAIN) {
   const REAP_INTERVAL_MS = Number(process.env.XERB_REAP_INTERVAL_MS) || 30_000;
   setInterval(reapIdle, REAP_INTERVAL_MS).unref?.();
   opened = readOpened(OPENED_PATH);
+  askForGuardedFolders();
   sweepViewables();
   setInterval(() => sweepViewables(), REAP_INTERVAL_MS).unref?.();
 
@@ -5003,6 +5046,28 @@ if (RUN_AS_MAIN) {
       if (p && p.enabled !== false) log(`  ${frontUrl(p.host)}`);
     }
   })();
+}
+
+// Read each project folder that sits under ~/Desktop, ~/Documents,
+// ~/Downloads, iCloud Drive or a /Volumes disk once at boot. The first read of
+// a guarded folder is what makes macOS ask whether node may access it, and
+// boot is right after the install, while the person is at the keyboard and
+// the banner has just told them to expect it. Waiting for the first browser
+// visit would put the dialog behind the browser window. The answer is
+// remembered by macOS, so later boots read silently.
+// Async and not awaited: the read blocks while the dialog is up, and the
+// daemon has to be answering the installer meanwhile.
+function askForGuardedFolders() {
+  const seen = new Set();
+  for (const p of config.projects) {
+    if (!p || p.enabled === false || !p.dir) continue;
+    const root = protectedRoot(p.dir, os.homedir());
+    if (!root || seen.has(root)) continue;
+    seen.add(root);
+    fs.promises.readdir(p.dir).catch((err) => {
+      if (isAccessDenied(err)) log(`blocked: macOS has not let node read ${root} (${p.dir}); projects there will not start`);
+    });
+  }
 }
 
 // ---------------------------------------------------------------------------

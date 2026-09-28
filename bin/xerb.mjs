@@ -27,7 +27,6 @@
 // Zero npm dependencies — Node built-ins only.
 
 import os from 'node:os';
-import net from 'node:net';
 import http from 'node:http';
 import path from 'node:path';
 import fs from 'node:fs';
@@ -43,6 +42,7 @@ import {
   setPort, renameEntry, pickPort, sanitizeHost, expandTilde, detectOne, startCmdFor,
   DETECTOR_EVIDENCE,
 } from '../lib/registry-cli.mjs';
+import { nodeTooOld, protectedRoot, isToolStub, whichOn, stableNode } from '../lib/macos.mjs';
 import { LAUNCHD_LABEL, LEGACY_NAME, LEGACY_LAUNCHD_LABEL, assembleLaunchdPath, renderPlist, stripCaddyBlock, legacyRegistryCandidates, toolsToVerify, parseLaunchdPid, waitForExit } from '../lib/install.mjs';
 
 const ui = makeStyler({ isTTY: process.stdout.isTTY, env: process.env });
@@ -79,6 +79,8 @@ const { configPath, logsDir, tokenPath } = resolveStatePaths({ env: process.env,
 // xerb creates" stays one directory (plus the plist and the PATH symlink,
 // which uninstall removes).
 const APP_DIR = path.join(stateDir, 'app');
+// Where the LaunchAgent's node is copied when it is not a Homebrew one.
+const NODE_PIN = path.join(stateDir, 'bin', 'node');
 const PLIST_PATH = path.join(os.homedir(), 'Library', 'LaunchAgents', `${LAUNCHD_LABEL}.plist`);
 const CLI_LINK = path.join(os.homedir(), '.local', 'bin', 'xerb');
 
@@ -134,23 +136,6 @@ async function retireLegacyInstall() {
   try {
     if (fs.lstatSync(LEGACY_CLI_LINK).isSymbolicLink()) fs.rmSync(LEGACY_CLI_LINK, { force: true });
   } catch { /* no old command */ }
-}
-
-// ---------------------------------------------------------------------------
-// port probes
-// ---------------------------------------------------------------------------
-
-// Is SOMETHING listening on this port? Used after the install to report the
-// URLs that actually work (the daemon on :80, or on the fallback behind a
-// legacy Caddy that still owns :80).
-function probeListen(port) {
-  return new Promise((resolve) => {
-    const s = net.connect({ host: '127.0.0.1', port });
-    s.setTimeout(400);
-    s.once('connect', () => { s.destroy(); resolve(true); });
-    s.once('timeout', () => { s.destroy(); resolve(false); });
-    s.once('error', () => resolve(false));
-  });
 }
 
 // ---------------------------------------------------------------------------
@@ -262,6 +247,7 @@ async function askConsent({ willInstallSkill }) {
   // first and reads a line only if it wants the detail.
   const step = (color, verb, what, note) => out(`  ${bold(color(verb.padEnd(9)))}${what} ${dim(`· ${note}`)}`);
   step(cyan, 'scan', 'your home folder for dev projects', 'reads config files, writes nothing');
+  out(dim(`           macOS may ask to let your terminal read Desktop, Documents or Downloads; Don't Allow skips that folder`));
   step(magenta, 'pick', `which get a URL like ${bold(cyan('http://<name>.localhost'))}`, 'works only on this machine');
   step(green, 'install', 'a background service', 'no sudo, keeps the URLs working after reboot');
   if (willInstallSkill) {
@@ -394,7 +380,10 @@ async function installPersistent({ onStep = () => {} } = {}) {
   const appDir = IS_CHECKOUT ? ROOT : APP_DIR;
   if (!IS_CHECKOUT) await copyApp();
 
-  const nodeBin = process.execPath;
+  // The daemon runs a node that outlives a version manager or a brew upgrade
+  // removing this one (see stableNode). Project start commands still find
+  // the user's own node on PATH.
+  const nodeBin = stableNode(process.execPath, NODE_PIN);
   const plist = renderPlist({
     nodeBin,
     daemonPath: path.join(appDir, 'xerb.mjs'),
@@ -406,7 +395,7 @@ async function installPersistent({ onStep = () => {} } = {}) {
     // the user's shell would — so it inherits this install shell's PATH.
     pathEnv: assembleLaunchdPath({
       userPath: process.env.PATH || '',
-      nodeDir: path.dirname(nodeBin),
+      nodeDir: path.dirname(process.execPath),
       home: os.homedir(),
     }),
     frontPort: FRONT_PORT,
@@ -442,20 +431,21 @@ async function installPersistent({ onStep = () => {} } = {}) {
     skillInstalled = true;
   }
 
-  // Wait for the daemon: :80 when it won the front door (or a legacy Caddy is
-  // forwarding), else the fallback port. Report the port that answers.
+  // Wait for the daemon: :80 when it won the front door, else the fallback
+  // port. It has to be xerb answering, not just something: Herd, Valet, MAMP
+  // or a Docker container on :80 would otherwise get the printed URLs.
   onStep('waking the daemon');
   const deadline = Date.now() + 10_000;
   while (Date.now() < deadline) {
-    if (await probeListen(FRONT_PORT)) return { up: true, port: FRONT_PORT, skillInstalled };
-    if (await probeListen(FALLBACK_PORT)) return { up: true, port: FALLBACK_PORT, skillInstalled };
+    const live = await findDaemon();
+    if (live) return { up: true, port: live.port, skillInstalled };
     await new Promise((r) => setTimeout(r, 500));
   }
   return { up: false, port: FRONT_PORT, skillInstalled };
 }
 
 function printInstalledBanner({ projects, port, startedAt, skillInstalled, verb = 'installed' }) {
-  const { bold, dim, cyan } = ui;
+  const { bold, dim, cyan, yellow } = ui;
   const out = (s = '') => process.stdout.write(s + '\n');
   const readyMs = Date.now() - startedAt;
   out();
@@ -475,6 +465,18 @@ function printInstalledBanner({ projects, port, startedAt, skillInstalled, verb 
     for (const line of lines) out(line);
     if (hidden) out(dim(`  and ${hidden} more · \`xerb status\` lists them all`));
   }
+  if (port !== 80) {
+    const holder = portHolder(80);
+    out();
+    out(`  ${yellow('!')} port 80 is taken${holder ? ` by ${bold(holder)}` : ''}, so every URL ends in :${port}.`);
+    out(dim(`    stop it, then \`xerb install\` moves xerb to plain http://<name>.localhost URLs.`));
+  }
+  const guarded = [...new Set(projects.map((p) => protectedRoot(p.dir, os.homedir())).filter(Boolean))];
+  if (guarded.length) {
+    out();
+    out(`  ${yellow('!')} some projects live in ${guarded.join(', ')}. if macOS asks whether ${bold('node')} may access`);
+    out(`    ${guarded.length === 1 ? 'that folder' : 'those folders'}, click Allow: the service cannot start them otherwise.`);
+  }
   out();
   out(dim(`  runs in the background and survives reboots · registry: ${tilde(configPath)} · logs: ${tilde(logsDir)}`));
   out(dim('  `xerb` rescans for new projects · `xerb uninstall` removes everything'));
@@ -483,9 +485,24 @@ function printInstalledBanner({ projects, port, startedAt, skillInstalled, verb 
   }
   const pathDirs = (process.env.PATH || '').split(':');
   if (!pathDirs.includes(path.dirname(CLI_LINK))) {
-    out(dim(`  note: add ${tilde(path.dirname(CLI_LINK))} to your PATH to get the \`xerb\` command.`));
+    // A stock macOS zsh does not have ~/.local/bin on PATH, so this is most
+    // first installs: hand over the exact line rather than the idea of it.
+    out();
+    out(`  ${yellow('!')} the ${bold('xerb')} command is in ${tilde(path.dirname(CLI_LINK))}, which is not on your PATH. to fix it:`);
+    const rc = /bash$/.test(process.env.SHELL || '') ? '~/.bash_profile' : '~/.zshrc';
+    out(`    ${cyan(`echo 'export PATH="$HOME/.local/bin:$PATH"' >> ${rc}`)} ${dim('then open a new terminal')}`);
+    out(dim('    until then, `npx xerb <command>` does the same thing.'));
   }
   out();
+}
+
+// The name of whatever holds `port`, or null. lsof without sudo only sees
+// this user's processes, so a root nginx comes back null and the copy says
+// "taken" without a name.
+function portHolder(port) {
+  const r = spawnSync('lsof', ['-nP', `-iTCP:${port}`, '-sTCP:LISTEN', '-Fc'], { encoding: 'utf8', timeout: 3000 });
+  const line = String(r.stdout || '').split('\n').find((l) => l.startsWith('c'));
+  return line ? line.slice(1) : null;
 }
 
 // ---------------------------------------------------------------------------
@@ -625,6 +642,9 @@ function probeTool(tool, pathEnv, withVersion) {
 }
 
 async function checkTool(tool, servicePath) {
+  // `--version` on a /usr/bin stub opens the "install developer tools" dialog
+  // in the middle of the install. Name the fix instead of running it.
+  if (isToolStub(whichOn(tool, servicePath))) return { tool, ok: false, reason: 'no-devtools' };
   const [service, shell] = await Promise.all([
     probeTool(tool, servicePath, VERSION_PROBED.has(tool)),
     probeTool(tool, process.env.PATH || '', false),
@@ -678,6 +698,9 @@ function printToolWarnings(results) {
     if (r.reason === 'mismatch') {
       out(`  ${red('⚠')} ${bold(r.tool)}: the service runs ${tilde(r.bin)}, your shell runs ${tilde(r.shellBin)}.`);
       out(dim(`    two installs of one tool can behave differently — \`xerb install\` rebakes the service PATH from this shell.`));
+    } else if (r.reason === 'no-devtools') {
+      out(`  ${red('⚠')} ${bold(r.tool)} needs the Xcode command line tools, which this Mac does not have yet.`);
+      out(dim(`    run \`xcode-select --install\`; projects that start with ${r.tool} will not come up until then.`));
     } else if (r.reason === 'broken') {
       out(`  ${red('⚠')} ${bold(r.tool)} resolves to ${tilde(r.bin || '?')} for the service, but \`${r.tool} --version\` fails there.`);
       out(dim(`    projects whose start command uses ${r.tool} will not come up until this is fixed.`));
@@ -1134,6 +1157,10 @@ function failureNote(r) {
       return `nothing on :${r.port} after ${Math.round((le.timeoutMs ?? 120_000) / 1000)}s`;
     case 'dir-missing':
       return 'folder is gone';
+    case 'blocked':
+      return 'macOS blocked the folder · allow node in System Settings › Privacy & Security › Files and Folders';
+    case 'no-devtools':
+      return 'python3 needs the Xcode command line tools · run xcode-select --install';
     case 'install-failed':
       return `${le.installCmd || 'npm install'} failed${line}`;
     default:
@@ -1531,6 +1558,11 @@ async function main() {
     process.stderr.write('xerb runs on macOS. Linux support is not planned.\n');
     return 2;
   }
+  const oldNode = nodeTooOld(process.versions.node);
+  if (oldNode) {
+    process.stderr.write(`${oldNode}\n`);
+    return 2;
+  }
 
   const assumeYes = flags.has('--yes') || flags.has('-y');
   const host = rest[1] || '';
@@ -1625,16 +1657,15 @@ async function main() {
   // `xerb install` — the explicit form is the sanctioned way to force a
   // plist rewrite, e.g. after the preflight flags a stale service PATH.
   if (cmd !== 'install' && (IS_CHECKOUT ? plistRunsCheckout() : installedVersion() === VERSION)) {
-    for (const port of [FRONT_PORT, FALLBACK_PORT]) {
-      if (await probeListen(port)) {
-        printInstalledBanner({ projects, port, startedAt, skillInstalled: false, verb: 'rescanned' });
-        // Preflight against the DEPLOYED plist PATH — what the daemon is
-        // actually resolving with right now. A tool that broke or diverged
-        // since install surfaces here, on the next casual `xerb`, not at
-        // 3am via a start timeout.
-        printToolWarnings(await preflightTools(toolsToVerify(projects), deployedPathEnv()));
-        return 0;
-      }
+    const live = await findDaemon();
+    if (live) {
+      printInstalledBanner({ projects, port: live.port, startedAt, skillInstalled: false, verb: 'rescanned' });
+      // Preflight against the DEPLOYED plist PATH — what the daemon is
+      // actually resolving with right now. A tool that broke or diverged
+      // since install surfaces here, on the next casual `xerb`, not at
+      // 3am via a start timeout.
+      printToolWarnings(await preflightTools(toolsToVerify(projects), deployedPathEnv()));
+      return 0;
     }
   }
 
