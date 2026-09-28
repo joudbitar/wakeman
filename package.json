@@ -1,6 +1,6 @@
 {
   "name": "xerb",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "On-demand local dev-server proxy: every project gets a permanent .localhost URL that wakes its dev server on request and sleeps it when idle.",
   "type": "module",
   "bin": {
