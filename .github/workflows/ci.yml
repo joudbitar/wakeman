@@ -52,15 +52,17 @@ jobs:
         run: |
           node bin/wakeman.mjs --yes
           systemctl --user is-active wakeman.service
-          curl -sf http://wakeman.localhost:4000/ > /dev/null
-          curl -sf --max-time 30 http://e2e-site.localhost:4000/ | grep -q 'e2e-site ok'
+          curl -sSf http://wakeman.localhost:4000/ -o /dev/null
+          # A request that lands while the dev server boots gets the starting
+          # page straight back, so ask until the project itself answers.
+          timeout 60 sh -c 'until curl -s http://e2e-site.localhost:4000/ | grep -q "e2e-site ok"; do sleep 1; done'
       - name: the capability on the pinned node moves it to :80 and survives a rerun
         run: |
           pin=~/.local/state/wakeman/bin/node
           sudo setcap cap_net_bind_service=+ep "$pin"
           node bin/wakeman.mjs install --yes
           getcap "$pin" | grep -q cap_net_bind_service
-          curl -sf --max-time 30 http://e2e-site.localhost/ | grep -q 'e2e-site ok'
+          timeout 60 sh -c 'until curl -s http://e2e-site.localhost/ | grep -q "e2e-site ok"; do sleep 1; done'
       - name: uninstall leaves nothing behind
         run: |
           node bin/wakeman.mjs uninstall --yes
@@ -71,5 +73,7 @@ jobs:
       - name: daemon logs on failure
         if: failure()
         run: |
-          journalctl --user -u wakeman.service --no-pager | tail -100 || true
-          tail -100 ~/.local/state/wakeman/logs/* || true
+          journalctl --user -u wakeman.service --no-pager | tail -n 100 || true
+          tail -n 100 ~/.local/state/wakeman/logs/* || true
+          cat ~/.config/systemd/user/wakeman.service || true
+          ss -ltnp || true
