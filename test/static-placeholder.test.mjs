@@ -160,7 +160,7 @@ test('a placeholder project starts and serves its folder through the front door'
   assert.equal(first.status, 200, 'the first navigation gets the wake page, not a hang');
 
   const up = await waitFor(() => getRuntime('placeholder-site').state === 'running');
-  assert.ok(up, 'the expanded command brought the port up');
+  assert.ok(up, `the expanded command brought the port up. its log:\n${tailLog('placeholder-site', 40, { all: true })}`);
 
   const served = await httpGet(daemonPort, 'placeholder-site.localhost', '/index.html');
   assert.equal(served.status, 200);
