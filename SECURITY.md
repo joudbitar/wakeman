@@ -22,4 +22,4 @@ The published package has zero npm dependencies: 16 files, all from this reposit
 
 ## Reporting
 
-Use GitHub's private vulnerability reporting on this repository, or mail bnbitar@gmail.com. There is no bounty program.
+Use GitHub's private vulnerability reporting on this repository, or mail bitjoud@gmail.com. There is no bounty program.
