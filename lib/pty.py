@@ -91,8 +91,12 @@ def main(argv):
                         # us, so the child hears about this on its own.
                         set_winsize(master, int(parts[0]), int(parts[1]))
 
-    code = os.waitstatus_to_exitcode(os.waitpid(pid, 0)[1])
-    return code if code >= 0 else 128 - code
+    # By hand rather than os.waitstatus_to_exitcode, which is 3.9+: Ubuntu
+    # 20.04 and Debian 11 still ship a 3.8 python3.
+    status = os.waitpid(pid, 0)[1]
+    if os.WIFSIGNALED(status):
+        return 128 + os.WTERMSIG(status)
+    return os.WEXITSTATUS(status)
 
 
 if __name__ == "__main__":

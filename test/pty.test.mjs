@@ -67,7 +67,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 test('the command runs on a real tty', { skip }, async () => {
   const p = startPty(['24', '80', 'test -t 0 && test -t 1 && tty']);
-  await p.until(/\/dev\/tty/);
+  await p.until(/\/dev\/(tty|pts\/)/); // /dev/ttys003 on macOS, /dev/pts/1 on Linux
   const { code } = await p.exited;
   assert.equal(code, 0);
 });
