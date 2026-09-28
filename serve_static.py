@@ -7,7 +7,7 @@ portfolio's vercel.json { "cleanUrls": true }. Binds PORT (env) on 127.0.0.1.
 
 Usage: run from the site directory. `python3 serve_static.py [port]`
 """
-import os, sys
+import os, socketserver, sys
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 
 PORT = int(os.environ.get("PORT") or (sys.argv[1] if len(sys.argv) > 1 else 8000))
@@ -29,8 +29,17 @@ class CleanURLHandler(SimpleHTTPRequestHandler):
         sys.stderr.write("%s - %s\n" % (self.address_string(), fmt % args))
 
 
+class Server(ThreadingHTTPServer):
+    # HTTPServer.server_bind calls socket.getfqdn(), a reverse DNS lookup that
+    # can stall for many seconds on some Macs (CI runners among them) before
+    # the port opens. The name is only used in CGI env vars; the host will do.
+    def server_bind(self):
+        socketserver.TCPServer.server_bind(self)
+        self.server_name, self.server_port = self.server_address[:2]
+
+
 if __name__ == "__main__":
     handler = lambda *a, **k: CleanURLHandler(*a, directory=ROOT, **k)
-    srv = ThreadingHTTPServer(("127.0.0.1", PORT), handler)
+    srv = Server(("127.0.0.1", PORT), handler)
     print(f"serve_static: {ROOT} on http://127.0.0.1:{PORT} (cleanUrls)", flush=True)
     srv.serve_forever()
