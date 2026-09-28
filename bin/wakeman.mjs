@@ -6,10 +6,12 @@
 //   wakeman                    (the installed command) rescan + refresh
 //   wakeman --help             the whole command table
 //
-// Every run installs a user LaunchAgent (no sudo) so the URLs survive reboots;
-// the daemon serves :80 itself with a per-connection loopback guard (ADR 0002),
-// so there is no Caddy and no shell installer. macOS only: the install IS a
-// LaunchAgent, and half a Linux story is worse than none.
+// Every run installs a user service (no sudo): a LaunchAgent on macOS, which
+// survives reboots, or a systemd user unit on Linux, which starts with the
+// login session. The daemon serves :80 itself with a per-connection loopback
+// guard (ADR 0002), so there is no Caddy and no shell installer. On Linux :80
+// needs CAP_NET_BIND_SERVICE, which the install offers to put on its own node
+// copy with one sudo, asked for out loud; declined, the URLs carry :4000.
 // See docs/adr/0003-one-way-in.md.
 //
 // The subcommands split in two. Registry edits (add, remove, enable, disable,
@@ -21,8 +23,9 @@
 //
 // Nothing is ever written into a project directory. Everything lands in the
 // state dir (registry, logs, control token, the installed app copy) plus, when
-// installed, one plist in ~/Library/LaunchAgents and one symlink in
-// ~/.local/bin. `wakeman uninstall` removes all of it.
+// installed, one service file (~/Library/LaunchAgents/com.wakeman.proxy.plist
+// or ~/.config/systemd/user/wakeman.service) and one symlink in ~/.local/bin.
+// `wakeman uninstall` removes all of it.
 //
 // Zero npm dependencies — Node built-ins only.
 
@@ -43,9 +46,19 @@ import {
   DETECTOR_EVIDENCE,
 } from '../lib/registry-cli.mjs';
 import { nodeTooOld, protectedRoot, isToolStub, whichOn, stableNode } from '../lib/macos.mjs';
-import { LAUNCHD_LABEL, LEGACY_NAME, LEGACY_LAUNCHD_LABEL, assembleLaunchdPath, renderPlist, stripCaddyBlock, legacyRegistryCandidates, toolsToVerify, parseLaunchdPid, waitForExit } from '../lib/install.mjs';
+import { unitPathFor, systemdUsable, systemdRequirementLine, bindCapState, setcapArgs, setcapCommand, linuxNode } from '../lib/linux.mjs';
+import { listenerPid, processName } from '../lib/procnet.mjs';
+import {
+  LAUNCHD_LABEL, SYSTEMD_UNIT, LEGACY_NAME, LEGACY_LAUNCHD_LABEL, assembleServicePath, renderPlist, renderUnit,
+  unitEnvironment, unitRunsDaemon, stripCaddyBlock, legacyRegistryCandidates, toolsToVerify, parseLaunchdPid,
+  parseSystemdMainPid, waitForExit, pathHintRc,
+} from '../lib/install.mjs';
 
 const ui = makeStyler({ isTTY: process.stdout.isTTY, env: process.env });
+
+// The two platforms, decided once. Everything below that says "the service"
+// means the LaunchAgent on a Mac and the systemd user unit on Linux.
+const IS_LINUX = process.platform === 'linux';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(HERE, '..'); // package root — where wakeman.mjs / scan.mjs live
@@ -76,12 +89,16 @@ const stateDir = resolveStateDir({
 const { configPath, logsDir, tokenPath } = resolveStatePaths({ env: process.env, stateDir });
 
 // Where the installed app copy lives: inside the state dir, so "everything
-// wakeman creates" stays one directory (plus the plist and the PATH symlink,
-// which uninstall removes).
+// wakeman creates" stays one directory (plus the service file and the PATH
+// symlink, which uninstall removes).
 const APP_DIR = path.join(stateDir, 'app');
-// Where the LaunchAgent's node is copied when it is not a Homebrew one.
+// Where the service's node is copied: on a Mac when it is not a Homebrew one,
+// on Linux always (the copy is what carries the :80 capability).
 const NODE_PIN = path.join(stateDir, 'bin', 'node');
 const PLIST_PATH = path.join(os.homedir(), 'Library', 'LaunchAgents', `${LAUNCHD_LABEL}.plist`);
+const UNIT_PATH = unitPathFor({ env: process.env, home: os.homedir(), unit: SYSTEMD_UNIT });
+// The one service file this platform writes; reruns read it back.
+const SERVICE_FILE = IS_LINUX ? UNIT_PATH : PLIST_PATH;
 const CLI_LINK = path.join(os.homedir(), '.local', 'bin', 'wakeman');
 
 // Where a pre-0.3.0 install (the lazydev name) left its three traces.
@@ -127,8 +144,10 @@ function migrateLegacyRegistry() {
 
 // Take a lazydev-era install down: its agent would fight this one for :80,
 // and its command would run a daemon that no longer exists. The old state dir
-// is left alone (logs and registry backups are the user's to delete).
+// is left alone (logs and registry backups are the user's to delete). lazydev
+// never ran on Linux, so there is nothing to retire there.
 async function retireLegacyInstall() {
+  if (IS_LINUX) return;
   if (fs.existsSync(LEGACY_PLIST_PATH)) {
     await launchctlAsync(['bootout', `gui/${process.getuid()}/${LEGACY_LAUNCHD_LABEL}`]);
     fs.rmSync(LEGACY_PLIST_PATH, { force: true });
@@ -247,9 +266,11 @@ async function askConsent({ willInstallSkill }) {
   // first and reads a line only if it wants the detail.
   const step = (color, verb, what, note) => out(`  ${bold(color(verb.padEnd(9)))}${what} ${dim(`· ${note}`)}`);
   step(cyan, 'scan', 'your home folder for dev projects', 'reads config files, writes nothing');
-  out(dim(`           macOS may ask to let your terminal read Desktop, Documents or Downloads; Don't Allow skips that folder`));
+  if (!IS_LINUX) out(dim(`           macOS may ask to let your terminal read Desktop, Documents or Downloads; Don't Allow skips that folder`));
   step(magenta, 'pick', `which get a URL like ${bold(cyan('http://<name>.localhost'))}`, 'works only on this machine');
-  step(green, 'install', 'a background service', 'no sudo, keeps the URLs working after reboot');
+  // Linux: the unit itself needs no sudo, and the one sudo that :80 may need
+  // is asked for separately, so the promise here is "asks first", not "never".
+  step(green, 'install', 'a background service', IS_LINUX ? 'no sudo to install, starts when you log in; asks before any sudo' : 'no sudo, keeps the URLs working after reboot');
   if (willInstallSkill) {
     step(yellow, 'add', 'the add-project skill to ~/.claude/skills', 'for projects the scan misses');
   }
@@ -267,7 +288,7 @@ async function askConsent({ willInstallSkill }) {
 }
 
 // ---------------------------------------------------------------------------
-// install (macOS, launchd)
+// install (macOS: launchd, Linux: systemd --user)
 // ---------------------------------------------------------------------------
 
 function which(cmd) {
@@ -322,20 +343,53 @@ function launchctlAsync(args) {
   });
 }
 
-// A git checkout is a dev install: the LaunchAgent runs the checkout directly
+// The systemd trio, same shapes as the launchctl ones: every call is
+// `systemctl --user`, because the unit is the user's, and a user manager is
+// the only thing this process may drive without sudo.
+function systemctl(args) {
+  const r = spawnSync('systemctl', ['--user', ...args], { stdio: 'ignore' });
+  return r.status === 0;
+}
+
+function systemctlOut(args) {
+  const r = spawnSync('systemctl', ['--user', ...args], { encoding: 'utf8' });
+  return r.status === 0 ? (r.stdout || '') : '';
+}
+
+function systemctlAsync(args) {
+  return new Promise((resolve) => {
+    const c = spawn('systemctl', ['--user', ...args], { stdio: 'ignore' });
+    c.on('error', () => resolve(false));
+    c.on('exit', (code) => resolve(code === 0));
+  });
+}
+
+// A git checkout is a dev install: the service runs the checkout directly
 // (no app copy — the repo is not a cache that vanishes) and the daemon watches
 // its own source, so an edit here is live at wakeman.localhost a moment later.
 const IS_CHECKOUT = fs.existsSync(path.join(ROOT, '.git'));
 
-// A checkout install is "current" when the deployed plist already runs THIS
-// checkout — the version comparison below is meaningless when the code
+// A checkout install is "current" when the deployed service file already runs
+// THIS checkout — the version comparison below is meaningless when the code
 // live-reloads out from under it.
-function plistRunsCheckout() {
+function serviceRunsCheckout() {
+  const daemon = path.join(ROOT, 'wakeman.mjs');
   try {
-    return fs.readFileSync(PLIST_PATH, 'utf8').includes(`<string>${path.join(ROOT, 'wakeman.mjs')}</string>`);
+    const text = fs.readFileSync(SERVICE_FILE, 'utf8');
+    return IS_LINUX ? unitRunsDaemon(text, daemon) : text.includes(`<string>${daemon}</string>`);
   } catch {
     return false;
   }
+}
+
+// The PATH the service gets: this shell's, then the platform's net.
+function servicePathEnv() {
+  return assembleServicePath({
+    userPath: process.env.PATH || '',
+    nodeDir: path.dirname(process.execPath),
+    home: os.homedir(),
+    platform: process.platform,
+  });
 }
 
 // Copy the running package into the state dir. npx runs from a cache that can
@@ -358,7 +412,7 @@ async function copyApp() {
   }
 }
 
-// The version of the copy the LaunchAgent runs, or null when nothing is
+// The version of the copy the service runs, or null when nothing is
 // installed. A re-run compares this against its own VERSION to decide whether
 // the daemon needs replacing at all.
 function installedVersion() {
@@ -369,16 +423,11 @@ function installedVersion() {
   }
 }
 
-async function installPersistent({ onStep = () => {} } = {}) {
-  const domain = `gui/${process.getuid()}`;
+const LAUNCHD_DOMAIN = () => `gui/${process.getuid()}`;
 
-  // Stop any existing agent first (under this name or the old one), then
-  // refresh the app copy. A checkout runs in place instead: no copy, and the
-  // daemon live-reloads.
-  await retireLegacyInstall();
-  await launchctlAsync(['bootout', `${domain}/${LAUNCHD_LABEL}`]);
-  const appDir = IS_CHECKOUT ? ROOT : APP_DIR;
-  if (!IS_CHECKOUT) await copyApp();
+// Write and load the LaunchAgent (already booted out). Returns the node it runs.
+async function installLaunchAgent(appDir) {
+  const domain = LAUNCHD_DOMAIN();
 
   // The daemon runs a node that outlives a version manager or a brew upgrade
   // removing this one (see stableNode). Project start commands still find
@@ -393,11 +442,7 @@ async function installPersistent({ onStep = () => {} } = {}) {
     home: os.homedir(),
     // The daemon must resolve every project's start command to the same binary
     // the user's shell would — so it inherits this install shell's PATH.
-    pathEnv: assembleLaunchdPath({
-      userPath: process.env.PATH || '',
-      nodeDir: path.dirname(process.execPath),
-      home: os.homedir(),
-    }),
+    pathEnv: servicePathEnv(),
     frontPort: FRONT_PORT,
     fallbackPort: FALLBACK_PORT,
     devWatch: IS_CHECKOUT,
@@ -414,6 +459,59 @@ async function installPersistent({ onStep = () => {} } = {}) {
   }
   await launchctlAsync(['enable', `${domain}/${LAUNCHD_LABEL}`]);
   await launchctlAsync(['kickstart', '-k', `${domain}/${LAUNCHD_LABEL}`]);
+  return nodeBin;
+}
+
+// Write and load the systemd user unit (already stopped). Same shape as the
+// LaunchAgent: write the file, tell the manager, start it. daemon-reload is
+// what makes systemd read the new file; enable is what makes it start on the
+// next login; restart is the kickstart.
+async function installSystemdUnit(appDir) {
+  const nodeBin = linuxNode(process.execPath, NODE_PIN);
+  const unit = renderUnit({
+    nodeBin,
+    daemonPath: path.join(appDir, 'wakeman.mjs'),
+    workDir: appDir,
+    stateDir,
+    logsDir,
+    home: os.homedir(),
+    pathEnv: servicePathEnv(),
+    frontPort: FRONT_PORT,
+    fallbackPort: FALLBACK_PORT,
+    devWatch: IS_CHECKOUT,
+  });
+  fs.mkdirSync(path.dirname(UNIT_PATH), { recursive: true });
+  fs.writeFileSync(UNIT_PATH, unit);
+  if (!(await systemctlAsync(['daemon-reload']))) throw new Error('systemctl --user daemon-reload failed');
+  if (!(await systemctlAsync(['enable', SYSTEMD_UNIT]))) throw new Error(`systemctl --user could not enable ${UNIT_PATH}`);
+  if (!(await systemctlAsync(['restart', SYSTEMD_UNIT]))) throw new Error(`systemctl --user could not start ${SYSTEMD_UNIT}`);
+  return nodeBin;
+}
+
+// Poll until wakeman answers, on the front door or the fallback. It has to be
+// wakeman answering, not just something: Herd, Valet, MAMP or a Docker
+// container on :80 would otherwise get the printed URLs. `wantPort` narrows it
+// to one port, for the restart after the :80 capability lands.
+async function waitForDaemon({ timeoutMs = 10_000, wantPort = null } = {}) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const live = await findDaemon();
+    if (live && (wantPort === null || live.port === wantPort)) return live;
+    await new Promise((r) => setTimeout(r, 500));
+  }
+  return null;
+}
+
+async function installPersistent({ onStep = () => {} } = {}) {
+  // Stop any existing agent first (under this name or the old one), then
+  // refresh the app copy. A checkout runs in place instead: no copy, and the
+  // daemon live-reloads.
+  await retireLegacyInstall();
+  if (IS_LINUX) await systemctlAsync(['stop', SYSTEMD_UNIT]);
+  else await launchctlAsync(['bootout', `${LAUNCHD_DOMAIN()}/${LAUNCHD_LABEL}`]);
+  const appDir = IS_CHECKOUT ? ROOT : APP_DIR;
+  if (!IS_CHECKOUT) await copyApp();
+  const nodeBin = IS_LINUX ? await installSystemdUnit(appDir) : await installLaunchAgent(appDir);
 
   // Put `wakeman` on PATH: a symlink to this same entrypoint in the app copy
   // (or the checkout, on a dev install).
@@ -432,19 +530,60 @@ async function installPersistent({ onStep = () => {} } = {}) {
   }
 
   // Wait for the daemon: :80 when it won the front door, else the fallback
-  // port. It has to be wakeman answering, not just something: Herd, Valet, MAMP
-  // or a Docker container on :80 would otherwise get the printed URLs.
+  // port.
   onStep('waking the daemon');
-  const deadline = Date.now() + 10_000;
-  while (Date.now() < deadline) {
-    const live = await findDaemon();
-    if (live) return { up: true, port: live.port, skillInstalled };
-    await new Promise((r) => setTimeout(r, 500));
-  }
-  return { up: false, port: FRONT_PORT, skillInstalled };
+  const live = await waitForDaemon();
+  if (live) return { up: true, port: live.port, skillInstalled, nodeBin };
+  return { up: false, port: FRONT_PORT, skillInstalled, nodeBin };
 }
 
-function printInstalledBanner({ projects, port, startedAt, skillInstalled, verb = 'installed' }) {
+// ---------------------------------------------------------------------------
+// :80 on Linux. The kernel refuses ports below ip_unprivileged_port_start
+// (1024 on a stock kernel) to a plain user, so the daemon lands on the
+// fallback port and every URL carries it. The fix is CAP_NET_BIND_SERVICE on
+// wakeman's own node copy: one sudo, one file wakeman owns, never the user's
+// node. The install asks out loud and runs it only on a yes; a rerun does not
+// ask again when getcap already shows the capability. Never any sudo without
+// a person at the terminal.
+// ---------------------------------------------------------------------------
+
+function linuxBindCapState(nodeBin) {
+  if (!IS_LINUX || nodeBin !== NODE_PIN) return 'unneeded'; // no pin to grant it to
+  let portStartText = '';
+  try { portStartText = fs.readFileSync('/proc/sys/net/ipv4/ip_unprivileged_port_start', 'utf8'); } catch { /* unreadable: assume 1024 */ }
+  const cap = spawnSync('getcap', [NODE_PIN], { encoding: 'utf8', timeout: 3000 });
+  return bindCapState({ portStartText, frontPort: FRONT_PORT, getcapOutput: cap.stdout || '' });
+}
+
+// The daemon is up on the fallback port with :80 free and the capability
+// missing. Ask once; on yes, grant it with the user's own sudo prompt on the
+// terminal and restart the unit so the daemon rebinds. Returns the port the
+// daemon answers on afterwards.
+async function offerBindCapability(port) {
+  const { bold, dim, green } = ui;
+  const cmd = setcapCommand(NODE_PIN);
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+  let answer;
+  try {
+    const q = `\n  wakeman needs sudo once to serve plain ${bold('http://<name>.localhost')} URLs: ${bold(cmd)}. run it? ${dim('[')}${green('Y')}${dim('/n]')} `;
+    answer = (await rl.question(q)).trim().toLowerCase();
+  } finally {
+    rl.close();
+  }
+  if (!(answer === '' || answer === 'y' || answer === 'yes')) return port;
+  const r = spawnSync('sudo', setcapArgs(NODE_PIN), { stdio: 'inherit' });
+  if (r.status !== 0) {
+    process.stdout.write(dim('  setcap did not run; keeping the numbered port.\n'));
+    return port;
+  }
+  await systemctlAsync(['restart', SYSTEMD_UNIT]);
+  const live = await waitForDaemon({ wantPort: FRONT_PORT });
+  return live ? live.port : port;
+}
+
+// `nodeBin` is what the service runs; on Linux it decides whether the :80 line
+// can name the setcap fix (only the pin may carry the capability).
+function printInstalledBanner({ projects, port, startedAt, skillInstalled, verb = 'installed', nodeBin = NODE_PIN }) {
   const { bold, dim, cyan, yellow } = ui;
   const out = (s = '') => process.stdout.write(s + '\n');
   const readyMs = Date.now() - startedAt;
@@ -465,20 +604,30 @@ function printInstalledBanner({ projects, port, startedAt, skillInstalled, verb 
     for (const line of lines) out(line);
     if (hidden) out(dim(`  and ${hidden} more · \`wakeman status\` lists them all`));
   }
-  if (port !== 80) {
-    const holder = portHolder(80);
+  if (port !== FRONT_PORT) {
+    const holder = portHolder(FRONT_PORT);
     out();
-    out(`  ${yellow('!')} port 80 is taken${holder ? ` by ${bold(holder)}` : ''}, so every URL ends in :${port}.`);
-    out(dim(`    stop it, then \`wakeman install\` moves wakeman to plain http://<name>.localhost URLs.`));
+    if (!holder && linuxBindCapState(nodeBin) === 'missing') {
+      // Nothing holds :80; the kernel refused it. The exact command, so the
+      // person who said no (or ran with --yes) can do it later.
+      out(`  ${yellow('!')} port ${FRONT_PORT} needs a one-time permission on linux, so every URL ends in :${port}.`);
+      out(dim(`    run ${setcapCommand(NODE_PIN)} then \`wakeman install\` for plain http://<name>.localhost URLs.`));
+    } else {
+      out(`  ${yellow('!')} port ${FRONT_PORT} is taken${holder ? ` by ${bold(holder)}` : ''}, so every URL ends in :${port}.`);
+      out(dim(`    stop it, then \`wakeman install\` moves wakeman to plain http://<name>.localhost URLs.`));
+    }
   }
-  const guarded = [...new Set(projects.map((p) => protectedRoot(p.dir, os.homedir())).filter(Boolean))];
+  const guarded = IS_LINUX ? [] : [...new Set(projects.map((p) => protectedRoot(p.dir, os.homedir())).filter(Boolean))];
   if (guarded.length) {
     out();
     out(`  ${yellow('!')} some projects live in ${guarded.join(', ')}. if macOS asks whether ${bold('node')} may access`);
     out(`    ${guarded.length === 1 ? 'that folder' : 'those folders'}, click Allow: the service cannot start them otherwise.`);
   }
   out();
-  out(dim(`  runs in the background and survives reboots · registry: ${tilde(configPath)} · logs: ${tilde(logsDir)}`));
+  // A user unit lives and dies with the login session; the LaunchAgent comes
+  // back on its own after a reboot. Say the one that is true here.
+  const lifetime = IS_LINUX ? 'starts when you log in' : 'runs in the background and survives reboots';
+  out(dim(`  ${lifetime} · registry: ${tilde(configPath)} · logs: ${tilde(logsDir)}`));
   out(dim('  `wakeman` rescans for new projects · `wakeman uninstall` removes everything'));
   if (skillInstalled) {
     out(dim('  agent skill: add-project installed to ~/.claude/skills · other agents: npx skills add joudbitar/wakeman'));
@@ -489,7 +638,7 @@ function printInstalledBanner({ projects, port, startedAt, skillInstalled, verb 
     // first installs: hand over the exact line rather than the idea of it.
     out();
     out(`  ${yellow('!')} the ${bold('wakeman')} command is in ${tilde(path.dirname(CLI_LINK))}, which is not on your PATH. to fix it:`);
-    const rc = /bash$/.test(process.env.SHELL || '') ? '~/.bash_profile' : '~/.zshrc';
+    const rc = pathHintRc({ shell: process.env.SHELL || '', platform: process.platform });
     out(`    ${cyan(`echo 'export PATH="$HOME/.local/bin:$PATH"' >> ${rc}`)} ${dim('then open a new terminal')}`);
     out(dim('    until then, `npx wakeman <command>` does the same thing.'));
   }
@@ -498,8 +647,13 @@ function printInstalledBanner({ projects, port, startedAt, skillInstalled, verb 
 
 // The name of whatever holds `port`, or null. lsof without sudo only sees
 // this user's processes, so a root nginx comes back null and the copy says
-// "taken" without a name.
+// "taken" without a name. Linux reads the same answer from /proc, since
+// minimal distros ship no lsof; another user's process is null there too.
 function portHolder(port) {
+  if (IS_LINUX) {
+    const pid = listenerPid(port);
+    return pid ? processName(pid) : null;
+  }
   const r = spawnSync('lsof', ['-nP', `-iTCP:${port}`, '-sTCP:LISTEN', '-Fc'], { encoding: 'utf8', timeout: 3000 });
   const line = String(r.stdout || '').split('\n').find((l) => l.startsWith('c'));
   return line ? line.slice(1) : null;
@@ -516,7 +670,7 @@ async function uninstall({ assumeYes }) {
   if (interactive && !assumeYes) {
     out();
     out(`  this stops the background service and deletes ${bold(tilde(stateDir))}`);
-    out('  (registry, logs, the installed app copy), the LaunchAgent plist, the');
+    out(`  (registry, logs, the installed app copy), the ${IS_LINUX ? 'systemd unit' : 'LaunchAgent plist'}, the`);
     out('  `wakeman` command, and the add-project skill. your projects are not');
     out('  touched.');
     out();
@@ -537,7 +691,29 @@ async function uninstall({ assumeYes }) {
   // "state removed" need a caveat.
   let daemonExited = true;
 
-  if (process.platform === 'darwin') {
+  if (IS_LINUX) {
+    // Same dance as launchd below: ask systemd for the pid first, because
+    // once the unit is gone `show` has nothing to say about the process that
+    // is still winding down. `disable --now` is bootout plus "not on next
+    // login"; daemon-reload makes the manager forget the deleted file instead
+    // of listing it as not-found.
+    const pid = parseSystemdMainPid(systemctlOut(['show', '-p', 'MainPID', '--value', SYSTEMD_UNIT]));
+    systemctl(['disable', '--now', SYSTEMD_UNIT]);
+    fs.rmSync(UNIT_PATH, { force: true });
+    systemctl(['daemon-reload']);
+    const alive = () => {
+      if (pid) {
+        try {
+          process.kill(pid, 0);
+          return true;
+        } catch (err) {
+          return !!err && err.code === 'EPERM';
+        }
+      }
+      return systemctl(['is-active', '--quiet', SYSTEMD_UNIT]);
+    };
+    daemonExited = await waitForExit({ isAlive: alive, timeoutMs: 5_000 });
+  } else {
     const domain = `gui/${process.getuid()}`;
     // Ask launchd who the daemon IS before booting it out: once the label
     // leaves the domain, nothing is left to name the process still winding
@@ -571,22 +747,25 @@ async function uninstall({ assumeYes }) {
     }
   } catch { /* absent — nothing to remove */ }
 
-  // A machine installed the old Caddy way still has a wakeman block in its
+  // A Mac installed the old Caddy way still has a wakeman block in its
   // Caddyfile; strip it and reload so :80 is truly released. Best-effort — a
-  // machine without brew or caddy skips all of this silently.
-  const brewPrefix = spawnSync('brew', ['--prefix'], { encoding: 'utf8' }).stdout?.trim() || '/opt/homebrew';
-  const caddyfile = path.join(brewPrefix, 'etc', 'Caddyfile');
-  try {
-    const before = fs.readFileSync(caddyfile, 'utf8');
-    const { text, changed } = stripCaddyBlock(before);
-    if (changed) {
-      fs.copyFileSync(caddyfile, `${caddyfile}.bak.wakeman-uninstall`);
-      fs.writeFileSync(caddyfile, text);
-      const caddy = which('caddy');
-      if (caddy) spawnSync(caddy, ['reload', '--config', caddyfile], { stdio: 'ignore' });
-      out(dim(`  removed the wakeman block from ${caddyfile} (backup alongside).`));
-    }
-  } catch { /* no Caddyfile — nothing to clean */ }
+  // machine without brew or caddy skips all of this silently. That installer
+  // never existed on Linux, so neither does this step.
+  if (!IS_LINUX) {
+    const brewPrefix = spawnSync('brew', ['--prefix'], { encoding: 'utf8' }).stdout?.trim() || '/opt/homebrew';
+    const caddyfile = path.join(brewPrefix, 'etc', 'Caddyfile');
+    try {
+      const before = fs.readFileSync(caddyfile, 'utf8');
+      const { text, changed } = stripCaddyBlock(before);
+      if (changed) {
+        fs.copyFileSync(caddyfile, `${caddyfile}.bak.wakeman-uninstall`);
+        fs.writeFileSync(caddyfile, text);
+        const caddy = which('caddy');
+        if (caddy) spawnSync(caddy, ['reload', '--config', caddyfile], { stdio: 'ignore' });
+        out(dim(`  removed the wakeman block from ${caddyfile} (backup alongside).`));
+      }
+    } catch { /* no Caddyfile — nothing to clean */ }
+  }
 
   fs.rmSync(stateDir, { recursive: true, force: true });
 
@@ -673,20 +852,22 @@ function preflightTools(tools, servicePath) {
   return Promise.all(tools.map((t) => checkTool(t, servicePath)));
 }
 
-// The PATH the daemon is REALLY running with: the deployed plist's, when one
-// is installed. Preflighting the plist we would write instead of the plist
-// that exists would miss the stale case — a shell PATH that changed since
+// The PATH the daemon is REALLY running with: the deployed service file's,
+// when one is installed. Preflighting the file we would write instead of the
+// file that exists would miss the stale case — a shell PATH that changed since
 // install, with the service still resolving yesterday's binaries.
 function deployedPathEnv() {
   try {
-    const m = fs.readFileSync(PLIST_PATH, 'utf8').match(/<key>PATH<\/key>\s*<string>([^<]*)<\/string>/);
-    if (m && m[1]) return m[1];
-  } catch { /* no plist yet — fresh install */ }
-  return assembleLaunchdPath({
-    userPath: process.env.PATH || '',
-    nodeDir: path.dirname(process.execPath),
-    home: os.homedir(),
-  });
+    const text = fs.readFileSync(SERVICE_FILE, 'utf8');
+    if (IS_LINUX) {
+      const p = unitEnvironment(text).get('PATH');
+      if (p) return p;
+    } else {
+      const m = text.match(/<key>PATH<\/key>\s*<string>([^<]*)<\/string>/);
+      if (m && m[1]) return m[1];
+    }
+  } catch { /* no service file yet — fresh install */ }
+  return servicePathEnv();
 }
 
 function printToolWarnings(results) {
@@ -1277,8 +1458,9 @@ async function cmdRuntime(action, host) {
   return 1;
 }
 
-// `open` uses macOS's own `open`, so the URL lands in whatever the user set as
-// their default browser. The port is the one the daemon actually answers on.
+// `open` uses the OS's own opener (`open` on macOS, `xdg-open` on Linux), so
+// the URL lands in whatever the user set as their default browser. The port is
+// the one the daemon actually answers on.
 async function cmdOpen(host) {
   if (!host) return needHost('open', 'wakeman open <host>');
   const live = await findDaemon();
@@ -1288,7 +1470,7 @@ async function cmdOpen(host) {
     return 1;
   }
   const url = formatProjectUrl(host, live.port);
-  const r = spawnSync('open', [url], { stdio: 'ignore' });
+  const r = spawnSync(IS_LINUX ? 'xdg-open' : 'open', [url], { stdio: 'ignore' });
   if (r.status !== 0) {
     process.stderr.write(`wakeman: could not open ${url}\n`);
     return 1;
@@ -1550,12 +1732,12 @@ async function main() {
     return 0;
   }
 
-  // macOS only. The install IS a user LaunchAgent and the front door is :80
-  // with a per-connection loopback guard; there is no half of that worth
-  // shipping elsewhere, and a foreground fallback taught people a wakeman that
-  // stops when the terminal closes.
-  if (process.platform !== 'darwin') {
-    process.stderr.write('wakeman runs on macOS. Linux support is not planned.\n');
+  // macOS and Linux. The install IS a user service (launchd or systemd) and
+  // the front door is :80 with a per-connection loopback guard; there is no
+  // half of that worth shipping elsewhere, and a foreground fallback taught
+  // people a wakeman that stops when the terminal closes.
+  if (process.platform !== 'darwin' && !IS_LINUX) {
+    process.stderr.write('wakeman runs on macOS and Linux.\n');
     return 2;
   }
   const oldNode = nodeTooOld(process.versions.node);
@@ -1608,6 +1790,17 @@ async function main() {
   // ---- the bare run: consent, scan, install (or rescan) --------------------
   const interactive = process.stdin.isTTY && process.stdout.isTTY;
 
+  // Linux without a systemd user manager (no systemd, WSL with it off, a
+  // container) has nowhere to put the service. Say so before the consent
+  // prompt, the scan, or the first write; there is nothing to consent to.
+  if (IS_LINUX) {
+    const sd = systemdUsable();
+    if (!sd.ok) {
+      process.stderr.write(`${systemdRequirementLine(sd.detail)}\n`);
+      return 2;
+    }
+  }
+
   const startedAt = Date.now();
   // Migration counts as prior consent: these users already installed wakeman
   // once, so a migrated run skips the first-run prompt like any re-run.
@@ -1620,7 +1813,7 @@ async function main() {
   }
   const firstRun = !fs.existsSync(configPath);
 
-  // A first run asks before it installs a LaunchAgent, and a pipe has nobody
+  // A first run asks before it installs a service, and a pipe has nobody
   // to ask. `--yes` is that answer given up front, which is how a script
   // installs. With a registry already there, consent is on record and a
   // non-interactive run just rescans, as it always did.
@@ -1651,16 +1844,16 @@ async function main() {
 
   // A re-run with a healthy daemon of this same version IS the rescan: the
   // daemon watches projects.json and reloads on its own, so replacing the
-  // LaunchAgent here would only kill the dev servers it is holding. The
-  // full install runs when nothing answers, the version changed (an npx of
-  // a newer release supersedes the installed copy), or the user typed
-  // `wakeman install` — the explicit form is the sanctioned way to force a
-  // plist rewrite, e.g. after the preflight flags a stale service PATH.
-  if (cmd !== 'install' && (IS_CHECKOUT ? plistRunsCheckout() : installedVersion() === VERSION)) {
+  // service here would only kill the dev servers it is holding. The full
+  // install runs when nothing answers, the version changed (an npx of a newer
+  // release supersedes the installed copy), or the user typed `wakeman
+  // install` — the explicit form is the sanctioned way to force a service
+  // file rewrite, e.g. after the preflight flags a stale service PATH.
+  if (cmd !== 'install' && (IS_CHECKOUT ? serviceRunsCheckout() : installedVersion() === VERSION)) {
     const live = await findDaemon();
     if (live) {
       printInstalledBanner({ projects, port: live.port, startedAt, skillInstalled: false, verb: 'rescanned' });
-      // Preflight against the DEPLOYED plist PATH — what the daemon is
+      // Preflight against the DEPLOYED service PATH — what the daemon is
       // actually resolving with right now. A tool that broke or diverged
       // since install surfaces here, on the next casual `wakeman`, not at
       // 3am via a start timeout.
@@ -1671,7 +1864,7 @@ async function main() {
 
   let result;
   const spin = makeSpinner({ isTTY: process.stdout.isTTY, styler: ui });
-  spin.start('installing the LaunchAgent');
+  spin.start(IS_LINUX ? 'installing the systemd unit' : 'installing the LaunchAgent');
   try {
     result = await installPersistent({ onStep: (t) => spin.update(t) });
   } catch (err) {
@@ -1688,12 +1881,21 @@ async function main() {
     return 1;
   }
   await spin.done(`${ui.green('✓')} ${ui.dim('service running')}`);
-  printInstalledBanner({ projects, port: result.port, startedAt, skillInstalled: result.skillInstalled });
+  // Linux, daemon on the fallback port, :80 free and the capability missing:
+  // the one sudo, offered with the spinner already down so the prompt owns
+  // the terminal. `--yes` promised no prompts, and a pipe has nobody to ask;
+  // both keep the numbered port, and the banner prints the command instead.
+  if (IS_LINUX && result.port !== FRONT_PORT && interactive && !assumeYes
+    && !portHolder(FRONT_PORT) && linuxBindCapState(result.nodeBin) === 'missing') {
+    result.port = await offerBindCapability(result.port);
+  }
+  printInstalledBanner({ projects, port: result.port, startedAt, skillInstalled: result.skillInstalled, nodeBin: result.nodeBin });
   if (IS_CHECKOUT) {
     process.stdout.write(ui.dim('  dev install: the service runs this checkout and restarts itself when the source changes.\n'));
   }
-  // The plist was just written, so deployedPathEnv() reads the fresh PATH:
-  // this proves what the daemon will resolve, on the install that baked it.
+  // The service file was just written, so deployedPathEnv() reads the fresh
+  // PATH: this proves what the daemon will resolve, on the install that baked
+  // it.
   printToolWarnings(await preflightTools(toolsToVerify(projects), deployedPathEnv()));
   return 0;
 }
