@@ -13,7 +13,7 @@
 // It drives wakeman.mjs rather than bin/wakeman.mjs because the entrypoint's
 // one path is now a launchd install, and a GitHub runner has no GUI domain to
 // bootstrap into. The entrypoint's own surface (consent, scan, help, version,
-// the non-darwin exit, every subcommand) is test/cli.test.mjs.
+// the platform gate, every subcommand) is test/cli.test.mjs.
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';

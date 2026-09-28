@@ -8,12 +8,12 @@
 // state dir on an OS-assigned port and drives the subcommands through it, so
 // the registry edits and the control-API calls are the real ones.
 //
-// Not covered here: `install` and `uninstall`, which bootstrap and boot out a
-// user LaunchAgent under a fixed label; running either would reach past the
-// temp state dir and stop the developer's own daemon. `open` IS covered, with
-// a shim named `open` earlier on PATH than macOS's: the URL it is handed is the
-// whole of that command, and a real one would put a browser window on the
-// screen mid-test.
+// Not covered here: `install` and `uninstall`, which load and unload a user
+// service (a LaunchAgent, or a systemd unit on Linux) under a fixed name;
+// running either would reach past the temp state dir and stop the developer's
+// own daemon. `open` IS covered, with a shim named after the system opener
+// earlier on PATH: the URL it is handed is the whole of that command, and a
+// real one would put a browser window on the screen mid-test.
 
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
@@ -51,21 +51,31 @@ const DEAD_PORT = await freePort();
 
 // Each of these runs with WAKEMAN_STATE_DIR pointed at a path that does NOT
 // exist, so "did the run create it?" is a one-line assertion.
-function runClean(args, { platform } = {}) {
+function runClean(args, { platform, systemctl } = {}) {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'wakeman-clean-'));
   const stateDir = path.join(tmp, 'state');
   const extra = [];
+  let PATH = process.env.PATH;
   if (platform) {
-    // The only way to exercise the non-darwin exit on a mac: define
+    // The only way to exercise another platform's gate on a mac: define
     // process.platform before the entrypoint's first line runs. `--import`
     // evaluates this module ahead of the main one.
     const stub = path.join(tmp, 'platform.mjs');
     fs.writeFileSync(stub, `Object.defineProperty(process, 'platform', { value: ${JSON.stringify(platform)}, configurable: true });\n`);
     extra.push('--import', `file://${stub}`);
   }
+  if (systemctl) {
+    // A `systemctl` shim ahead of everything on PATH: what the Linux install
+    // gate sees is only its exit status and its first stderr line.
+    const bin = path.join(tmp, 'shimbin');
+    fs.mkdirSync(bin);
+    fs.writeFileSync(path.join(bin, 'systemctl'), `#!/bin/sh\n${systemctl}\n`, { mode: 0o755 });
+    PATH = `${bin}:${PATH}`;
+  }
   const r = spawnSync(process.execPath, [...extra, BIN, ...args], {
     env: {
       ...process.env,
+      PATH,
       WAKEMAN_STATE_DIR: stateDir,
       WAKEMAN_PORT: String(DEAD_PORT),
       WAKEMAN_FALLBACK_PORT: String(DEAD_PORT),
@@ -100,18 +110,57 @@ test('--version / -v print the version and touch no state dir', () => {
   }
 });
 
-test('non-darwin: one line, exit 2, nothing else', () => {
-  const r = runClean([], { platform: 'linux' });
+test('neither macOS nor Linux: one line, exit 2, nothing else', () => {
+  for (const platform of ['freebsd', 'win32']) {
+    const r = runClean([], { platform });
+    assert.equal(r.code, 2, platform);
+    assert.equal(r.stderr, 'wakeman runs on macOS and Linux.\n', platform);
+    assert.equal(r.stdout, '', 'nothing else runs');
+    assert.equal(r.madeState, false);
+  }
+});
+
+test('the platform gate does not swallow --help', () => {
+  for (const platform of ['linux', 'freebsd']) {
+    const r = runClean(['--help'], { platform });
+    assert.equal(r.code, 0, platform);
+    assert.match(r.stdout, /wakeman status/);
+  }
+});
+
+test('linux without a systemd user session: one line naming the requirement, exit 2, nothing written', () => {
+  // WSL with systemd off, a container, an ssh session with no user manager:
+  // systemctl is there and cannot connect. Checked before consent and before
+  // the first write, so a machine that cannot hold the service stays as it was.
+  const r = runClean([], { platform: 'linux', systemctl: 'echo "Failed to connect to bus: No medium found" >&2; exit 1' });
   assert.equal(r.code, 2);
-  assert.equal(r.stderr, 'wakeman runs on macOS. Linux support is not planned.\n');
-  assert.equal(r.stdout, '', 'nothing else runs');
+  assert.equal(r.stderr.split('\n').filter(Boolean).length, 1, 'one line');
+  assert.match(r.stderr, /systemctl --user/);
+  assert.match(r.stderr, /Failed to connect to bus: No medium found/);
+  assert.equal(r.stdout, '', 'no consent prompt, no scan');
+  assert.equal(r.madeState, false);
+
+  // No systemctl at all (Alpine, most containers): same gate, named as such.
+  const none = runClean([], { platform: 'linux', systemctl: 'exec /nonexistent/systemctl' });
+  assert.equal(none.code, 2);
+  assert.match(none.stderr, /systemctl --user/);
+  assert.equal(none.madeState, false);
+});
+
+test('linux with a systemd user session gets past the gate to the first-run check', () => {
+  // The shim answers like a live user manager. With no terminal and no --yes
+  // the run stops at "first run needs a terminal", exactly as on a Mac, and
+  // still writes nothing.
+  const r = runClean([], { platform: 'linux', systemctl: 'echo PATH=/usr/bin; exit 0' });
+  assert.equal(r.code, 1);
+  assert.match(r.stderr, /first run needs a terminal/);
   assert.equal(r.madeState, false);
 });
 
-test('non-darwin gate does not swallow --help', () => {
-  const r = runClean(['--help'], { platform: 'linux' });
-  assert.equal(r.code, 0);
-  assert.match(r.stdout, /wakeman status/);
+test('linux subcommands that only need the daemon are not behind the systemd gate', () => {
+  const r = runClean(['status'], { platform: 'linux', systemctl: 'exit 1' });
+  assert.equal(r.code, 3);
+  assert.match(r.stderr, /wakeman is not running/);
 });
 
 test('unknown command: says which, reprints the table, exit 1, no state dir', () => {
@@ -123,7 +172,9 @@ test('unknown command: says which, reprints the table, exit 1, no state dir', ()
 });
 
 test('a refused first run (no terminal, no --yes) exits 1 and leaves no state dir', () => {
-  const r = runClean([]);
+  // The systemctl shim only matters when this suite runs on Linux: a runner
+  // without a user session would otherwise stop one gate earlier.
+  const r = runClean([], { systemctl: 'exit 0' });
   assert.equal(r.code, 1);
   assert.match(r.stderr, /first run needs a terminal/);
   assert.equal(r.madeState, false, 'not even an empty logs folder');
@@ -451,14 +502,17 @@ test('runtime commands on an unknown host: exit 1, not 3', () => {
 // until it is answered, and the escapes `logs -f` strips) is test/attach.test.mjs;
 // what belongs in the command-table file is that both entries reach a live
 // daemon, say what they are, and leave the dev server running on the way out.
-// The success path, with macOS's `open` replaced by a shim on PATH: the URL it
-// is handed is the whole contract, and a real `open` would put a browser window
-// on the developer's screen mid-test.
+// The success path, with the system opener (`open` on macOS, `xdg-open` on
+// Linux) replaced by a shim on PATH: the URL it is handed is the whole
+// contract, and a real one would put a browser window on the developer's
+// screen mid-test.
 test('open hands the project URL to the system opener', () => {
   const bin = fs.mkdtempSync(path.join(os.tmpdir(), 'wakeman-openbin-'));
   const record = path.join(bin, 'opened');
-  fs.writeFileSync(path.join(bin, 'open'), `#!/bin/sh\nprintf '%s' "$1" > ${JSON.stringify(record)}\n`);
-  fs.chmodSync(path.join(bin, 'open'), 0o755);
+  for (const name of ['open', 'xdg-open']) {
+    fs.writeFileSync(path.join(bin, name), `#!/bin/sh\nprintf '%s' "$1" > ${JSON.stringify(record)}\n`);
+    fs.chmodSync(path.join(bin, name), 0o755);
+  }
 
   const r = spawnSync(process.execPath, [BIN, 'open', 'demo'], {
     env: {
