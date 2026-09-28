@@ -4958,8 +4958,18 @@ process.on('SIGINT', () => shutdown('SIGINT'));
 
 // Only auto-boot when run directly (e.g. via launchd / CLI). When imported by a
 // unit test, skip listening so pure helpers (inferInstallCmd, connectLoopback…)
-// can be exercised without occupying :4000 or spawning anything.
-const RUN_AS_MAIN = process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
+// can be exercised without occupying :4000 or spawning anything. Compared as
+// real paths: node resolves symlinks in import.meta.url but not in argv[1], so
+// a home that is a symlink (/home/you -> /home3/you on NFS machines) made the
+// service start, see "not main", and exit 0 in a restart loop.
+const RUN_AS_MAIN = (() => {
+  if (!process.argv[1]) return false;
+  try {
+    return fs.realpathSync(process.argv[1]) === fs.realpathSync(fileURLToPath(import.meta.url));
+  } catch {
+    return false;
+  }
+})();
 
 if (RUN_AS_MAIN) {
   loadConfig('boot');

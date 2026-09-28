@@ -37,13 +37,15 @@ jobs:
           for i in $(seq 1 50); do [ -S "/run/user/$(id -u)/bus" ] && break; sleep 0.2; done
           echo "XDG_RUNTIME_DIR=/run/user/$(id -u)" >> "$GITHUB_ENV"
           echo "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(id -u)/bus" >> "$GITHUB_ENV"
+      # The scanner only counts a node dev script that looks like a server, and
+      # dev-server is one of the names it knows.
       - name: a project for the scan to find
         run: |
           mkdir -p ~/e2e-site
           cat > ~/e2e-site/package.json <<'EOF'
-          { "name": "e2e-site", "scripts": { "dev": "node server.js" } }
+          { "name": "e2e-site", "scripts": { "dev": "node dev-server.js" } }
           EOF
-          cat > ~/e2e-site/server.js <<'EOF'
+          cat > ~/e2e-site/dev-server.js <<'EOF'
           require('http').createServer((_, res) => res.end('e2e-site ok')).listen(process.env.PORT, '127.0.0.1');
           EOF
       - name: install, no sudo, lands on the fallback port
