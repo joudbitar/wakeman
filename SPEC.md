@@ -42,6 +42,7 @@ of it.
 | `bin/wakeman.mjs` | the entrypoint: consent prompt, scan, launchd or systemd install, uninstall |
 | `lib/install.mjs` | pure install helpers: plist and unit rendering, service PATH, Caddyfile cleanup |
 | `lib/procnet.mjs` | who listens on a port, from `/proc`, for Linux without lsof |
+| `lib/linux.mjs` | Linux install helpers: unit path, systemd checks, the port-80 capability, the node pin |
 | `lib/picker.mjs` | the scan picker: choose which newly found projects register |
 | `lib/registry-cli.mjs` | the one module that creates, changes or deletes a registry entry; the CLI, the dashboard routes and the add-project skill all write through it |
 | `lib/ws.mjs` | a minimal RFC 6455 server, for the per-project terminal socket |
